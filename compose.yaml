@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ai_studio
+      POSTGRES_USER: ai_studio
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_studio -d ai_studio"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://ai_studio:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db:5432/ai_studio
+      AI_STUDIO_SESSION_SECRET: ${AI_STUDIO_SESSION_SECRET:?Set AI_STUDIO_SESSION_SECRET}
+      AI_STUDIO_ADMIN_PASSWORD: ${AI_STUDIO_ADMIN_PASSWORD:?Set AI_STUDIO_ADMIN_PASSWORD}
+      AI_STUDIO_DATA_DIR: /app/data
+      AI_STUDIO_OLLAMA_URL: ${AI_STUDIO_OLLAMA_URL:-http://host.docker.internal:11434}
+      AI_STUDIO_OLLAMA_MODEL: ${AI_STUDIO_OLLAMA_MODEL:-qwen3:8b}
+      AI_STUDIO_REMOTE_ENABLED: ${AI_STUDIO_REMOTE_ENABLED:-0}
+      AI_STUDIO_REMOTE_URL: ${AI_STUDIO_REMOTE_URL:-}
+      AI_STUDIO_REMOTE_MODEL: ${AI_STUDIO_REMOTE_MODEL:-}
+      AI_STUDIO_REMOTE_API_KEY: ${AI_STUDIO_REMOTE_API_KEY:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - files_data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    ports:
+      - 127.0.0.1:8080:80
+    depends_on:
+      - api
+
+volumes:
+  db_data:
+  files_data:

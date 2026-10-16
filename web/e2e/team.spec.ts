@@ -1,0 +1,62 @@
+import { expect, test } from '@playwright/test'
+
+test('项目成员管理与个人项目创建', async ({ page }) => {
+  const password = process.env.AI_STUDIO_E2E_PASSWORD
+  if (!password) test.skip(true, 'Set AI_STUDIO_E2E_PASSWORD')
+  const errors: string[] = []
+  page.on('pageerror', error => errors.push(error.message))
+  page.on('dialog', dialog => void dialog.accept())
+  const suffix = Date.now()
+  const reviewerName = `team-reviewer-${suffix}`
+  const managerName = `team-manager-${suffix}`
+  const memberPassword = 'test-member-password-123'
+
+  await page.goto('/')
+  await page.getByLabel('账号').fill('admin')
+  await page.getByLabel('密码').fill(password!)
+  await page.getByRole('button', { name: '登录', exact: true }).click()
+  await expect(page.getByRole('heading', { name: '工作台' })).toBeVisible()
+  await page.getByRole('button', { name: '新建项目' }).first().click()
+  await page.getByLabel('项目名称').fill(`团队验收-${suffix}`)
+  await page.getByRole('button', { name: '创建项目' }).click()
+  await page.getByRole('button', { name: '项目成员' }).click()
+  await expect(page.getByRole('heading', { name: '项目成员' }).first()).toBeVisible()
+  await expect(page.getByText('admin', { exact: true }).last()).toBeVisible()
+
+  await page.getByRole('button', { name: '创建账号' }).click()
+  await page.getByLabel('用户名').fill(reviewerName)
+  await page.getByLabel('初始密码').fill(memberPassword)
+  await page.getByRole('button', { name: '创建并加入' }).click()
+  await expect(page.getByRole('dialog')).toHaveCount(0)
+  await expect(page.getByText(reviewerName, { exact: true }).first()).toBeVisible()
+  await page.getByRole('combobox', { name: `${reviewerName} 的项目权限` }).click()
+  await page.getByRole('option', { name: '只读成员' }).click()
+  await expect(page.getByText(`${reviewerName} 的权限已更新`)).toBeVisible()
+  await page.screenshot({ path: '/tmp/ai-studio-team-desktop.png' })
+  await page.setViewportSize({ width: 390, height: 844 })
+  await expect(page.getByRole('combobox', { name: `${reviewerName} 的项目权限` })).toBeVisible()
+  await page.screenshot({ path: '/tmp/ai-studio-team-mobile.png' })
+  await page.getByRole('button', { name: `移除 ${reviewerName}` }).click()
+  await expect(page.getByText(`${reviewerName} 已移出项目`)).toBeVisible()
+  await expect(page.getByText(reviewerName, { exact: true })).toHaveCount(0)
+
+  await page.getByRole('button', { name: '创建账号' }).click()
+  await page.getByLabel('用户名').fill(managerName)
+  await page.getByLabel('初始密码').fill(memberPassword)
+  await page.getByRole('combobox', { name: '新成员项目权限' }).click()
+  await page.getByRole('option', { name: '项目管理员' }).click()
+  await page.getByRole('button', { name: '创建并加入' }).click()
+  await expect(page.getByRole('dialog')).toHaveCount(0)
+  await page.getByRole('button', { name: '退出登录' }).click()
+  await page.getByLabel('账号').fill(managerName)
+  await page.getByLabel('密码').fill(memberPassword)
+  await page.getByRole('button', { name: '登录', exact: true }).click()
+  await expect(page.getByRole('heading', { name: '工作台' })).toBeVisible()
+  await page.getByRole('button', { name: '新建项目' }).click()
+  await page.getByLabel('项目名称').fill(`个人项目-${suffix}`)
+  await page.getByRole('button', { name: '创建项目' }).click()
+  await expect(page.getByText(`个人项目-${suffix}`).first()).toBeVisible()
+  await page.getByRole('button', { name: '项目成员' }).click()
+  await expect(page.locator('.team-member-row').getByText(managerName, { exact: true })).toBeVisible()
+  expect(errors).toEqual([])
+})

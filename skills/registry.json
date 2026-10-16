@@ -1,0 +1,40 @@
+{
+  "source_root": "/Users/lazy/huangsheng/project/qa-doc-skills",
+  "skills": [
+    {
+      "id": "requirement-analysis",
+      "name": "qa-doc-skills-requirement-analysis",
+      "label": "需求分析",
+      "path": "skills/requirement-analysis/SKILL.md",
+      "enabled_by_default": true
+    },
+    {
+      "id": "test-cases",
+      "name": "qa-doc-skills-test-cases",
+      "label": "用例编写",
+      "path": "skills/test-cases/SKILL.md",
+      "enabled_by_default": true
+    },
+    {
+      "id": "figma-to-prd",
+      "name": "qa-doc-skills-figma-to-prd",
+      "label": "Figma 转 PRD",
+      "path": "skills/figma-to-prd/SKILL.md",
+      "enabled_by_default": true
+    },
+    {
+      "id": "dev-doc-analysis",
+      "name": "qa-doc-skills-dev-doc-analysis",
+      "label": "开发文档分析",
+      "path": "skills/dev-doc-analysis/SKILL.md",
+      "enabled_by_default": true
+    },
+    {
+      "id": "api-parsing",
+      "name": "qa-doc-skills-api-parsing",
+      "label": "接口解析",
+      "path": "skills/api-parsing/SKILL.md",
+      "enabled_by_default": true
+    }
+  ]
+}
