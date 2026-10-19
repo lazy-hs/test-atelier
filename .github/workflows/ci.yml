@@ -21,7 +21,7 @@ jobs:
       AI_STUDIO_ADMIN_PASSWORD: ci-admin-password-123
       DATABASE_URL: sqlite://
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -116,7 +116,7 @@ jobs:
   web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -151,7 +151,7 @@ jobs:
   compose-config:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Validate Compose interpolation
         env:
           POSTGRES_PASSWORD: ci-postgres-password-123
@@ -163,7 +163,7 @@ jobs:
   containers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build API image
         run: docker build --file api/Dockerfile --tag test-atelier-api:ci .
       - name: Build and validate Web image
@@ -185,7 +185,7 @@ jobs:
       DATABASE_URL: postgresql+psycopg://ai_studio:ci-postgres-password-123@db:5432/ai_studio
       TEST_ATELIER_SKILL_ROOT: ${{ github.workspace }}/.ci/qa-doc-skills
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The preflight checks the same cryptography baseline used by the API
       # image. Install the declared Linux dependencies instead of relying on
       # whatever packages happen to be preloaded on the GitHub runner.
