@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { AlertCircle, ArrowRight, FileText, Plus, RefreshCw, Save, Upload } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import { AlertCircle, ArrowRight, Eye, FileText, PencilLine, Plus, RefreshCw, Save, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
-import { api, type AiConfig, type AiJob, type Analysis, type SourceDocument } from '@/lib/api'
+import { api, formatAiError, type AiConfig, type AiJob, type Analysis, type SourceDocument } from '@/lib/api'
+import { PromptViewerDialog } from '@/components/PromptViewerDialog'
 
 export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { projectId: number; readonly: boolean; onOpenAuthoring: () => void }) {
   const [documents, setDocuments] = useState<SourceDocument[]>([])
@@ -16,20 +19,23 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
   const [analysisId, setAnalysisId] = useState('')
   const [analysis, setAnalysis] = useState<Analysis | null>(null)
   const [jobs, setJobs] = useState<AiJob[]>([])
-  const [model, setModel] = useState<Pick<AiConfig, 'local_model' | 'remote_enabled' | 'codex_enabled' | 'claude_enabled'> | null>(null)
+  const [model, setModel] = useState<Pick<AiConfig, 'local_model' | 'local_enabled' | 'remote_enabled' | 'codex_enabled' | 'claude_enabled'> | null>(null)
   const [provider, setProvider] = useState('local')
   const [reportText, setReportText] = useState('')
   const [decisions, setDecisions] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [promptOpen, setPromptOpen] = useState(false)
+  const [reportMode, setReportMode] = useState<'preview' | 'edit'>('preview')
+  const reportRevision = useRef('')
   const input = useRef<HTMLInputElement>(null)
   const base = `/projects/${projectId}`
 
   const refresh = useCallback(async () => {
     const [docs, runs, config] = await Promise.all([
       api<SourceDocument[]>(`${base}/documents`), api<Analysis[]>(`${base}/analyses`),
-      api<Pick<AiConfig, 'local_model' | 'remote_enabled' | 'codex_enabled' | 'claude_enabled'>>(`${base}/ai/config`),
+      api<Pick<AiConfig, 'local_model' | 'local_enabled' | 'remote_enabled' | 'codex_enabled' | 'claude_enabled'>>(`${base}/ai/config`),
     ])
     setDocuments(docs); setAnalyses(runs); setModel(config)
     setAnalysisId(previous => previous || runs[0]?.id || '')
@@ -46,8 +52,14 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
       if (!active) return
       setAnalysis(run); setJobs(currentJobs)
       setAnalyses(previous => previous.map(item => item.id === run.id ? run : item))
-      setReportText(run.result.report_markdown ?? '')
-      setDecisions(Object.fromEntries((run.result.ambiguities ?? []).map(item => [item.id, item.decision ?? ''])))
+      // Polling refreshes job status, but must not overwrite unsaved editor
+      // changes until the server reports a newer analysis revision.
+      const revision = `${run.id}:${run.version}`
+      if (reportRevision.current !== revision) {
+        reportRevision.current = revision
+        setReportText(run.result.report_markdown ?? '')
+        setDecisions(Object.fromEntries((run.result.ambiguities ?? []).map(item => [item.id, item.decision ?? ''])))
+      }
       if (run.status === 'ready' || run.status === 'failed') window.clearInterval(interval)
     }
     void load().catch(cause => setError(cause.message))
@@ -126,20 +138,25 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
           <span>{new Date(run.created_at).toLocaleString('zh-CN')}</span><Badge variant="secondary">{run.status === 'ready' ? '已完成' : run.status === 'failed' ? '失败' : '处理中'}</Badge>
         </button>)}
         <div className="ai-rail-footer"><label htmlFor="model-provider">分析模型</label><select id="model-provider" value={provider} onChange={event => setProvider(event.target.value)} disabled={readonly}>
-          <option value="local">本地 {model?.local_model ?? 'Ollama'}</option>{model?.remote_enabled && <option value="remote">远程模型（发送正文）</option>}{model?.codex_enabled && <option value="codex">Codex CLI（本机）</option>}{model?.claude_enabled && <option value="claude">Claude Code（本机）</option>}
+          {model?.local_enabled !== false && <option value="local">本地 {model?.local_model ?? 'Ollama'}</option>}{model?.remote_enabled && <option value="remote">远程模型（发送正文）</option>}{model?.codex_enabled && <option value="codex">Codex CLI（本机）</option>}{model?.claude_enabled && <option value="claude">Claude Code（本机）</option>}
         </select><Button onClick={() => void start()} disabled={readonly || busy || !selectedIds.length}>开始分析</Button></div>
       </aside>
       <section className="ai-main">
         <AnimatePresence mode="wait">{analysis ? <motion.div key={analysis.id} initial={{ opacity: 0, y: 7 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -7 }} className="ai-report">
           <div className="ai-section-heading"><div><h2>分析报告</h2><p>{analysis.source_ids.length} 份材料 · {analysis.result.requirements?.length ?? 0} 条需求</p></div>
-            {analysis.status === 'ready' && <Button variant="outline" size="sm" onClick={onOpenAuthoring}>进入用例编写<ArrowRight data-icon="inline-end" /></Button>}</div>
-          {analysis.status === 'failed' ? <div className="ai-alert error"><AlertCircle size={16} />{analysis.error}{currentJob && !readonly && <Button variant="outline" size="sm" onClick={() => void retry(currentJob.id)} disabled={busy}><RefreshCw data-icon="inline-start" />重试</Button>}</div> : null}
+            <div className="ai-heading-actions">{currentJob && <Button variant="outline" size="sm" onClick={() => setPromptOpen(true)}><Eye data-icon="inline-start" />查看提示词</Button>}{analysis.status === 'ready' && <Button variant="outline" size="sm" onClick={onOpenAuthoring}>进入用例编写<ArrowRight data-icon="inline-end" /></Button>}</div></div>
+          {analysis.status === 'failed' ? <div className="ai-alert error"><AlertCircle size={16} />{formatAiError(analysis.error)}{currentJob && !readonly && <Button variant="outline" size="sm" onClick={() => void retry(currentJob.id)} disabled={busy}><RefreshCw data-icon="inline-start" />重试</Button>}</div> : null}
           {analysis.status === 'queued' || analysis.status === 'running' ? <div className="ai-processing" role="status">正在处理需求材料，请稍候</div> : null}
           {analysis.status === 'ready' && <><div className="ai-section-heading"><h3>待澄清</h3><span>{analysis.result.ambiguities?.length ?? 0} 项</span></div>
             {(analysis.result.ambiguities ?? []).map(item => <div className="ambiguity-row" key={item.id}><div><strong>{item.id} {item.description}</strong>{item.critical && <Badge variant="destructive">关键</Badge>}</div>
               <div><Input value={decisions[item.id] ?? ''} placeholder="填写确认结论" onChange={event => setDecisions(previous => ({ ...previous, [item.id]: event.target.value }))} disabled={readonly} /><Button size="sm" variant="outline" onClick={() => void saveDecision(item.id)} disabled={readonly || busy || !(decisions[item.id] ?? '').trim()}>确认</Button></div></div>)}
-            <div className="ai-section-heading report-edit-heading"><h3>报告正文</h3><Button size="sm" onClick={() => void saveReport()} disabled={readonly || busy || !reportText.trim()}><Save data-icon="inline-start" />保存</Button></div>
-            <Textarea className="report-editor" value={reportText} onChange={event => setReportText(event.target.value)} readOnly={readonly} aria-label="分析报告正文" /></>}
+            <div className="ai-section-heading report-edit-heading"><div><h3>报告正文</h3><p>支持 Markdown 预览与编辑</p></div><div className="report-heading-actions"><div className="report-mode-switch" role="tablist" aria-label="报告显示模式">
+              <Button type="button" size="sm" variant={reportMode === 'preview' ? 'secondary' : 'ghost'} role="tab" aria-selected={reportMode === 'preview'} onClick={() => setReportMode('preview')}><Eye data-icon="inline-start" />预览</Button>
+              <Button type="button" size="sm" variant={reportMode === 'edit' ? 'secondary' : 'ghost'} role="tab" aria-selected={reportMode === 'edit'} onClick={() => setReportMode('edit')}><PencilLine data-icon="inline-start" />编辑 Markdown</Button>
+            </div><Button size="sm" onClick={() => void saveReport()} disabled={readonly || busy || !reportText.trim() || reportMode !== 'edit'}><Save data-icon="inline-start" />保存</Button></div></div>
+            <AnimatePresence mode="wait" initial={false}>{reportMode === 'preview' ? <motion.article key="report-preview" className="report-markdown" initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -5 }} transition={{ duration: .16 }}>
+              {reportText.trim() ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{reportText}</ReactMarkdown> : <p className="report-markdown-empty">暂无报告正文</p>}
+            </motion.article> : <motion.div key="report-editor" className="report-editor-frame" initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -5 }} transition={{ duration: .16 }}><Textarea className="report-editor" value={reportText} onChange={event => setReportText(event.target.value)} readOnly={readonly} aria-label="分析报告正文 Markdown" /></motion.div>}</AnimatePresence></>}
         </motion.div> : <motion.div key={documentId || 'empty'} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="ai-report">
           {currentDoc ? <><div className="ai-section-heading"><div><h2>{currentDoc.filename}</h2><p>提取内容预览 · {currentDoc.text_length} 字符</p></div></div>
             {currentDoc.warnings.map(warning => <div className="ai-alert warning" key={warning}><AlertCircle size={16} />{warning}</div>)}
@@ -147,5 +164,6 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
         </motion.div>}</AnimatePresence>
       </section>
     </div>
+    <PromptViewerDialog projectId={projectId} jobId={currentJob?.id ?? null} open={promptOpen} onOpenChange={setPromptOpen} />
   </div>
 }

@@ -132,11 +132,24 @@ export function SmokePage({ projectId, readonly, onOpenCases }: { projectId: num
   useEffect(() => {
     if (!suiteId) { setCandidates([]); return }
     let active = true
-    const timer = window.setTimeout(() => {
+    let retryTimer: number | undefined
+    let attempts = 0
+    const load = () => {
       void api<SmokeCandidate[]>(`${base}/smoke-suites/${suiteId}/candidates?q=${encodeURIComponent(query)}`)
-        .then(value => { if (active) setCandidates(value) }).catch(cause => { if (active) setError(cause.message) })
-    }, 220)
-    return () => { active = false; window.clearTimeout(timer) }
+        .then(value => {
+          if (!active) return
+          setCandidates(value)
+          // Review and suite writes are separate requests. A short bounded
+          // retry keeps the picker usable when the read lands during commit.
+          if (value.length === 0 && attempts < 3) {
+            attempts += 1
+            retryTimer = window.setTimeout(load, 250)
+          }
+        })
+        .catch(cause => { if (active) setError(cause.message) })
+    }
+    const timer = window.setTimeout(load, 220)
+    return () => { active = false; window.clearTimeout(timer); if (retryTimer) window.clearTimeout(retryTimer) }
   }, [base, suiteId, suite?.revision, query])
   useEffect(() => { if (!notice) return; const timer = window.setTimeout(() => setNotice(''), 4500); return () => window.clearTimeout(timer) }, [notice])
 
@@ -154,7 +167,11 @@ export function SmokePage({ projectId, readonly, onOpenCases }: { projectId: num
       const next = await api<SmokeSuite>(`${base}/smoke-suites/${suite.id}/items`, { method: 'POST', body: JSON.stringify({
         revision: suite.revision, case_id: Number(candidateId), chain_name: chain, estimated_seconds: Math.round(Number(duration) * 60),
       }) })
-      updateSuite(next); setCandidateId(''); setQuery(''); setNotice('用例已由人工确认并加入冒烟集')
+      updateSuite(next)
+      // Drop the old list immediately; the next revision must be fetched
+      // before another candidate can be selected (otherwise the just-added
+      // case can be submitted again during the refresh window).
+      setCandidates([]); setCandidateId(''); setQuery(''); setNotice('用例已由人工确认并加入冒烟集')
     } catch (cause) { setError((cause as Error).message) } finally { setBusy(false) }
   }
   async function updateItem(item: SmokeItem, nextChain: string, seconds: number) {

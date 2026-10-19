@@ -13,6 +13,13 @@ class ImportErrorDetail(ValueError):
     pass
 
 
+# XMind is a user-supplied recursive tree. Keep traversal bounded even when
+# the compressed archive itself is small, so a deeply nested or extremely
+# wide outline cannot exhaust the parser stack or output memory.
+MAX_XMIND_NODES = 100_000
+MAX_XMIND_DEPTH = 512
+
+
 def _number(value, pattern):
     if isinstance(value, float) and value.is_integer():
         value = int(value)
@@ -64,55 +71,68 @@ def _xmind(data):
         archive = zipfile.ZipFile(io.BytesIO(data))
     except zipfile.BadZipFile as exc:
         raise ImportErrorDetail("XMind 压缩包损坏") from exc
-    files = archive.infolist()
-    if len(files) > 3000 or sum(item.file_size for item in files) > 20 * 1024 * 1024:
-        raise ImportErrorDetail("XMind 解压后内容过大")
-    if any(item.compress_size and item.file_size / item.compress_size > 1000 for item in files):
-        raise ImportErrorDetail("XMind 压缩比异常")
-    titles = []
-    if "content.json" in archive.namelist():
-        sheets = json.loads(archive.read("content.json"))
+    with archive:
+        files = archive.infolist()
+        if len(files) > 3000 or sum(item.file_size for item in files) > 20 * 1024 * 1024:
+            raise ImportErrorDetail("XMind 解压后内容过大")
+        if any(item.compress_size and item.file_size / item.compress_size > 1000 for item in files):
+            raise ImportErrorDetail("XMind 压缩比异常")
+        titles = []
+        nodes_seen = 0
 
-        def visit(node, path):
-            title = node.get("title", "").strip()
-            current = path + ([title] if title else [])
-            branches = node.get("children") or {}
-            children = branches.get("attached", []) + branches.get("detached", [])
-            if children:
-                for child in children:
-                    visit(child, current)
-            elif title:
-                titles.append(current)
+        def guard_depth(depth):
+            nonlocal nodes_seen
+            nodes_seen += 1
+            if nodes_seen > MAX_XMIND_NODES:
+                raise ImportErrorDetail("XMind 节点数量超过限制")
+            if depth > MAX_XMIND_DEPTH:
+                raise ImportErrorDetail("XMind 层级超过限制")
 
-        for sheet in sheets:
-            visit(sheet.get("rootTopic", {}), [])
-    elif "content.xml" in archive.namelist():
-        root = ElementTree.fromstring(archive.read("content.xml"))
+        if "content.json" in archive.namelist():
+            sheets = json.loads(archive.read("content.json"))
 
-        def child_topics(node):
-            for child in node:
-                if child.tag.split("}")[-1] == "topic":
-                    yield child
-                else:
-                    yield from child_topics(child)
+            def visit(node, path, depth):
+                guard_depth(depth)
+                title = node.get("title", "").strip()
+                current = path + ([title] if title else [])
+                branches = node.get("children") or {}
+                children = branches.get("attached", []) + branches.get("detached", [])
+                if children:
+                    for child in children:
+                        visit(child, current, depth + 1)
+                elif title:
+                    titles.append(current)
 
-        def visit(node, path):
-            title = next((el.text or "" for el in node if el.tag.split("}")[-1] == "title"), "").strip()
-            current = path + ([title] if title else [])
-            direct = list(child_topics(node))
-            if direct:
-                for child in direct:
-                    visit(child, current)
-            elif title:
-                titles.append(current)
+            for sheet in sheets:
+                visit(sheet.get("rootTopic", {}), [], 0)
+        elif "content.xml" in archive.namelist():
+            root = ElementTree.fromstring(archive.read("content.xml"))
 
-        for sheet in root:
-            if sheet.tag.split("}")[-1] == "sheet":
-                topic = next((el for el in sheet if el.tag.split("}")[-1] == "topic"), None)
-                if topic is not None:
-                    visit(topic, [])
-    else:
-        raise ImportErrorDetail("缺少 content.json 或 content.xml")
+            def child_topics(node):
+                for child in node:
+                    if child.tag.split("}")[-1] == "topic":
+                        yield child
+                    else:
+                        yield from child_topics(child)
+
+            def visit(node, path, depth):
+                guard_depth(depth)
+                title = next((el.text or "" for el in node if el.tag.split("}")[-1] == "title"), "").strip()
+                current = path + ([title] if title else [])
+                direct = list(child_topics(node))
+                if direct:
+                    for child in direct:
+                        visit(child, current, depth + 1)
+                elif title:
+                    titles.append(current)
+
+            for sheet in root:
+                if sheet.tag.split("}")[-1] == "sheet":
+                    topic = next((el for el in sheet if el.tag.split("}")[-1] == "topic"), None)
+                    if topic is not None:
+                        visit(topic, [], 0)
+        else:
+            raise ImportErrorDetail("缺少 content.json 或 content.xml")
     if not titles:
         raise ImportErrorDetail("未找到可导入的 XMind 叶节点")
     fingerprint = hashlib.sha256(data).hexdigest()[:10].upper()
@@ -136,7 +156,8 @@ def parse(filename, data):
             raise ImportErrorDetail("只支持 .xls、.xlsx 和 .xmind")
     except ImportErrorDetail:
         raise
-    except (ValueError, KeyError, IndexError, AttributeError, TypeError, OSError, zipfile.BadZipFile, ElementTree.ParseError, xlrd.XLRDError) as exc:
+    except (ValueError, KeyError, IndexError, AttributeError, TypeError, OSError, RecursionError,
+            zipfile.BadZipFile, ElementTree.ParseError, xlrd.XLRDError) as exc:
         raise ImportErrorDetail("文件结构无法解析") from exc
     if not grid:
         raise ImportErrorDetail("文件没有表头")

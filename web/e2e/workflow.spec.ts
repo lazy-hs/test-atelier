@@ -8,7 +8,7 @@ test('真实样本导入、审核与导出', async ({ page }) => {
   page.on('pageerror', error => errors.push(error.message))
   await page.goto('/')
   await expect(page).toHaveTitle('Test Atelier')
-  await expect(page.getByRole('heading', { name: '登录工作站' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: '登录 Test Atelier' })).toBeVisible()
   await page.getByLabel('账号').fill('admin')
   await page.getByLabel('密码').fill(password!)
   await page.getByRole('button', { name: '登录', exact: true }).click()

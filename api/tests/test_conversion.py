@@ -102,6 +102,23 @@ def test_project_config_and_isolated_history(context):
     assert client.delete(url + "/history", headers=headers).json()["deleted_count"] == 1
 
 
+@pytest.mark.skipif(os.name == "nt", reason="symlink behavior is not portable on Windows")
+def test_history_download_rejects_replaced_symlink(context):
+    client, headers, root = context
+    url = root + "/conversion"
+    response = client.post(url + "/export", files={"file": ("cases.xlsx", source_file())},
+                           data=form("excel_to_excel"), headers=headers)
+    assert response.status_code == 200
+    record_id = client.get(url + "/history").json()["records"][0]["id"]
+    path = conversion_routes.output_path(type("Record", (), {"project_id": int(root.split("/")[-1]), "id": record_id})())
+    outside = path.parent / "outside-secret.txt"
+    outside.write_bytes(b"not an export")
+    path.unlink()
+    path.symlink_to(outside)
+    downloaded = client.get(url + f"/history/{record_id}/download")
+    assert downloaded.status_code == 404
+
+
 def test_first_reads_do_not_write_and_reader_permissions(context):
     client, headers, root = context
     url = root + "/conversion"

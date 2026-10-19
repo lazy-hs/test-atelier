@@ -1,6 +1,7 @@
 """Project-scoped HTTP adapter for the ecxel_check conversion engine."""
 
 import io
+import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -8,7 +9,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -16,6 +17,12 @@ from sqlalchemy.orm import Session
 from .conversion import service
 from .conversion.converter import ConversionError
 from .db import ConversionRecord, ConversionSettings, User
+from .storage import open_private_regular_file, write_private_atomic
+from .observability import monotonic
+from starlette.background import BackgroundTask
+
+
+logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("AI_STUDIO_DATA_DIR", str(Path(__file__).resolve().parents[1] / "data"))) / "conversions"
@@ -134,9 +141,24 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         scope(project_id, user, db)
         writable(user, project_id, db)
         data, name = await read_file(file)
+        conversion_started = monotonic()
         try:
-            return service.preview(data, name, conversion_mode, output_mode, prefix_path, case_type, case_status)
+            result = service.preview(data, name, conversion_mode, output_mode, prefix_path, case_type, case_status)
+            logger.info("conversion.preview.completed", extra={
+                "event": "conversion.preview.completed", "project_id": project_id,
+                "actor_id": user.id, "source": Path(name).suffix.lower().lstrip("."),
+                "file_size": len(data), "row_count": result.get("row_count", 0),
+                "conversion_mode": conversion_mode, "output_mode": output_mode,
+                "duration_ms": round((monotonic() - conversion_started) * 1000, 2),
+            })
+            return result
         except ConversionError as exc:
+            logger.warning("conversion.preview.failed", extra={
+                "event": "conversion.preview.failed", "project_id": project_id,
+                "actor_id": user.id, "error_type": type(exc).__name__,
+                "source": Path(name).suffix.lower().lstrip("."),
+                "duration_ms": round((monotonic() - conversion_started) * 1000, 2),
+            })
             raise HTTPException(422, str(exc)) from exc
 
     @router.post("/export", dependencies=[Depends(csrf)])
@@ -146,9 +168,16 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         scope(project_id, user, db)
         writable(user, project_id, db)
         data, name = await read_file(file)
+        conversion_started = monotonic()
         try:
             result, output, output_name, media_type = service.export(data, name, conversion_mode, output_mode, prefix_path, case_type, case_status)
         except ConversionError as exc:
+            logger.warning("conversion.export.failed", extra={
+                "event": "conversion.export.failed", "project_id": project_id,
+                "actor_id": user.id, "error_type": type(exc).__name__,
+                "source": Path(name).suffix.lower().lstrip("."),
+                "duration_ms": round((monotonic() - conversion_started) * 1000, 2),
+            })
             raise HTTPException(422, str(exc)) from exc
         record = ConversionRecord(
             id=uuid.uuid4().hex, project_id=project_id, user_id=user.id,
@@ -157,18 +186,25 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             row_count=result["row_count"], file_size=len(output), preview=result,
         )
         path = output_path(record)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
         try:
-            temporary.write_bytes(output)
-            os.replace(temporary, path)
+            write_private_atomic(path, output, root=DATA_DIR)
             db.add(record)
             db.commit()
-        except Exception:
-            temporary.unlink(missing_ok=True)
+        except Exception as exc:
             path.unlink(missing_ok=True)
             db.rollback()
+            logger.exception("conversion.export.persist_failed", extra={
+                "event": "conversion.export.persist_failed", "project_id": project_id,
+                "actor_id": user.id, "error_type": type(exc).__name__,
+            })
             raise
+        logger.info("conversion.export.completed", extra={
+            "event": "conversion.export.completed", "project_id": project_id,
+            "actor_id": user.id, "source": Path(name).suffix.lower().lstrip("."),
+            "file_size": len(output), "row_count": result["row_count"],
+            "conversion_mode": conversion_mode, "output_mode": result["output_mode"],
+            "duration_ms": round((monotonic() - conversion_started) * 1000, 2),
+        })
         prune(db, project_id, settings_for(db, project_id).history_retention_days)
         return StreamingResponse(io.BytesIO(output), media_type=media_type,
                                  headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(output_name)}"})
@@ -192,10 +228,24 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         scope(project_id, user, db)
         record = find_record(project_id, record_id, db)
         path = output_path(record)
-        if not path.is_file():
-            raise HTTPException(404, "历史结果文件不存在。")
-        return FileResponse(path, media_type=record.media_type,
-                            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(record.output_filename)}"})
+        try:
+            stream, size = open_private_regular_file(path, root=DATA_DIR)
+        except OSError as exc:
+            logger.warning("conversion.download.rejected", extra={
+                "event": "conversion.download.rejected", "project_id": project_id,
+                "actor_id": user.id, "error_type": type(exc).__name__,
+                "component": "conversion-storage",
+            })
+            raise HTTPException(404, "历史结果文件不存在。") from exc
+        return StreamingResponse(
+            iter(lambda: stream.read(1024 * 1024), b""),
+            media_type=record.media_type,
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(record.output_filename)}",
+                "Content-Length": str(size),
+            },
+            background=BackgroundTask(stream.close),
+        )
 
     @router.delete("/history/{record_id}", dependencies=[Depends(csrf)])
     def history_delete(project_id: int, record_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):

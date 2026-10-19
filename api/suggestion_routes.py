@@ -1,6 +1,7 @@
 """Project classification versions, suggestion tasks and human decisions."""
 
 import copy
+import logging
 import uuid
 from typing import Literal
 
@@ -12,6 +13,9 @@ from sqlalchemy.orm import Session
 from . import ai_engine, classification, suggestion_jobs
 from .db import (Case, CaseSuggestion, ImportBatch, ReviewEvent, SuggestionJob,
                  TaxonomyVersion, User, utcnow)
+from .observability import request_id as current_request_id
+
+logger = logging.getLogger(__name__)
 
 
 class TaxonomyUpdate(BaseModel):
@@ -54,7 +58,8 @@ def version_dict(item: TaxonomyVersion | None) -> dict | None:
 def job_dict(item: SuggestionJob) -> dict:
     return {"id": item.id, "project_id": item.project_id, "provider": item.provider, "status": item.status,
             "total": item.total, "completed": item.completed, "errors": item.errors,
-            "taxonomy_version_id": item.taxonomy_version_id, "case_ids": item.case_ids, "created_at": item.created_at}
+            "taxonomy_version_id": item.taxonomy_version_id, "case_ids": item.case_ids,
+            "request_id": item.request_id or "", "created_at": item.created_at}
 
 
 def suggestion_dict(item: CaseSuggestion, case_version: int, definitions: dict | None) -> dict:
@@ -116,6 +121,11 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_m
                                definitions=copy.deepcopy(current.definitions if current else classification.empty_definitions()),
                                created_by=user.id)
         db.add(item); db.commit()
+        logger.info("taxonomy.version.created", extra={
+            "event": "taxonomy.version.created", "project_id": project_id,
+            "actor_id": user.id, "version": item.number, "revision": item.revision,
+            "component": "taxonomy",
+        })
         return version_dict(item)
 
     @router.put("/taxonomy/versions/{version_id}", dependencies=[Depends(csrf)])
@@ -139,6 +149,12 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_m
         if changed.rowcount != 1:
             db.rollback(); raise HTTPException(409, "分类版本已更新，请刷新")
         db.commit(); db.refresh(item)
+        logger.info("taxonomy.version.updated", extra={
+            "event": "taxonomy.version.updated", "project_id": project_id,
+            "actor_id": user.id, "taxonomy_version_id": item.id,
+            "version": item.number, "revision": item.revision,
+            "component": "taxonomy",
+        })
         return version_dict(item)
 
     @router.post("/taxonomy/versions/{version_id}/publish", dependencies=[Depends(csrf)])
@@ -160,6 +176,12 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_m
         if changed.rowcount != 1:
             db.rollback(); raise HTTPException(409, "分类版本已更新，请刷新")
         db.commit(); db.refresh(item)
+        logger.info("taxonomy.version.published", extra={
+            "event": "taxonomy.version.published", "project_id": project_id,
+            "actor_id": user.id, "taxonomy_version_id": item.id,
+            "version": item.number, "revision": item.revision,
+            "component": "taxonomy",
+        })
         return version_dict(item)
 
     @router.post("/suggestions/rules", dependencies=[Depends(csrf)])
@@ -185,6 +207,11 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_m
                                   source="rule", status="pending", case_version=case.version, created_by=user.id, **candidate)
             db.add(item); rows.append(item)
         db.commit()
+        logger.info("suggestions.rules.generated", extra={
+            "event": "suggestions.rules.generated", "project_id": project_id,
+            "actor_id": user.id, "taxonomy_version_id": version.id if version else None,
+            "count": len(rows), "component": "suggestions",
+        })
         return {"count": len(rows), "suggestions": [suggestion_dict(item, db.get(Case, item.case_id).version,
                  version.definitions if version else None) for item in rows]}
 
@@ -195,6 +222,8 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_m
             payload.provider = "codex_cli"
         if payload.provider == "claude":
             payload.provider = "claude_code"
+        if payload.provider == "local" and not ai_engine.LOCAL_ENABLED:
+            raise HTTPException(403, "本地模型未由管理员启用")
         if payload.provider == "remote" and (user.role != "admin" or not ai_engine.REMOTE_ENABLED):
             raise HTTPException(403, "远程模型未由管理员启用")
         if payload.provider == "codex_cli" and not ai_engine.CODEX_ENABLED:
@@ -209,8 +238,15 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_m
         job = SuggestionJob(id=uuid.uuid4().hex, project_id=project_id, created_by=user.id,
                             taxonomy_version_id=version.id if version else None,
                             provider=payload.provider, status="queued", case_ids=payload.case_ids,
-                            total=len(payload.case_ids), completed=0, errors=[])
-        db.add(job); db.commit(); suggestion_jobs.enqueue(job.id)
+                            total=len(payload.case_ids), completed=0, errors=[], request_id=current_request_id())
+        db.add(job); db.commit()
+        if suggestion_jobs.enqueue(job.id, current_request_id()) is False:
+            raise HTTPException(503, "AI 任务队列已满，请稍后重试", headers={"Retry-After": "5"})
+        logger.info("suggestion_job.enqueued", extra={
+            "event": "suggestion_job.enqueued", "job_id": job.id, "project_id": project_id,
+            "kind": "suggestion", "provider": job.provider, "actor_id": user.id,
+            "total": job.total,
+        })
         return job_dict(job)
 
     @router.get("/suggestion-jobs")
@@ -236,7 +272,15 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_m
             raise HTTPException(404, "建议任务不存在")
         if item.status not in ("failed", "partial"):
             raise HTTPException(409, "只能重试失败或部分失败的任务")
-        item.status = "queued"; db.commit(); suggestion_jobs.enqueue(item.id)
+        item.status = "queued"
+        item.lease_owner = ""; item.lease_until = 0.0; item.lease_heartbeat = 0.0
+        db.commit()
+        if suggestion_jobs.enqueue(item.id, current_request_id()) is False:
+            raise HTTPException(503, "AI 任务队列已满，请稍后重试", headers={"Retry-After": "5"})
+        logger.info("suggestion_job.requeued", extra={
+            "event": "suggestion_job.requeued", "job_id": item.id, "project_id": project_id,
+            "kind": "suggestion", "provider": item.provider, "actor_id": user.id,
+        })
         return job_dict(item)
 
     @router.get("/cases/{case_id}/suggestions")
@@ -308,6 +352,13 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_m
             db.rollback(); raise HTTPException(409, "建议已被处理，请刷新")
         db.commit()
         db.refresh(case)
+        logger.info("suggestion.decided", extra={
+            "event": "suggestion.decided", "project_id": project_id,
+            "actor_id": user.id, "suggestion_id": suggestion_id,
+            "case_id": case.id, "case_version": case.version,
+            "action": payload.action, "taxonomy_version_id": item.taxonomy_version_id,
+            "component": "suggestions",
+        })
         return {"suggestion_id": suggestion_id, "status": "accepted" if payload.action == "accept" else "rejected",
                 "case": case_dict(case, case_assignee(case, db))}
 

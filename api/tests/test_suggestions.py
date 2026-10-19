@@ -11,7 +11,7 @@ os.environ["AI_STUDIO_SESSION_SECRET"] = "test-only-session-secret-32-characters
 os.environ["AI_STUDIO_ADMIN_PASSWORD"] = "test-admin-password-123"
 
 from api import ai_engine, classification, suggestion_jobs  # noqa: E402
-from api.db import Base, engine  # noqa: E402
+from api.db import Base, CaseSuggestion, SessionLocal, SuggestionJob, engine  # noqa: E402
 from api.main import app  # noqa: E402
 
 
@@ -148,6 +148,23 @@ def test_invalid_model_ids_fail_without_writing_case(context, monkeypatch):
     assert client.get(f"{root}/cases/{ids[0]}").json()["final_smoke"] is None
 
 
+def test_model_suggestion_error_redacts_provider_credentials(context, monkeypatch):
+    client, headers, root, ids = context
+    publish_taxonomy(client, headers, root)
+
+    def unavailable(*_args):
+        raise RuntimeError("provider failed postgresql://app:db-secret@db/app password=hunter2")
+
+    monkeypatch.setattr(ai_engine, "request_structured", unavailable)
+    job_id = client.post(f"{root}/suggestions/model", json={"case_ids": [ids[0]]}, headers=headers).json()["id"]
+    result = wait_job(client, root, job_id)
+    assert result["status"] == "failed"
+    message = result["errors"][0]["message"]
+    assert "db-secret" not in message
+    assert "hunter2" not in message
+    assert "[REDACTED]" in message
+
+
 def test_partial_model_retry_is_idempotent(context, monkeypatch):
     client, headers, root, ids = context
     version = publish_taxonomy(client, headers, root)
@@ -168,6 +185,37 @@ def test_partial_model_retry_is_idempotent(context, monkeypatch):
     assert retried["status"] == "done" and retried["completed"] == 2 and retried["errors"] == []
     assert len(client.get(f"{root}/cases/{ids[0]}/suggestions").json()) == 1
     assert len(client.get(f"{root}/cases/{ids[1]}/suggestions").json()) == 1
+
+
+def test_expired_worker_cannot_persist_suggestion(context, monkeypatch):
+    client, headers, root, ids = context
+    version = publish_taxonomy(client, headers, root)
+    identifiers = {key: values[0]["id"] for key, values in version["definitions"].items()}
+
+    def dispatch(job_id, _correlation_id=""):
+        with SessionLocal() as db:
+            job = db.get(SuggestionJob, job_id)
+            job.lease_owner = "worker-a"
+            job.lease_until = time.time() + 60
+            db.commit()
+        suggestion_jobs._process_job(job_id, lease_owner="worker-a")
+        return True
+
+    monkeypatch.setattr(suggestion_jobs, "enqueue", dispatch)
+
+    def expire_before_persist(*_args, **_kwargs):
+        with SessionLocal() as db:
+            job = db.query(SuggestionJob).order_by(SuggestionJob.created_at.desc()).first()
+            job.lease_until = time.time() - 1
+            db.commit()
+        return {"categories": identifiers, "level": "2", "smoke": None,
+                "rationale": "不应写入", "questions": []}
+
+    monkeypatch.setattr(classification, "model_candidate", expire_before_persist)
+    job_id = client.post(f"{root}/suggestions/model", json={"case_ids": [ids[0]]}, headers=headers).json()["id"]
+    time.sleep(.1)
+    with SessionLocal() as db:
+        assert db.query(CaseSuggestion).filter(CaseSuggestion.job_id == job_id).count() == 0
 
 
 def test_assigned_reviewer_cannot_decide_other_members_suggestion(context):

@@ -21,6 +21,8 @@ npm run dev -- --host 127.0.0.1
 | `npm run test:e2e` | 使用本机 Chrome 运行 Playwright 回归 |
 | `npm run preview` | 预览已构建的静态文件 |
 
+生产构建会把 React、Motion 和 Lucide 拆成独立 vendor chunk，页面功能模块继续按路由懒加载；这样首屏共享入口不会因为工作台全部依赖增长到不可控的单块体积。
+
 开发服务器默认将 `/api` 转发到 `http://127.0.0.1:8000`，API 端口变化时：
 
 ```bash

@@ -1,13 +1,22 @@
 .venv/
+.venv*/
 __pycache__/
 .pytest_cache/
 *.pyc
 *.db
 *.sqlite*
+.DS_Store
 .env
 web/node_modules/
 web/dist/
 web/.vite/
 web/test-results/
 web/playwright-report/
+test-results/
 .test-atelier-logs/
+# Backups include source requirements and uploaded files; keep them out of Git.
+backups/
+# Runtime uploads and conversion outputs are project-sensitive; keep the
+# directory itself available while excluding generated files from commits.
+data/*
+!data/.gitkeep

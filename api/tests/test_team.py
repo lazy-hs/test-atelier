@@ -92,3 +92,18 @@ def test_manager_can_build_personal_project_and_manage_existing_accounts(client)
     assert client.post(f"/api/v1/projects/{project}/members/new", json={
         "username": "stranger", "password": "some-password-123"}, headers=lead).status_code == 403
     assert client.get(f"/api/v1/projects/{own.json()['id']}/members").status_code == 200
+
+
+def test_admin_can_rotate_account_password_with_six_characters(client):
+    admin = login(client)
+    created = client.post("/api/v1/users", json={
+        "username": "shortpass", "password": "abc123", "role": "reviewer",
+    }, headers=admin)
+    assert created.status_code == 200, created.text
+    user_id = created.json()["id"]
+
+    changed = client.patch(f"/api/v1/users/{user_id}/password", json={"password": "new456"}, headers=admin)
+    assert changed.status_code == 200, changed.text
+    client.post("/api/v1/auth/logout", headers=admin)
+    reviewer = login(client, "shortpass", "new456")
+    assert client.patch(f"/api/v1/users/{user_id}/password", json={"password": "xxxxxx"}, headers=reviewer).status_code == 403

@@ -1,17 +1,73 @@
 import os
 from datetime import datetime, timezone
 
-from sqlalchemy import ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import QueuePool
+from .observability import env_float, env_int
 
 
 def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
 
-database_url = os.getenv("DATABASE_URL", "sqlite:///./ai_studio.db")
-engine = create_engine(database_url, pool_pre_ping=True, **({"connect_args": {"check_same_thread": False}, "poolclass": StaticPool} if database_url == "sqlite://" else {}))
+# Keep the local SQLite file with the rest of the runtime data. Deployments
+# using PostgreSQL (or an explicit DATABASE_URL) are unaffected.
+database_url = os.getenv("DATABASE_URL", "sqlite:///./data/ai_studio.db")
+_is_sqlite = database_url.startswith("sqlite")
+database_kind = "sqlite" if _is_sqlite else "postgresql" if database_url.startswith(("postgresql", "postgres")) else "unknown"
+_is_memory_sqlite = _is_sqlite and (":memory:" in database_url or database_url.rstrip("/") in {"sqlite:", "sqlite+pysqlite:"})
+_engine_options = {"pool_pre_ping": True}
+if _is_sqlite:
+    # AI and suggestion workers run in a thread pool.  SQLite's default
+    # thread check rejects a pooled connection reused by another worker.
+    _sqlite_timeout = env_float("AI_STUDIO_SQLITE_TIMEOUT", 30, 1.0)
+    _engine_options["connect_args"] = {"check_same_thread": False, "timeout": _sqlite_timeout}
+    if _is_memory_sqlite:
+        # Use SQLite's shared-cache URI with a real pool.  StaticPool shares
+        # one connection across request and worker threads, which can expose
+        # stale snapshots or interleaved transactions under concurrent jobs.
+        database_url = "sqlite:///file:test_atelier_shared?mode=memory&cache=shared&uri=true"
+        _engine_options["connect_args"] = {"check_same_thread": False, "timeout": _sqlite_timeout, "uri": True}
+        _engine_options["poolclass"] = QueuePool
+else:
+    # Keep connection pressure predictable under the API thread pool; the
+    # values are configurable for larger Postgres deployments.
+    _engine_options.update({
+        "pool_size": env_int("DB_POOL_SIZE", 5, 1),
+        "max_overflow": env_int("DB_MAX_OVERFLOW", 10, 0),
+        "pool_timeout": env_int("DB_POOL_TIMEOUT", 30, 1),
+    })
+engine = create_engine(database_url, **_engine_options)
+
+
+if _is_sqlite:
+    @event.listens_for(engine, "connect")
+    def _configure_sqlite_connection(dbapi_connection, _connection_record):
+        """Keep local SQLite reads from blocking a short worker commit.
+
+        The test and single-process development setup uses a shared in-memory
+        database. SQLite's shared-cache table locks are not resolved by the
+        busy timeout, so read-uncommitted is needed for status polling while a
+        worker finalizes a job. File-backed SQLite additionally benefits from
+        WAL and the same explicit busy timeout.
+        """
+        cursor = dbapi_connection.cursor()
+        try:
+            timeout_ms = int(_sqlite_timeout * 1000)
+            cursor.execute(f"PRAGMA busy_timeout={timeout_ms}")
+            if _is_memory_sqlite:
+                # Shared-cache in-memory SQLite otherwise reports SQLITE_LOCKED
+                # for a status read racing a worker commit. This is limited to
+                # the local test/development database; file-backed databases
+                # retain normal read isolation.
+                cursor.execute("PRAGMA read_uncommitted=1")
+            else:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cursor.close()
+
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
@@ -42,6 +98,18 @@ class AiSettings(Base):
     claude_enabled: Mapped[bool] = mapped_column(default=False)
     claude_command: Mapped[str] = mapped_column(String(255), default="claude")
     claude_model: Mapped[str] = mapped_column(String(120), default="")
+    # Provider catalog is additive to the legacy single local/remote fields.
+    # Keeping the legacy columns lets existing workers continue to run while
+    # the admin UI can manage more than one connection.
+    providers_json: Mapped[str] = mapped_column(Text, default="[]")
+    updated_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
+class AiQueueState(Base):
+    """Singleton row used to atomically reserve durable worker capacity."""
+    __tablename__ = "ai_queue_state"
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    active_jobs: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[str] = mapped_column(String(40), default=utcnow)
 
 
@@ -211,9 +279,24 @@ class AiJob(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     analysis_id: Mapped[str] = mapped_column(ForeignKey("analysis_runs.id"))
     kind: Mapped[str] = mapped_column(String(24))
-    status: Mapped[str] = mapped_column(String(24), default="queued")
+    status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
+    # Request correlation is copied from the enqueueing HTTP request so
+    # background-worker logs remain traceable after the request returns.
+    request_id: Mapped[str] = mapped_column(String(128), default="")
+    # External workers use a short database lease so a crashed worker can be
+    # recovered without allowing two workers to finalize the same job.
+    lease_owner: Mapped[str] = mapped_column(String(128), default="")
+    lease_until: Mapped[float] = mapped_column(default=0.0)
+    lease_heartbeat: Mapped[float] = mapped_column(default=0.0)
+    queue_reserved: Mapped[bool] = mapped_column(default=False)
     error: Mapped[str] = mapped_column(Text, default="")
     attempts: Mapped[int] = mapped_column(Integer, default=0)
+    # Keep every prompt sent in this job so reviewers can inspect the exact
+    # payload even when a task fails after one of several model calls.
+    prompts: Mapped[list] = mapped_column(JSON, default=list)
+    prompt_length: Mapped[int] = mapped_column(Integer, default=0)
+    prompt_calls: Mapped[int] = mapped_column(Integer, default=0)
+    prompt_sha256: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
 
 
@@ -238,7 +321,13 @@ class SuggestionJob(Base):
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
     taxonomy_version_id: Mapped[int | None] = mapped_column(ForeignKey("taxonomy_versions.id"), nullable=True)
     provider: Mapped[str] = mapped_column(String(20))
-    status: Mapped[str] = mapped_column(String(20), default="queued")
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    # Keep the originating request id for asynchronous job diagnostics.
+    request_id: Mapped[str] = mapped_column(String(128), default="")
+    lease_owner: Mapped[str] = mapped_column(String(128), default="")
+    lease_until: Mapped[float] = mapped_column(default=0.0)
+    lease_heartbeat: Mapped[float] = mapped_column(default=0.0)
+    queue_reserved: Mapped[bool] = mapped_column(default=False)
     case_ids: Mapped[list] = mapped_column(JSON)
     total: Mapped[int] = mapped_column(Integer)
     completed: Mapped[int] = mapped_column(Integer, default=0)

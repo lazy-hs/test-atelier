@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { AlertCircle, Plus, RefreshCw, Trash2, UserPlus, UsersRound } from 'lucide-react'
+import { AlertCircle, KeyRound, Plus, RefreshCw, Trash2, UserPlus, UsersRound } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -24,7 +24,8 @@ export function TeamPage({ projectId, role, userId }: { projectId: number; role:
   const canManage = role === 'admin' || role === 'manager'
   const [members, setMembers] = useState<Member[]>([])
   const [events, setEvents] = useState<Event[]>([])
-  const [dialog, setDialog] = useState<'existing' | 'new' | null>(null)
+  const [dialog, setDialog] = useState<'existing' | 'new' | 'password' | null>(null)
+  const [passwordTarget, setPasswordTarget] = useState<Member | null>(null)
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [newRole, setNewRole] = useState<Exclude<Role, 'admin'>>('reviewer')
@@ -49,7 +50,10 @@ export function TeamPage({ projectId, role, userId }: { projectId: number; role:
   useEffect(() => { if (!notice) return; const timer = window.setTimeout(() => setNotice(''), 4000); return () => window.clearTimeout(timer) }, [notice])
 
   function open(mode: 'existing' | 'new') {
-    setDialog(mode); setUsername(''); setPassword(''); setNewRole('reviewer'); setError('')
+    setDialog(mode); setPasswordTarget(null); setUsername(''); setPassword(''); setNewRole('reviewer'); setError('')
+  }
+  function openPassword(member: Member) {
+    setDialog('password'); setPasswordTarget(member); setUsername(member.username); setPassword(''); setError('')
   }
   async function add(event: FormEvent) {
     event.preventDefault(); setBusy(true); setError('')
@@ -66,6 +70,15 @@ export function TeamPage({ projectId, role, userId }: { projectId: number; role:
     try {
       await api(`${base}/members/${member.id}`, { method: 'PATCH', body: JSON.stringify({ role: next }) })
       await refresh(); setNotice(`${member.username} 的权限已更新`)
+    } catch (cause) { setError((cause as Error).message) } finally { setBusy(false) }
+  }
+  async function updatePassword(event: FormEvent) {
+    event.preventDefault()
+    if (!passwordTarget) return
+    setBusy(true); setError('')
+    try {
+      await api(`/users/${passwordTarget.id}/password`, { method: 'PATCH', body: JSON.stringify({ password }) })
+      setDialog(null); setPasswordTarget(null); setPassword(''); setNotice(`${passwordTarget.username} 的密码已更新`)
     } catch (cause) { setError((cause as Error).message) } finally { setBusy(false) }
   }
   async function remove(member: Member) {
@@ -89,6 +102,7 @@ export function TeamPage({ projectId, role, userId }: { projectId: number; role:
       <div className="team-table-head"><span>成员</span><span>项目权限</span><span>操作</span></div>
       <AnimatePresence initial={false}>{members.map(member => {
         const editable = canManage && member.role !== 'admin' && (role === 'admin' || member.role !== 'manager') && member.id !== userId
+        const canResetPassword = role === 'admin'
         return <motion.div layout key={member.id} className="team-member-row" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, x: -12 }}>
           <span className="team-identity"><span className="team-avatar" aria-hidden="true">{member.username.slice(0, 1).toUpperCase()}</span><strong title={member.username}>{member.username}</strong>{member.id === userId && <Badge variant="secondary">我</Badge>}</span>
           <span>{editable ? <Select value={member.role} onValueChange={value => void changeRole(member, value as Exclude<Role, 'admin'>)} disabled={busy}>
@@ -96,7 +110,7 @@ export function TeamPage({ projectId, role, userId }: { projectId: number; role:
               {role === 'admin' && <SelectItem value="manager">项目管理员</SelectItem>}
               <SelectItem value="reviewer">评审员</SelectItem><SelectItem value="reader">只读成员</SelectItem>
             </SelectGroup></SelectContent></Select> : <Badge variant="secondary">{labels[member.role]}</Badge>}</span>
-          <span className="team-row-action">{editable && <Button variant="ghost" size="icon-sm" aria-label={`移除 ${member.username}`} title={`移除 ${member.username}`} onClick={() => void remove(member)} disabled={busy}><Trash2 /></Button>}</span>
+          <span className="team-row-action">{canResetPassword && <Button variant="ghost" size="icon-sm" aria-label={`修改 ${member.username} 的密码`} title={`修改 ${member.username} 的密码`} onClick={() => openPassword(member)} disabled={busy}><KeyRound /></Button>}{editable && <Button variant="ghost" size="icon-sm" aria-label={`移除 ${member.username}`} title={`移除 ${member.username}`} onClick={() => void remove(member)} disabled={busy}><Trash2 /></Button>}</span>
         </motion.div>
       })}</AnimatePresence>
       {!loading && members.length === 0 && <div className="team-empty"><UsersRound size={20} />暂无项目成员</div>}
@@ -105,18 +119,23 @@ export function TeamPage({ projectId, role, userId }: { projectId: number; role:
       {events.map(item => <div className="team-event" key={item.id}><span>{eventText(item)}</span><small>{item.actor} · {new Date(item.created_at).toLocaleString('zh-CN')}</small></div>)}
       {!loading && events.length === 0 && <div className="team-empty">还没有成员变更记录</div>}
     </section>}
-    <Dialog open={dialog !== null} onOpenChange={value => { if (!value) setDialog(null) }}><DialogContent><DialogHeader>
-      <DialogTitle>{dialog === 'new' ? '创建成员账号' : '添加已有账号'}</DialogTitle>
-      <DialogDescription>{dialog === 'new' ? '创建后立即加入当前项目' : '输入已存在的准确用户名并指定项目权限'}</DialogDescription>
-    </DialogHeader><form className="team-form" onSubmit={event => void add(event)}>
+    <Dialog open={dialog !== null} onOpenChange={value => { if (!value) { setDialog(null); setPasswordTarget(null) } }}><DialogContent><DialogHeader>
+      <DialogTitle>{dialog === 'new' ? '创建成员账号' : dialog === 'password' ? '修改账号密码' : '添加已有账号'}</DialogTitle>
+      <DialogDescription>{dialog === 'new' ? '创建后立即加入当前项目' : dialog === 'password' ? `为 ${passwordTarget?.username ?? '当前账号'} 设置新的登录密码` : '输入已存在的准确用户名并指定项目权限'}</DialogDescription>
+    </DialogHeader>{dialog === 'password' ? <form className="team-form" onSubmit={event => void updatePassword(event)}>
+      <label>账号<Input value={username} readOnly /></label>
+      <label>新密码<Input type="password" value={password} onChange={event => setPassword(event.target.value)} minLength={6} autoComplete="new-password" required /></label>
+      {error && <div className="ai-alert error" role="alert"><AlertCircle size={16} />{error}</div>}
+      <DialogFooter><Button type="submit" disabled={busy}>{busy ? '处理中…' : '保存密码'}</Button></DialogFooter>
+    </form> : <form className="team-form" onSubmit={event => void add(event)}>
       <label>用户名<Input value={username} onChange={event => setUsername(event.target.value)} minLength={2} maxLength={80} autoComplete="username" required /></label>
-      {dialog === 'new' && <label>初始密码<Input type="password" value={password} onChange={event => setPassword(event.target.value)} minLength={12} autoComplete="new-password" required /></label>}
+      {dialog === 'new' && <label>初始密码<Input type="password" value={password} onChange={event => setPassword(event.target.value)} minLength={6} autoComplete="new-password" required /></label>}
       <label>项目权限<Select value={newRole} onValueChange={value => setNewRole(value as Exclude<Role, 'admin'>)}><SelectTrigger aria-label="新成员项目权限"><SelectValue /></SelectTrigger><SelectContent><SelectGroup>
         {role === 'admin' && <SelectItem value="manager">项目管理员</SelectItem>}
         <SelectItem value="reviewer">评审员</SelectItem><SelectItem value="reader">只读成员</SelectItem>
       </SelectGroup></SelectContent></Select></label>
       {error && <div className="ai-alert error" role="alert"><AlertCircle size={16} />{error}</div>}
       <DialogFooter><Button type="submit" disabled={busy}>{busy ? '处理中…' : dialog === 'new' ? '创建并加入' : '加入项目'}</Button></DialogFooter>
-    </form></DialogContent></Dialog>
+    </form>}</DialogContent></Dialog>
   </div>
 }

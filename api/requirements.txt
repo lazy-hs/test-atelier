@@ -12,5 +12,11 @@ pypdfium2>=4,<6
 python-docx>=1,<2
 pillow>=11,<13
 httpx>=0.27,<1
-cryptography>=43,<47
+# Linux production images and Apple Silicon development use the patched wheel
+# series (50.x includes the PKCS#7 fixes in addition to the 49.x certificate
+# fixes). Intel macOS keeps the last universal2 wheel available without a
+# local OpenSSL/Rust toolchain; that environment is development-only and is
+# explicitly called out in SECURITY.md.
+cryptography>=50,<51; sys_platform != "darwin" or platform_machine == "arm64"
+cryptography>=48.0.1,<49; sys_platform == "darwin" and platform_machine != "arm64"
 alembic>=1.14,<2

@@ -1,0 +1,94 @@
+groups:
+  - name: test-atelier.production
+    rules:
+      - alert: TestAtelierApiUnavailable
+        # ``absent`` also fires when the scrape target disappears entirely;
+        # a missing series must not look healthier than an explicit 0.
+        expr: up{job="test-atelier-api"} == 0 or absent(up{job="test-atelier-api"})
+        for: 2m
+        labels:
+          severity: critical
+          service: test-atelier
+        annotations:
+          summary: Test Atelier API is unavailable
+          description: The API scrape target has been down for more than two minutes.
+
+      - alert: TestAtelierApiNotReady
+        expr: probe_success{job="test-atelier-ready"} == 0 or absent(probe_success{job="test-atelier-ready"})
+        for: 1m
+        labels:
+          severity: critical
+          service: test-atelier
+        annotations:
+          summary: Test Atelier API is not ready
+          description: The ready probe has failed for more than one minute.
+
+      - alert: TestAtelierWorkerUnavailable
+        expr: test_atelier_worker_up == 0 or absent(test_atelier_worker_up)
+        for: 2m
+        labels:
+          severity: critical
+          service: test-atelier-worker
+        annotations:
+          summary: Test Atelier worker heartbeat is unavailable
+          description: The durable worker has not reported a healthy heartbeat.
+
+      - alert: TestAtelierWorkerHeartbeatStale
+        expr: test_atelier_worker_heartbeat_threshold_seconds > 0 and test_atelier_worker_heartbeat_age_seconds > test_atelier_worker_heartbeat_threshold_seconds
+        for: 2m
+        labels:
+          severity: warning
+          service: test-atelier-worker
+        annotations:
+          summary: Test Atelier worker heartbeat is stale
+          description: The worker heartbeat age has exceeded the configured heartbeat threshold.
+
+      - alert: TestAtelierAiQueueNearCapacity
+        expr: test_atelier_ai_jobs_capacity > 0 and test_atelier_ai_jobs_active / test_atelier_ai_jobs_capacity > 0.8
+        for: 10m
+        labels:
+          severity: warning
+          service: test-atelier
+        annotations:
+          summary: Test Atelier AI queue is near capacity
+          description: More than 80 percent of durable or embedded AI queue capacity has been used for ten minutes.
+
+      - alert: TestAtelierProviderTimeouts
+        expr: sum by (provider) (rate(test_atelier_model_requests_total{outcome="timeout"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: test-atelier-ai
+        annotations:
+          summary: Test Atelier provider timeouts detected
+          description: A model provider has reported timeouts continuously for five minutes.
+
+      - alert: TestAtelierCliUnavailable
+        expr: test_atelier_cli_enabled{provider=~"codex_cli|claude_code"} == 1 and on(provider) test_atelier_cli_available{provider=~"codex_cli|claude_code"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          service: test-atelier-ai
+        annotations:
+          summary: Test Atelier CLI provider is unavailable
+          description: A configured local CLI is not executable in the API or worker runtime.
+
+      - alert: TestAtelierApiErrors
+        expr: sum(rate(test_atelier_requests_total{status=~"5.."}[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          service: test-atelier-api
+        annotations:
+          summary: Test Atelier API 5xx rate is elevated
+          description: API server errors exceed 0.05 requests per second for five minutes.
+
+      - alert: TestAtelierDatabasePoolSaturated
+        expr: test_atelier_db_pool_size > 0 and test_atelier_db_pool_checked_out >= test_atelier_db_pool_size
+        for: 5m
+        labels:
+          severity: warning
+          service: test-atelier-api
+        annotations:
+          summary: Test Atelier database pool is saturated
+          description: All configured database pool connections have been checked out for five minutes; inspect slow queries or increase pool capacity carefully.

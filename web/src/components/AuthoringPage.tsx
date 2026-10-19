@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { AlertCircle, Download, Plus, RefreshCw, Save, Send, Trash2 } from 'lucide-react'
+import { AlertCircle, Download, Eye, Plus, RefreshCw, Save, Send, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
-import { api, rawApi, type AiJob, type Analysis, type Draft, type DraftPayload } from '@/lib/api'
+import { api, formatAiError, rawApi, type AiJob, type Analysis, type Draft, type DraftPayload } from '@/lib/api'
+import { PromptViewerDialog } from '@/components/PromptViewerDialog'
 
 function download(response: Response, blob: Blob) {
   const disposition = response.headers.get('Content-Disposition') ?? ''
@@ -29,6 +30,7 @@ export function AuthoringPage({ projectId, readonly, onOpenCases }: { projectId:
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  const [promptOpen, setPromptOpen] = useState(false)
 
   const refresh = useCallback(async () => {
     const runs = await api<Analysis[]>(`${base}/analyses`)
@@ -102,11 +104,11 @@ export function AuthoringPage({ projectId, readonly, onOpenCases }: { projectId:
     {notice && <div className="ai-alert" role="status">{notice}</div>}
     <div className="authoring-toolbar"><label htmlFor="analysis-select">分析报告</label><select id="analysis-select" value={analysisId} onChange={event => setAnalysisId(event.target.value)}>
       {analyses.length ? analyses.map(item => <option value={item.id} key={item.id}>{new Date(item.created_at).toLocaleString('zh-CN')} · {item.result.requirements?.length ?? 0} 条需求</option>) : <option value="">暂无已完成的分析报告</option>}
-    </select><Button onClick={() => void generate()} disabled={readonly || busy || !analysisId || Boolean(unresolved) || drafts.length > 0 || job?.status === 'running' || job?.status === 'queued'}><Plus data-icon="inline-start" />生成草稿</Button>
+    </select>{job && <Button variant="outline" onClick={() => setPromptOpen(true)} disabled={busy}><Eye data-icon="inline-start" />查看提示词</Button>}<Button onClick={() => void generate()} disabled={readonly || busy || !analysisId || Boolean(unresolved) || drafts.length > 0 || job?.status === 'running' || job?.status === 'queued'}><Plus data-icon="inline-start" />生成草稿</Button>
       {drafts.length > 0 && <><Button variant="outline" onClick={() => void exportFile('xlsx')} disabled={busy}><Download data-icon="inline-start" />Excel</Button><Button variant="outline" onClick={() => void exportFile('xmind')} disabled={busy}><Download data-icon="inline-start" />XMind</Button></>}</div>
     {unresolved && <div className="ai-alert warning"><AlertCircle size={16} />分析报告仍有关键歧义待确认</div>}
     {drafts.length > 0 && quality && <div className={`ai-alert ${quality.errors.length ? 'error' : quality.warnings.length ? 'warning' : ''}`} role="status">需求覆盖 {quality.coverage}% · {drafts.length} 条草稿{quality.errors.map(item => ` · ${item}`)}{quality.warnings.map(item => ` · ${item}`)}</div>}
-    {job?.status === 'failed' && <div className="ai-alert error"><AlertCircle size={16} />{job.error}{!readonly && <Button variant="outline" size="sm" onClick={() => void retry()} disabled={busy}><RefreshCw data-icon="inline-start" />重试</Button>}</div>}
+    {job?.status === 'failed' && <div className="ai-alert error"><AlertCircle size={16} />{formatAiError(job.error)}{!readonly && <Button variant="outline" size="sm" onClick={() => void retry()} disabled={busy}><RefreshCw data-icon="inline-start" />重试</Button>}</div>}
     {(job?.status === 'queued' || job?.status === 'running') && <div className="ai-processing" role="status">正在生成用例草稿</div>}
     <div className="ai-columns authoring-columns"><aside className="ai-rail"><div className="ai-rail-heading"><h2>用例草稿</h2><Badge variant="secondary">{drafts.length}</Badge></div>
       {drafts.length ? drafts.map(item => <button className={`draft-row ${item.id === selected ? 'is-active' : ''}`} key={item.id} onClick={() => setSelected(item.id)}><strong>{item.payload.title}</strong><span>{item.payload.requirement_ids.join(', ')} · {item.payload.priority} · {item.status === 'published' ? '已发布' : '草稿'}</span></button>) : <div className="ai-empty">从已确认的分析报告生成草稿</div>}
@@ -123,5 +125,6 @@ export function AuthoringPage({ projectId, readonly, onOpenCases }: { projectId:
       <div className="draft-fields draft-extra"><label>适用端<Input value={form.label} onChange={event => change({ label: event.target.value })} disabled={readonly || current.status === 'published'} /></label><label>备注<Input value={form.remark} onChange={event => change({ remark: event.target.value })} disabled={readonly || current.status === 'published'} /></label></div>
       {current.status === 'draft' && !readonly && <div className="draft-actions"><Button variant="outline" onClick={() => void save()} disabled={busy}><Save data-icon="inline-start" />保存草稿</Button><Button onClick={() => void publish()} disabled={busy}><Send data-icon="inline-start" />发布到用例库</Button></div>}
     </motion.div> : <motion.div key="empty" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="ai-empty main"><h2>选择一条用例草稿</h2></motion.div>}</AnimatePresence></section></div>
+    <PromptViewerDialog projectId={projectId} jobId={job?.id ?? null} open={promptOpen} onOpenChange={setPromptOpen} />
   </div>
 }

@@ -123,6 +123,28 @@ def test_xmind_leaf_paths(format_name):
     assert warnings
 
 
+def test_xmind_tree_limits_are_enforced(monkeypatch):
+    from api import importers
+
+    monkeypatch.setattr(importers, "MAX_XMIND_NODES", 1)
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as archive:
+        archive.writestr("content.json", json.dumps([{"rootTopic": {"title": "Root", "children": {"attached": [{"title": "Leaf"}]}}}]))
+    with pytest.raises(importers.ImportErrorDetail, match="节点数量超过限制"):
+        importers.parse("limited.xmind", stream.getvalue())
+
+
+def test_xmind_depth_limit_handles_empty_titles(monkeypatch):
+    from api import importers
+
+    monkeypatch.setattr(importers, "MAX_XMIND_DEPTH", 0)
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w") as archive:
+        archive.writestr("content.json", json.dumps([{"rootTopic": {"title": "", "children": {"attached": [{"title": "Leaf"}]}}}]))
+    with pytest.raises(importers.ImportErrorDetail, match="层级超过限制"):
+        importers.parse("depth-limited.xmind", stream.getvalue())
+
+
 def test_reader_cannot_import_or_review(client):
     headers = auth(client)
     project_id = client.post("/api/v1/projects", json={"name": "P"}, headers=headers).json()["id"]

@@ -25,13 +25,12 @@ def upgrade():
         if name not in existing:
             op.add_column("ai_settings", sa.Column(name, type_, nullable=False,
                                                      server_default=sa.false() if isinstance(type_, sa.Boolean) else sa.text("''")))
-    # Defaults are only needed while adding columns; ORM supplies them afterwards.
-    for name, _, _ in columns:
-        try:
+    # Defaults are only needed while adding columns; ORM supplies them
+    # afterwards. SQLite cannot alter column defaults in place, so retain the
+    # harmless default there while surfacing real PostgreSQL migration errors.
+    if bind.dialect.name != "sqlite":
+        for name, _, _ in columns:
             op.alter_column("ai_settings", name, server_default=None)
-        except Exception:
-            # SQLite cannot always alter defaults; leaving a harmless default is fine.
-            pass
 
 
 def downgrade():

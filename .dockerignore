@@ -7,5 +7,12 @@ __pycache__/
 *.pyc
 *.db
 data/
+backups/
+.test-atelier-logs/
+.git/
+.pytest_cache/
+*.tar.gz
+*.log
+.env
 .DS_Store
 outputs/

@@ -9,17 +9,29 @@ and optionally executes a repository script.  Business validation remains in
 from __future__ import annotations
 
 import json
+import logging
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .observability import env_float, redact_sensitive_text, sanitized_subprocess_environment
+
 
 DEFAULT_ROOT = Path("/Users/lazy/huangsheng/project/qa-doc-skills")
 PROJECT_REGISTRY = Path(__file__).resolve().parents[1] / "skills" / "registry.json"
+SKILL_SCRIPT_TIMEOUT = env_float("AI_STUDIO_SKILL_SCRIPT_TIMEOUT", 120, 1.0)
+logger = logging.getLogger(__name__)
+
+
+def _script_environment() -> dict[str, str]:
+    """Keep application credentials out of repository-owned helper scripts."""
+    return sanitized_subprocess_environment()
 
 
 class SkillRunnerError(RuntimeError):
@@ -77,7 +89,9 @@ def discover_skills() -> list[SkillSpec]:
         path = root / spec.path
         description = ""
         if path.is_file():
-            description = _frontmatter(path.read_text(encoding="utf-8")).get("description", "")
+            # Frontmatter is metadata only; do not read an arbitrarily large
+            # repository-owned skill into API memory just to discover a label.
+            description = _frontmatter(_read(path, 12000)).get("description", "")
         result.append(SkillSpec(**{**spec.__dict__, "description": description}))
     return result
 
@@ -92,7 +106,10 @@ def get_skill(skill_id: str) -> SkillSpec:
 def _read(path: Path, limit: int = 30000) -> str:
     if not path.is_file():
         raise SkillRunnerError(f"技能文件不存在: {path}")
-    return path.read_text(encoding="utf-8")[:limit]
+    # Read at most the requested prefix from the file descriptor. Slicing the
+    # result of ``read_text`` would load an unbounded skill/reference first.
+    with path.open("r", encoding="utf-8") as stream:
+        return stream.read(max(0, limit))
 
 
 def load_reference(name: str, limit: int = 16000) -> str:
@@ -121,12 +138,95 @@ def _safe_script(path: Path) -> None:
         raise SkillRunnerError("脚本路径必须位于技能仓库内")
 
 
+def _stop_process(process: subprocess.Popen[str]) -> None:
+    """Terminate a skill subprocess and its descendants without shell use."""
+    try:
+        if os.name != "nt":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name != "nt":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
 def run_script(script: str, args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run a repository Python script without shell interpolation."""
     path = skill_root() / script
     _safe_script(path)
-    return subprocess.run([sys.executable, str(path), *args], cwd=str(cwd or skill_root()),
-                          text=True, capture_output=True, check=False, timeout=120)
+    started = time.perf_counter()
+    logger.info("skill.script.started", extra={"event": "skill.script.started", "script": script,
+                                                "component": "skill-runner"})
+    command = [sys.executable, str(path), *args]
+    from . import ai_engine
+    try:
+        # Skill scripts can run after a long model turn (for example XMind
+        # export). Use the same cancellation source as provider calls so a
+        # worker stop or lost lease does not wait for the full 120-second
+        # subprocess timeout. A process group prevents grandchildren from
+        # surviving a graceful shutdown on POSIX hosts.
+        cancel_event = ai_engine.get_cancel_event()
+        if cancel_event is None:
+            result = subprocess.run(command, cwd=str(cwd or skill_root()),
+                                    text=True, capture_output=True, check=False, shell=False,
+                                    timeout=SKILL_SCRIPT_TIMEOUT,
+                                    start_new_session=(os.name != "nt"), env=_script_environment())
+        else:
+            process = subprocess.Popen(command, cwd=str(cwd or skill_root()),
+                                       text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       shell=False, start_new_session=(os.name != "nt"),
+                                       env=_script_environment())
+            deadline = time.perf_counter() + SKILL_SCRIPT_TIMEOUT
+            try:
+                while True:
+                    if cancel_event.is_set():
+                        _stop_process(process)
+                        process.communicate()
+                        logger.info("skill.script.cancelled", extra={
+                            "event": "skill.script.cancelled", "script": script,
+                            "component": "skill-runner",
+                            "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                        })
+                        raise ai_engine.CliCancelled("worker stop requested")
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        _stop_process(process)
+                        stdout, stderr = process.communicate()
+                        raise subprocess.TimeoutExpired(command, SKILL_SCRIPT_TIMEOUT, output=stdout, stderr=stderr)
+                    try:
+                        stdout, stderr = process.communicate(timeout=min(0.25, remaining))
+                        result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            finally:
+                if process.poll() is None and cancel_event.is_set():
+                    _stop_process(process)
+    except ai_engine.CliCancelled:
+        raise
+    except Exception as exc:
+        logger.warning("skill.script.failed", extra={
+            "event": "skill.script.failed", "script": script, "component": "skill-runner",
+            "error_type": type(exc).__name__,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+        })
+        raise
+    event = "skill.script.finished" if result.returncode == 0 else "skill.script.failed"
+    logger.log(logging.INFO if result.returncode == 0 else logging.WARNING, event, extra={
+        "event": event, "script": script, "returncode": result.returncode,
+        "component": "skill-runner", "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+        "error_type": "SkillScriptError" if result.returncode else None,
+    })
+    return result
 
 
 def generate_xmind(cases: list[dict], title: str) -> bytes:
@@ -138,7 +238,7 @@ def generate_xmind(cases: list[dict], title: str) -> bytes:
         source.write_text(json.dumps(cases, ensure_ascii=False), encoding="utf-8")
         result = run_script("scripts/generate_xmind.py", ["-f", str(source), "-o", str(output), "--title", title])
         if result.returncode != 0 or not output.is_file():
-            raise SkillRunnerError((result.stderr or result.stdout or "XMind 生成失败").strip()[:500])
+            raise SkillRunnerError(redact_sensitive_text(result.stderr or result.stdout or "XMind 生成失败"))
         return output.read_bytes()
 
 

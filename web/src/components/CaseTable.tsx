@@ -52,7 +52,7 @@ export function CaseTable({ items, total, page, selected, loading, query, onQuer
             <TableCell><span className={item.assignee ? '' : 'pending-text'} title={item.assignee ?? ''}>{item.assignee ?? '未分派'}</span></TableCell>
             <TableCell>{item.pending_suggestion_count > 0 ? <span className="suggestion-count">{item.pending_suggestion_count} 条</span> : '—'}</TableCell>
             <TableCell><span className={item.review_status === 'reviewed' ? 'reviewed-text' : 'pending-text'}>{item.review_status === 'reviewed' ? '已审核' : '待审核'}</span></TableCell>
-            {!readonly && <TableCell onClick={event => event.stopPropagation()} onKeyDown={event => event.stopPropagation()}><Button variant="ghost" size="icon-sm" aria-label={`删除用例 ${item.original_id}`} title="删除用例" onClick={() => onDelete(item.id)}><Trash2 /></Button></TableCell>}
+            {!readonly && <TableCell onClick={event => event.stopPropagation()} onKeyDown={event => event.stopPropagation()}><Button variant="destructive" size="icon-sm" aria-label={`删除用例 ${item.original_id}`} title="删除用例" onClick={() => onDelete(item.id)}><Trash2 /></Button></TableCell>}
           </motion.tr>)}
         </TableBody>
       </Table>

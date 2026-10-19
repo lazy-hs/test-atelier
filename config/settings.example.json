@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "models": {
+    "local": {
+      "enabled": true,
+      "url": "http://127.0.0.1:11434",
+      "model": "qwen3:8b"
+    },
+    "remote": {
+      "enabled": false,
+      "url": "",
+      "model": "",
+      "api_key_encrypted": ""
+    },
+    "cli": {
+      "codex": {
+        "enabled": false,
+        "command": "codex",
+        "model": ""
+      },
+      "claude": {
+        "enabled": false,
+        "command": "claude",
+        "model": ""
+      }
+    },
+    "providers": []
+  },
+  "skills_root": "",
+  "skills": []
+}

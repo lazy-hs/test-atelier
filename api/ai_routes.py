@@ -2,25 +2,50 @@
 
 import io
 import json
+import logging
 import os
 import subprocess
 import uuid
 import httpx
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask
 
-from . import ai_engine, ai_jobs
+from . import ai_engine, ai_jobs, config_file
 from .skill_runner import SkillRunnerError, discover_skills, generate_xmind as generate_skill_xmind
 from .db import AiJob, AiSettings, AnalysisRun, Case, CaseDraft, ImportBatch, ProjectSkill, SourceDocument, User, utcnow
 from .document_extract import extract
+from .observability import monotonic, redact_sensitive_text, request_id as current_request_id
+from .storage import open_private_regular_file, write_private_atomic
+
+logger = logging.getLogger(__name__)
+
+
+def _prompt_texts(job: AiJob) -> list[str]:
+    """Normalize persisted prompt history before calculating or returning it.
+
+    The current schema stores plain strings, but early development databases
+    could contain structured ``{"text": ...}`` entries. Prompt inspection is
+    a diagnostic path and must not turn one malformed legacy row into a 500.
+    Invalid entries are ignored rather than exposing arbitrary object data as
+    a React child or attempting to measure a non-string value.
+    """
+    normalized: list[str] = []
+    for value in list(job.prompts or []):
+        if isinstance(value, str):
+            normalized.append(value)
+        elif isinstance(value, dict) and isinstance(value.get("text"), str):
+            normalized.append(value["text"])
+    return normalized
 
 DOCUMENT_DIR = Path(os.getenv("AI_STUDIO_DATA_DIR", str(Path(__file__).resolve().parents[1] / "data"))) / "documents"
 MAX_FILE_BYTES = 20 * 1024 * 1024
@@ -28,7 +53,7 @@ MAX_FILE_BYTES = 20 * 1024 * 1024
 
 class AnalysisCreate(BaseModel):
     source_ids: list[str] = Field(min_length=1, max_length=10)
-    provider: str = "local"
+    provider: str = Field(default="local", max_length=32)
 
 
 class ReportEdit(BaseModel):
@@ -58,15 +83,102 @@ class AiSettingsUpdate(BaseModel):
     codex_binary: str = Field(default="", max_length=255)
     codex_model: str = Field(default="", max_length=120)
     claude_enabled: bool = False
-    claude_command: str = Field(default="claude", min_length=1, max_length=255)
+    claude_command: str = Field(default="claude", max_length=255)
     claude_model: str = Field(default="", max_length=120)
+    providers: list[dict] | None = Field(default=None, max_length=50)
     provider: str = "local"
+
+
+class ProviderProbeRequest(BaseModel):
+    provider_id: str = Field(default="", max_length=80)
+    endpoint: str = Field(min_length=1, max_length=255)
+    protocol: Literal["openai", "responses", "anthropic", "gemini", "system-one"] = "openai"
+    model: str = Field(default="", max_length=160)
+    models: list[str] = Field(default_factory=list, max_length=30)
+    api_key: str = Field(default="", max_length=1000)
 
 
 def valid_url(value: str, required: bool = False) -> bool:
     if not value:
         return not required
     return urlparse(value).scheme in {"http", "https"} and bool(urlparse(value).netloc)
+
+
+def _provider_key(settings: AiSettings, provider_id: str, typed_key: str) -> str:
+    if typed_key.strip():
+        return typed_key.strip()
+    try:
+        catalog = json.loads(settings.providers_json or "[]")
+    except (TypeError, ValueError):
+        catalog = []
+    for item in catalog if isinstance(catalog, list) else []:
+        if isinstance(item, dict) and str(item.get("id")) == provider_id:
+            encrypted = str(item.get("api_key_encrypted") or "")
+            if encrypted:
+                return ai_engine.decrypt_secret(encrypted)
+    return ""
+
+
+def _probe_provider(endpoint: str, protocol: str, model: str, api_key: str) -> dict:
+    """Send a minimal request used by protocol/model detection."""
+    base = endpoint.rstrip("/")
+    headers = {"Accept": "application/json"}
+    params: dict[str, str] = {}
+    if protocol in {"openai", "responses", "system-one"}:
+        url = f"{base}/responses" if protocol == "responses" else f"{base}/chat/completions"
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        body = {"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}
+        if protocol == "responses":
+            body = {"model": model, "input": "ping", "max_output_tokens": 1}
+    elif protocol == "anthropic":
+        url = f"{base}/messages"
+        if api_key:
+            headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
+        body = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]}
+    else:
+        url = f"{base}/models/{quote(model, safe='')}:generateContent"
+        if api_key:
+            params["key"] = api_key
+        body = {"contents": [{"parts": [{"text": "ping"}]}]}
+    response = httpx.post(url, headers=headers, params=params, json=body, timeout=10)
+    ok = 200 <= response.status_code < 300
+    result = {"ok": ok, "status": response.status_code, "protocol": protocol, "model": model}
+    if not ok:
+        result["error"] = redact_sensitive_text(response.text[:240] or "请求失败")
+    return result
+
+
+def _listed_models(endpoint: str, protocol: str, api_key: str) -> list[dict[str, str]]:
+    base = endpoint.rstrip("/")
+    headers = {"Accept": "application/json"}
+    params: dict[str, str] = {}
+    if protocol == "gemini":
+        url = f"{base}/models"
+        if api_key:
+            params["key"] = api_key
+    else:
+        url = f"{base}/models"
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+    response = httpx.get(url, headers=headers, params=params, timeout=10)
+    response.raise_for_status()
+    payload = response.json()
+    raw = payload.get("models", payload.get("data", [])) if isinstance(payload, dict) else []
+    output: list[dict[str, str]] = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, str):
+            model_id = item
+            name = item
+        elif isinstance(item, dict):
+            model_id = str(item.get("id") or item.get("name") or "").removeprefix("models/")
+            name = str(item.get("name") or item.get("id") or model_id).removeprefix("models/")
+        else:
+            continue
+        if model_id:
+            output.append({"id": model_id[:160], "name": name[:160]})
+    return output[:200]
 
 
 def run_dict(run: AnalysisRun) -> dict:
@@ -125,7 +237,21 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
 
     def config_dict(settings: AiSettings, user: User) -> dict:
         admin = user.role == "admin"
+        try:
+            providers = json.loads(settings.providers_json or "[]")
+            if not isinstance(providers, list):
+                providers = []
+        except (TypeError, ValueError):
+            providers = []
+        # Never return encrypted provider secrets to the browser.
+        providers = [
+            {key: item[key] for key in ("id", "kind", "name", "endpoint", "model", "enabled", "detail", "protocol") if key in item}
+            | {"api_key_set": bool(item.get("api_key_encrypted"))}
+            for item in providers if isinstance(item, dict)
+        ]
+        local_enabled = ai_engine.catalog_provider_enabled(settings.providers_json, "local")
         return {"local_url": settings.local_url, "local_model": settings.local_model,
+                "local_enabled": local_enabled,
                 "remote_enabled": bool(settings.remote_enabled) and admin,
                 "remote_url": settings.remote_url if admin else "",
                 "remote_model": settings.remote_model if admin else "",
@@ -137,7 +263,8 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
                 "codex_model": settings.codex_model if admin else "",
                 "claude_enabled": bool(settings.claude_enabled),
                 "claude_command": settings.claude_command if admin else "",
-                "claude_model": settings.claude_model if admin else ""}
+                "claude_model": settings.claude_model if admin else "",
+                "providers": providers if admin else []}
 
     @router.get("/ai/config")
     def model_config(project_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
@@ -161,7 +288,8 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         settings = settings_for(db)
         if not valid_url(local_url) or (payload.remote_enabled and not valid_url(remote_url, required=True)):
             raise HTTPException(422, "模型地址必须是 http 或 https 地址")
-        if payload.remote_enabled and (not payload.remote_model.strip() or (not payload.remote_api_key.strip() and not settings.remote_api_key)):
+        catalog_api_key = next((str(item.get("api_key", "")).strip() for item in (payload.providers or []) if isinstance(item, dict) and str(item.get("api_key", "")).strip()), "")
+        if payload.remote_enabled and (not payload.remote_model.strip() or (not payload.remote_api_key.strip() and not settings.remote_api_key and not catalog_api_key)):
             raise HTTPException(422, "启用远程模型时必须填写模型名称和 API Key")
         settings.local_url = local_url
         settings.local_model = payload.local_model.strip()
@@ -169,30 +297,142 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         settings.remote_url = remote_url
         settings.remote_model = payload.remote_model.strip()
         codex_command = (payload.codex_command or payload.codex_binary or "codex").strip()
-        claude_command = (payload.claude_command or "claude").strip()
+        claude_command = (payload.claude_command or "").strip() or "claude"
         for command, label in ((codex_command, "Codex"), (claude_command, "Claude Code")):
-            if not command.strip() or any(char.isspace() for char in command) or "\x00" in command:
-                raise HTTPException(422, f"{label} 命令必须是单个可执行文件路径")
+            try:
+                ai_engine._validate_cli_command(command)
+            except RuntimeError as exc:
+                raise HTTPException(422, f"{label} {exc}") from exc
         settings.codex_enabled = payload.codex_enabled
         settings.codex_command = codex_command
         settings.codex_model = payload.codex_model.strip()
         settings.claude_enabled = payload.claude_enabled
         settings.claude_command = claude_command
         settings.claude_model = payload.claude_model.strip()
+        if payload.providers is not None:
+            # Provider catalog metadata is intentionally non-secret. API keys
+            # remain in the encrypted legacy field and are never serialized.
+            try:
+                previous_catalog = json.loads(settings.providers_json or "[]")
+            except (TypeError, ValueError):
+                previous_catalog = []
+            previous_by_id = {str(item.get("id")): item for item in previous_catalog if isinstance(item, dict)}
+            catalog = []
+            for item in payload.providers:
+                if not isinstance(item, dict):
+                    continue
+                provider_id = str(item.get("id", "")).strip()[:80]
+                name = str(item.get("name", "")).strip()[:120]
+                kind = str(item.get("kind", "remote")).strip()
+                protocol = str(item.get("protocol", "openai")).strip()
+                if not provider_id or not name or kind not in {"local", "remote", "cli"} or protocol not in {"openai", "responses", "anthropic", "gemini", "system-one"}:
+                    continue
+                prior = previous_by_id.get(provider_id, {})
+                encrypted_key = str(prior.get("api_key_encrypted", ""))
+                if str(item.get("api_key", "")).strip():
+                    encrypted_key = ai_engine.encrypt_secret(str(item["api_key"]).strip())
+                catalog.append({
+                    "id": provider_id,
+                    "kind": kind,
+                    "name": name,
+                    "endpoint": str(item.get("endpoint", "")).strip()[:255],
+                    "model": str(item.get("model", "")).strip()[:120],
+                    "enabled": bool(item.get("enabled", False)),
+                    "detail": str(item.get("detail", "")).strip()[:160],
+                    "protocol": protocol,
+                    "api_key_encrypted": encrypted_key,
+                })
+            settings.providers_json = json.dumps(catalog, ensure_ascii=False)
         if payload.remote_api_key.strip():
             settings.remote_api_key = ai_engine.encrypt_secret(payload.remote_api_key.strip())
+        elif catalog_api_key:
+            settings.remote_api_key = ai_engine.encrypt_secret(catalog_api_key)
         elif not payload.remote_enabled:
             settings.remote_api_key = ""
         settings.updated_at = utcnow()
         db.commit(); db.refresh(settings)
         ai_engine.apply_config({"local_url": settings.local_url, "local_model": settings.local_model,
+                                "local_enabled": ai_engine.catalog_provider_enabled(settings.providers_json, "local"),
                                 "remote_enabled": settings.remote_enabled, "remote_url": settings.remote_url,
                                 "remote_model": settings.remote_model,
                                 "remote_api_key": ai_engine.decrypt_secret(settings.remote_api_key),
                                 "codex_enabled": settings.codex_enabled, "codex_command": settings.codex_command,
                                 "codex_model": settings.codex_model, "claude_enabled": settings.claude_enabled,
                                 "claude_command": settings.claude_command, "claude_model": settings.claude_model})
+        try:
+            config_file.persist_model_settings(settings)
+        except OSError as exc:
+            logger.error("config.file.write_failed", extra={
+                "event": "config.file.write_failed", "component": "config-file",
+                "error_type": type(exc).__name__, "actor_id": user.id,
+            })
+            raise HTTPException(503, "核心配置文件不可写") from exc
+        logger.info("ai.settings.updated", extra={
+            "event": "ai.settings.updated", "actor_id": user.id, "role": user.role,
+            "component": "ai-settings",
+        })
         return config_dict(settings, user)
+
+    @router.post("/ai/admin-config/detect", dependencies=[Depends(csrf)])
+    def detect_provider_protocol(project_id: int, payload: ProviderProbeRequest,
+                                 user: User = Depends(current_user), db: Session = Depends(get_db)):
+        scope(project_id, user, db)
+        if user.role != "admin":
+            raise HTTPException(403, "仅全局管理员可检测模型供应商")
+        if not valid_url(payload.endpoint, required=True):
+            raise HTTPException(422, "供应商地址必须是 http 或 https 地址")
+        settings = settings_for(db)
+        key = _provider_key(settings, payload.provider_id, payload.api_key)
+        model = payload.model.strip()
+        if not model:
+            try:
+                model = (_listed_models(payload.endpoint, payload.protocol, key) or [{"id": "test-model"}])[0]["id"]
+            except (httpx.HTTPError, OSError):
+                model = "test-model"
+        results = []
+        for protocol in ("openai", "responses", "anthropic", "gemini", "system-one"):
+            try:
+                results.append(_probe_provider(payload.endpoint, protocol, model, key))
+            except (httpx.HTTPError, OSError) as exc:
+                results.append({"ok": False, "protocol": protocol, "model": model,
+                                "error": redact_sensitive_text(str(exc))})
+        return {"results": results}
+
+    @router.post("/ai/admin-config/test-models", dependencies=[Depends(csrf)])
+    def test_provider_models(project_id: int, payload: ProviderProbeRequest,
+                             user: User = Depends(current_user), db: Session = Depends(get_db)):
+        scope(project_id, user, db)
+        if user.role != "admin":
+            raise HTTPException(403, "仅全局管理员可检测模型供应商")
+        if not valid_url(payload.endpoint, required=True):
+            raise HTTPException(422, "供应商地址必须是 http 或 https 地址")
+        settings = settings_for(db)
+        key = _provider_key(settings, payload.provider_id, payload.api_key)
+        models = [item.strip() for item in payload.models if item.strip()][:30]
+        if not models:
+            raise HTTPException(422, "请先填写或选择至少一个模型")
+        results = []
+        for model in models:
+            try:
+                results.append(_probe_provider(payload.endpoint, payload.protocol, model, key))
+            except (httpx.HTTPError, OSError) as exc:
+                results.append({"ok": False, "protocol": payload.protocol, "model": model,
+                                "error": redact_sensitive_text(str(exc))})
+        return {"results": results}
+
+    @router.post("/ai/admin-config/models", dependencies=[Depends(csrf)])
+    def fetch_provider_models(project_id: int, payload: ProviderProbeRequest,
+                              user: User = Depends(current_user), db: Session = Depends(get_db)):
+        scope(project_id, user, db)
+        if user.role != "admin":
+            raise HTTPException(403, "仅全局管理员可获取模型列表")
+        if not valid_url(payload.endpoint, required=True):
+            raise HTTPException(422, "供应商地址必须是 http 或 https 地址")
+        try:
+            models = _listed_models(payload.endpoint, payload.protocol, _provider_key(settings_for(db), payload.provider_id, payload.api_key))
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, "无法获取供应商模型列表") from exc
+        return {"models": models}
 
     @router.post("/ai/admin-config/test", dependencies=[Depends(csrf)])
     def test_admin_model_config(project_id: int, payload: AiSettingsUpdate,
@@ -204,24 +444,37 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         remote_required = payload.provider == "remote"
         if not valid_url(local_url) or (remote_required and not valid_url(remote_url, required=True)):
             raise HTTPException(422, "模型地址必须是 http 或 https 地址")
+        test_started = monotonic()
+        tested_provider = payload.provider
+        test_error_type = None
         try:
+            if payload.provider == "local" and not ai_engine.LOCAL_ENABLED:
+                raise ValueError("本地模型未启用")
             if payload.provider in {"codex", "codex_cli", "claude", "claude_code"}:
                 if payload.provider in {"codex", "codex_cli"}:
                     command, enabled = (payload.codex_command or payload.codex_binary or "codex").strip(), payload.codex_enabled
                     provider = "codex_cli"
                 else:
-                    command, enabled = payload.claude_command.strip(), payload.claude_enabled
+                    command, enabled = (payload.claude_command or "").strip() or "claude", payload.claude_enabled
                     provider = "claude_code"
                 if not enabled:
                     raise ValueError(f"{provider} 未启用")
-                if not command or any(char.isspace() for char in command) or "\x00" in command:
-                    raise ValueError("CLI 命令必须是单个可执行文件路径")
-                subprocess.run([command, "--version"], capture_output=True, text=True, timeout=8, check=True, shell=False)
+                try:
+                    ai_engine._validate_cli_command(command)
+                except RuntimeError as exc:
+                    raise ValueError(str(exc)) from exc
+                # A version check only proves that the executable exists. Run
+                # a small structured turn so auth and session initialization
+                # are validated before the user starts a long task.
+                tested_provider = provider
+                ai_engine.test_cli_connection(provider, command, payload.codex_model if provider in {"codex", "codex_cli"} else payload.claude_model)
                 return {"ok": True, "provider": provider, "message": "CLI 可连接"}
             if payload.provider == "remote":
-                if not payload.remote_model.strip() or not payload.remote_api_key.strip():
+                stored_key = ai_engine.decrypt_secret(settings_for(db).remote_api_key)
+                remote_api_key = payload.remote_api_key.strip() or stored_key
+                if not payload.remote_model.strip() or not remote_api_key:
                     raise ValueError("启用远程模型时必须填写模型名称和 API Key")
-                response = httpx.get(remote_url + "/models", headers={"Authorization": f"Bearer {payload.remote_api_key.strip()}"}, timeout=8)
+                response = httpx.get(remote_url + "/models", headers={"Authorization": f"Bearer {remote_api_key}"}, timeout=8)
                 response.raise_for_status()
                 return {"ok": True, "provider": "remote", "message": "远程模型服务可连接"}
             response = httpx.get(local_url + "/api/tags", timeout=8)
@@ -229,11 +482,32 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             models = [item.get("name") for item in response.json().get("models", []) if item.get("name")]
             return {"ok": True, "provider": "local", "models": models, "message": "Ollama 可连接"}
         except ValueError as exc:
+            test_error_type = type(exc).__name__
             raise HTTPException(422, str(exc)) from exc
-        except (httpx.HTTPError, ValueError) as exc:
+        except httpx.HTTPError as exc:
+            test_error_type = type(exc).__name__
             raise HTTPException(502, "模型服务无法连接或返回了无效响应") from exc
+        except ai_engine.CliTimeout as exc:
+            test_error_type = type(exc).__name__
+            raise HTTPException(504, redact_sensitive_text(str(exc))) from exc
+        except RuntimeError as exc:
+            test_error_type = type(exc).__name__
+            # Provider CLIs may include connection URLs or credential-shaped
+            # diagnostics in stderr. Keep the useful bounded summary while
+            # applying the same redaction used by structured logs.
+            raise HTTPException(502, redact_sensitive_text(str(exc))) from exc
         except (OSError, subprocess.SubprocessError) as exc:
+            test_error_type = type(exc).__name__
             raise HTTPException(502, "CLI 无法启动或返回了失败状态") from exc
+        finally:
+            logger.log(logging.WARNING if test_error_type else logging.INFO,
+                       "ai.provider.connection_test.failed" if test_error_type else "ai.provider.connection_test.succeeded",
+                       extra={
+                           "event": "ai.provider.connection_test.failed" if test_error_type else "ai.provider.connection_test.succeeded",
+                           "provider": tested_provider, "actor_id": user.id,
+                           "component": "ai-settings", "error_type": test_error_type,
+                           "duration_ms": round((monotonic() - test_started) * 1000, 2),
+                       })
 
     @router.post("/documents", dependencies=[Depends(csrf)])
     async def upload_document(project_id: int, file: UploadFile = File(...), user: User = Depends(current_user), db: Session = Depends(get_db)):
@@ -243,25 +517,39 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         data = await file.read(MAX_FILE_BYTES + 1)
         if len(data) > MAX_FILE_BYTES:
             raise HTTPException(413, "文件超过 20 MB 限制")
+        extract_started = monotonic()
         try:
             text, warnings = extract(filename, data)
         except ValueError as exc:
+            logger.warning("document.extract.failed", extra={
+                "event": "document.extract.failed", "project_id": project_id,
+                "actor_id": user.id, "error_type": type(exc).__name__,
+                "source": Path(filename).suffix.lower().lstrip("."),
+                "duration_ms": round((monotonic() - extract_started) * 1000, 2),
+            })
             raise HTTPException(422, str(exc)) from exc
         document = SourceDocument(id=uuid.uuid4().hex, project_id=project_id, user_id=user.id,
                                   filename=filename[:255], extracted_text=text, warnings=warnings)
         path = DOCUMENT_DIR / str(project_id) / f"{document.id}.bin"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
         try:
-            temporary.write_bytes(data)
-            os.replace(temporary, path)
+            write_private_atomic(path, data, root=DOCUMENT_DIR)
             db.add(document)
             db.commit()
-        except Exception:
+        except Exception as exc:
             db.rollback()
-            temporary.unlink(missing_ok=True)
             path.unlink(missing_ok=True)
+            logger.exception("document.persist.failed", extra={
+                "event": "document.persist.failed", "project_id": project_id,
+                "actor_id": user.id, "error_type": type(exc).__name__,
+            })
             raise
+        logger.info("document.uploaded", extra={
+            "event": "document.uploaded", "project_id": project_id,
+            "actor_id": user.id, "source": Path(filename).suffix.lower().lstrip("."),
+            "file_size": len(data), "text_length": len(text),
+            "warning_count": len(warnings),
+            "duration_ms": round((monotonic() - extract_started) * 1000, 2),
+        })
         return {"id": document.id, "filename": document.filename, "text": text, "warnings": warnings}
 
     @router.get("/documents")
@@ -286,9 +574,24 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         if not row or row.project_id != project_id:
             raise HTTPException(404, "文档不存在")
         path = DOCUMENT_DIR / str(project_id) / f"{row.id}.bin"
-        if not path.is_file():
+        try:
+            stream, size = open_private_regular_file(path, root=DOCUMENT_DIR)
+        except OSError as exc:
+            logger.warning("document.download.rejected", extra={
+                "event": "document.download.rejected", "project_id": project_id,
+                "actor_id": user.id, "error_type": type(exc).__name__,
+                "component": "document-storage",
+            })
             raise HTTPException(404, "原始文件不存在")
-        return FileResponse(path, headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(row.filename)}"})
+        return StreamingResponse(
+            iter(lambda: stream.read(1024 * 1024), b""),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(row.filename)}",
+                "Content-Length": str(size),
+            },
+            background=BackgroundTask(stream.close),
+        )
 
     @router.post("/analyses", dependencies=[Depends(csrf)])
     def create_analysis(project_id: int, payload: AnalysisCreate, user: User = Depends(current_user), db: Session = Depends(get_db)):
@@ -301,6 +604,8 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             payload.provider = "claude_code"
         if payload.provider not in {"local", "remote", "codex_cli", "claude_code"}:
             raise HTTPException(422, "模型类型无效")
+        if payload.provider == "local" and not ai_engine.LOCAL_ENABLED:
+            raise HTTPException(403, "本地模型未由管理员启用")
         if payload.provider == "remote" and (user.role != "admin" or not ai_engine.REMOTE_ENABLED):
             raise HTTPException(403, "远程模型未由管理员启用")
         if payload.provider == "codex_cli" and not ai_engine.CODEX_ENABLED:
@@ -316,9 +621,14 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         run = AnalysisRun(id=uuid.uuid4().hex, project_id=project_id, user_id=user.id,
                           source_ids=payload.source_ids, provider=payload.provider, result={})
         job = AiJob(id=uuid.uuid4().hex, project_id=project_id, user_id=user.id,
-                    analysis_id=run.id, kind="analysis")
+                    analysis_id=run.id, kind="analysis", request_id=current_request_id())
         db.add_all([run, job]); db.commit()
-        ai_jobs.enqueue(job.id)
+        if ai_jobs.enqueue(job.id, current_request_id()) is False:
+            raise HTTPException(503, "AI 任务队列已满，请稍后重试", headers={"Retry-After": "5"})
+        logger.info("ai_job.enqueued", extra={
+            "event": "ai_job.enqueued", "job_id": job.id, "project_id": project_id,
+            "kind": job.kind, "provider": run.provider, "actor_id": user.id,
+        })
         return {"analysis_id": run.id, "job_id": job.id, "status": "queued"}
 
     @router.get("/analyses")
@@ -347,6 +657,10 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             raise HTTPException(409, "报告已更新，请刷新")
         run.result = {**run.result, "report_markdown": payload.report_markdown, "report_edited": True}
         run.version += 1; run.updated_at = utcnow(); db.commit()
+        logger.info("analysis.report.updated", extra={
+            "event": "analysis.report.updated", "project_id": project_id,
+            "actor_id": user.id, "component": "analysis-report",
+        })
         return run_dict(run)
 
     @router.patch("/analyses/{run_id}/ambiguities/{ambiguity_id}", dependencies=[Depends(csrf)])
@@ -366,6 +680,10 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         if not result.get("report_edited"):
             result["report_markdown"] = ai_engine.render_report(result, [{"id": doc.id, "filename": doc.filename} for doc in docs])
         run.result = result; run.version += 1; run.updated_at = utcnow(); db.commit()
+        logger.info("analysis.ambiguity.decided", extra={
+            "event": "analysis.ambiguity.decided", "project_id": project_id,
+            "actor_id": user.id, "component": "analysis-report",
+        })
         return run_dict(run)
 
     @router.post("/analyses/{run_id}/generate", dependencies=[Depends(csrf)])
@@ -381,8 +699,15 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         active = db.scalar(select(AiJob.id).where(AiJob.analysis_id == run_id, AiJob.kind == "cases", AiJob.status.in_(["queued", "running"])) .limit(1))
         if existing or active:
             raise HTTPException(409, "已有草稿或生成任务，请勿重复提交")
-        job = AiJob(id=uuid.uuid4().hex, project_id=project_id, user_id=user.id, analysis_id=run_id, kind="cases")
-        db.add(job); db.commit(); ai_jobs.enqueue(job.id)
+        job = AiJob(id=uuid.uuid4().hex, project_id=project_id, user_id=user.id, analysis_id=run_id,
+                    kind="cases", request_id=current_request_id())
+        db.add(job); db.commit()
+        if ai_jobs.enqueue(job.id, current_request_id()) is False:
+            raise HTTPException(503, "AI 任务队列已满，请稍后重试", headers={"Retry-After": "5"})
+        logger.info("ai_job.enqueued", extra={
+            "event": "ai_job.enqueued", "job_id": job.id, "project_id": project_id,
+            "kind": job.kind, "provider": run.provider, "actor_id": user.id,
+        })
         return {"job_id": job.id, "status": "queued"}
 
     @router.get("/ai/jobs/{job_id}")
@@ -391,7 +716,61 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         job = db.get(AiJob, job_id)
         if not job or job.project_id != project_id:
             raise HTTPException(404, "任务不存在")
-        return {"id": job.id, "kind": job.kind, "status": job.status, "error": job.error, "attempts": job.attempts, "analysis_id": job.analysis_id}
+        return {"id": job.id, "kind": job.kind, "status": job.status, "error": job.error,
+                "attempts": job.attempts, "analysis_id": job.analysis_id,
+                "request_id": job.request_id or "",
+                "prompt_calls": job.prompt_calls or 0, "prompt_length": job.prompt_length or 0,
+                "prompt_available": bool(job.prompts)}
+
+    def _load_prompt_job(project_id: int, job_id: str, user: User, db: Session) -> AiJob:
+        """Load exact prompts without exposing provider configuration secrets.
+
+        Project access is required just like the job status endpoint.  Prompts
+        are never written to application logs; the hash lets clients verify a
+        cached copy without exposing any additional configuration values.
+        """
+        scope(project_id, user, db)
+        job = db.get(AiJob, job_id)
+        if not job or job.project_id != project_id:
+            raise HTTPException(404, "任务不存在")
+        return job
+
+    @router.get("/ai/jobs/{job_id}/prompt")
+    def job_prompt(project_id: int, job_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+        """Legacy singular endpoint returning the raw prompt strings."""
+        job = _load_prompt_job(project_id, job_id, user, db)
+        prompts = _prompt_texts(job)
+        logger.info("ai_prompt.viewed", extra={
+            "event": "ai_prompt.viewed", "job_id": job.id, "project_id": project_id,
+            "analysis_id": job.analysis_id, "kind": job.kind, "actor_id": user.id, "prompt_calls": len(prompts),
+            "prompt_length": sum(len(item) for item in prompts), "component": "prompt-viewer",
+        })
+        return {"job_id": job.id, "analysis_id": job.analysis_id, "kind": job.kind,
+                "status": job.status, "prompts": prompts,
+                "prompt_calls": job.prompt_calls or len(prompts),
+                "prompt_length": job.prompt_length or sum(len(item) for item in prompts),
+                "prompt_sha256": job.prompt_sha256 or ""}
+
+    @router.get("/ai/jobs/{job_id}/prompts")
+    def job_prompts(project_id: int, job_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+        """Structured prompt history used by the prompt viewer."""
+        job = _load_prompt_job(project_id, job_id, user, db)
+        prompts = _prompt_texts(job)
+        run = db.get(AnalysisRun, job.analysis_id)
+        provider = run.provider if run else ""
+        logger.info("ai_prompt.viewed", extra={
+            "event": "ai_prompt.viewed", "job_id": job.id, "project_id": project_id,
+            "analysis_id": job.analysis_id, "kind": job.kind, "provider": provider, "actor_id": user.id,
+            "prompt_calls": len(prompts), "prompt_length": sum(len(item) for item in prompts),
+            "component": "prompt-viewer",
+        })
+        entries = [{"index": index, "provider": provider, "text": text, "length": len(text)}
+                   for index, text in enumerate(prompts, start=1)]
+        return {"job_id": job.id, "analysis_id": job.analysis_id, "kind": job.kind,
+                "status": job.status, "prompts": entries,
+                "prompt_calls": job.prompt_calls or len(prompts),
+                "prompt_length": job.prompt_length or sum(len(item) for item in prompts),
+                "prompt_sha256": job.prompt_sha256 or ""}
 
     @router.get("/ai/jobs")
     def jobs(project_id: int, analysis_id: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
@@ -402,7 +781,10 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             query = query.where(AiJob.analysis_id == analysis_id)
         rows = db.scalars(query.order_by(AiJob.created_at.desc())).all()
         return [{"id": job.id, "kind": job.kind, "status": job.status, "error": job.error,
-                 "attempts": job.attempts, "analysis_id": job.analysis_id} for job in rows]
+                 "attempts": job.attempts, "analysis_id": job.analysis_id,
+                 "request_id": job.request_id or "",
+                 "prompt_calls": job.prompt_calls or 0, "prompt_length": job.prompt_length or 0,
+                 "prompt_available": bool(job.prompts)} for job in rows]
 
     @router.post("/ai/jobs/{job_id}/retry", dependencies=[Depends(csrf)])
     def retry(project_id: int, job_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
@@ -412,7 +794,15 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             raise HTTPException(404, "任务不存在")
         if job.status != "failed":
             raise HTTPException(409, "只能重试失败任务")
-        job.status = "queued"; job.error = ""; db.commit(); ai_jobs.enqueue(job.id)
+        job.status = "queued"; job.error = ""
+        job.lease_owner = ""; job.lease_until = 0.0; job.lease_heartbeat = 0.0
+        db.commit()
+        if ai_jobs.enqueue(job.id, current_request_id()) is False:
+            raise HTTPException(503, "AI 任务队列已满，请稍后重试", headers={"Retry-After": "5"})
+        logger.info("ai_job.requeued", extra={
+            "event": "ai_job.requeued", "job_id": job.id, "project_id": project_id,
+            "kind": job.kind, "actor_id": user.id,
+        })
         return {"job_id": job.id, "status": "queued"}
 
     @router.get("/drafts")

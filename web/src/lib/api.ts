@@ -2,10 +2,11 @@ export type User = { id: number; username: string; role: 'admin' | 'reviewer' | 
 export type Project = { id: number; name: string; role: 'admin' | 'manager' | 'reviewer' | 'reader' }
 export type ProjectSkill = { skill_id: string; name: string; label: string; source_path: string; description: string; enabled: boolean; updated_at: string }
 export type AiConfig = {
-  local_url: string; local_model: string; remote_enabled: boolean; remote_url: string; remote_model: string
+  local_url: string; local_model: string; local_enabled?: boolean; remote_enabled: boolean; remote_url: string; remote_model: string
   remote_api_key_set: boolean; remote_api_key_mask: string
   codex_enabled: boolean; codex_command: string; codex_binary?: string; codex_model: string
   claude_enabled: boolean; claude_command: string; claude_model: string
+  providers?: { id: string; kind: 'local' | 'remote' | 'cli'; name: string; endpoint: string; model: string; enabled: boolean; detail: string; protocol?: 'openai' | 'responses' | 'anthropic' | 'gemini' | 'system-one'; api_key_set?: boolean }[]
 }
 export type Case = {
   id: number; original_id: string; title: string; directory: string; level: string; smoke: string
@@ -44,7 +45,16 @@ export type Analysis = { id: string; source_ids: string[]; status: string; provi
 export type DraftPayload = { module: string[]; title: string; priority: string; precondition: string;
   steps: { action: string; expected: string }[]; requirement_ids: string[]; method: string; label: string; remark: string; smoke: string }
 export type Draft = { id: string; analysis_id: string; payload: DraftPayload; status: string; version: number; case_id: number | null }
-export type AiJob = { id: string; kind: string; status: string; error: string; attempts: number; analysis_id: string }
+export type AiJob = { id: string; kind: string; status: string; error: string; attempts: number; analysis_id: string;
+  request_id?: string; prompt_calls?: number; prompt_length?: number; prompt_available?: boolean }
+export type AiPromptLog = { index: number; provider: string; text: string; length: number }
+
+/** Keep persisted errors from older workers readable after provider renames. */
+export function formatAiError(message: string | null | undefined): string {
+  return (message || 'AI 任务失败，请检查模型输出与服务配置后重试')
+    .replace(/^codex_cli CLI/, 'Codex CLI')
+    .replace(/^claude_code CLI/, 'Claude Code')
+}
 export type SmokeItem = { id: number; case_id: number; case_version: number; original_id: string; title: string;
   level: string | null; smoke: string | null; stale: boolean; chain_name: string;
   estimated_seconds: number; confirmed_at: string }
@@ -79,7 +89,9 @@ export async function rawApi(path: string, init: RequestInit = {}): Promise<Resp
   const response = await fetch(`/api/v1${path}`, { ...init, headers, credentials: 'same-origin' })
   if (!response.ok) {
     const data = await response.json().catch(() => ({}))
-    throw new Error(typeof data.detail === 'string' ? data.detail : `请求失败 (${response.status})`)
+    const message = typeof data.detail === 'string' ? data.detail : `请求失败 (${response.status})`
+    const requestId = response.headers.get('x-request-id')
+    throw new Error(requestId ? `${message}（请求编号 ${requestId}）` : message)
   }
   return response
 }

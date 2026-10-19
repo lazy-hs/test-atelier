@@ -1,6 +1,14 @@
 services:
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "3"
     environment:
       POSTGRES_DB: ai_studio
       POSTGRES_USER: ai_studio
@@ -14,37 +22,198 @@ services:
       retries: 10
 
   api:
+    init: true
+    restart: unless-stopped
+    # Application code and the Python runtime are immutable at runtime. The
+    # data volume is the only durable write surface; /tmp and HOME remain
+    # private tmpfs mounts for parsers such as LibreOffice.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    # The API image runs as the unprivileged app user and needs no Linux
+    # capabilities. Keep the process boundary explicit if the host runtime
+    # grants a broader default capability set.
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m
+      - /home/app:rw,nosuid,nodev,size=128m
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "3"
     build:
       context: .
       dockerfile: api/Dockerfile
     environment:
       DATABASE_URL: postgresql+psycopg://ai_studio:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db:5432/ai_studio
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
       AI_STUDIO_SESSION_SECRET: ${AI_STUDIO_SESSION_SECRET:?Set AI_STUDIO_SESSION_SECRET}
+      AI_STUDIO_ENV: ${AI_STUDIO_ENV:-production}
+      AI_STUDIO_RELEASE: ${AI_STUDIO_RELEASE:-}
       AI_STUDIO_ADMIN_PASSWORD: ${AI_STUDIO_ADMIN_PASSWORD:?Set AI_STUDIO_ADMIN_PASSWORD}
       AI_STUDIO_DATA_DIR: /app/data
+      TEST_ATELIER_SKILL_ROOT: /app/qa-doc-skills
+      AI_STUDIO_REQUIRE_MIGRATIONS: ${AI_STUDIO_REQUIRE_MIGRATIONS:-1}
+      AI_STUDIO_MIGRATION_HEAD: ${AI_STUDIO_MIGRATION_HEAD:-20261024_queue_capacity}
+      AI_STUDIO_MIGRATION_TIMEOUT: ${AI_STUDIO_MIGRATION_TIMEOUT:-120}
+      AI_STUDIO_SHUTDOWN_TIMEOUT: ${AI_STUDIO_SHUTDOWN_TIMEOUT:-25}
+      AI_STUDIO_MAX_SUBMITTED_JOBS: ${AI_STUDIO_MAX_SUBMITTED_JOBS:-100}
+      AI_STUDIO_LOGIN_FAILURE_LIMIT: ${AI_STUDIO_LOGIN_FAILURE_LIMIT:-8}
+      AI_STUDIO_LOGIN_FAILURE_WINDOW_SECONDS: ${AI_STUDIO_LOGIN_FAILURE_WINDOW_SECONDS:-60}
+      AI_STUDIO_SESSION_MAX_AGE: ${AI_STUDIO_SESSION_MAX_AGE:-28800}
+      AI_STUDIO_MAX_REQUEST_BYTES: ${AI_STUDIO_MAX_REQUEST_BYTES:-26214400}
+      AI_STUDIO_TRUST_PROXY_HEADERS: ${AI_STUDIO_TRUST_PROXY_HEADERS:-1}
+      AI_STUDIO_EXTERNAL_WORKER: ${AI_STUDIO_EXTERNAL_WORKER:-1}
+      AI_STUDIO_WORKER_HEARTBEAT: /app/data/.worker-heartbeat
+      AI_STUDIO_WORKER_HEARTBEAT_SECONDS: ${AI_STUDIO_WORKER_HEARTBEAT_SECONDS:-5}
       AI_STUDIO_OLLAMA_URL: ${AI_STUDIO_OLLAMA_URL:-http://host.docker.internal:11434}
       AI_STUDIO_OLLAMA_MODEL: ${AI_STUDIO_OLLAMA_MODEL:-qwen3:8b}
       AI_STUDIO_REMOTE_ENABLED: ${AI_STUDIO_REMOTE_ENABLED:-0}
       AI_STUDIO_REMOTE_URL: ${AI_STUDIO_REMOTE_URL:-}
       AI_STUDIO_REMOTE_MODEL: ${AI_STUDIO_REMOTE_MODEL:-}
       AI_STUDIO_REMOTE_API_KEY: ${AI_STUDIO_REMOTE_API_KEY:-}
+      AI_STUDIO_CODEX_ENABLED: ${AI_STUDIO_CODEX_ENABLED:-0}
+      AI_STUDIO_CODEX_COMMAND: ${AI_STUDIO_CODEX_COMMAND:-codex}
+      AI_STUDIO_CODEX_MODEL: ${AI_STUDIO_CODEX_MODEL:-}
+      AI_STUDIO_CLAUDE_ENABLED: ${AI_STUDIO_CLAUDE_ENABLED:-0}
+      AI_STUDIO_CLAUDE_COMMAND: ${AI_STUDIO_CLAUDE_COMMAND:-claude}
+      AI_STUDIO_CLAUDE_MODEL: ${AI_STUDIO_CLAUDE_MODEL:-}
+      AI_STUDIO_CLI_TIMEOUT: ${AI_STUDIO_CLI_TIMEOUT:-600}
+      AI_STUDIO_CLI_TEST_TIMEOUT: ${AI_STUDIO_CLI_TEST_TIMEOUT:-45}
+      AI_STUDIO_SKILL_SCRIPT_TIMEOUT: ${AI_STUDIO_SKILL_SCRIPT_TIMEOUT:-120}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_INCLUDE_TRACEBACK: ${LOG_INCLUDE_TRACEBACK:-0}
+      METRICS_ENABLED: ${METRICS_ENABLED:-1}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
     extra_hosts:
       - host.docker.internal:host-gateway
     volumes:
       - files_data:/app/data
+      - ${TEST_ATELIER_SKILL_ROOT:?Set TEST_ATELIER_SKILL_ROOT}:/app/qa-doc-skills:ro
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    stop_grace_period: 30s
+
+  worker:
+    init: true
+    restart: unless-stopped
+    # Keep the worker root filesystem immutable; only its shared data volume
+    # and bounded runtime tmpfs mounts may be written.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m
+      - /home/app:rw,nosuid,nodev,size=128m
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "3"
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://ai_studio:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db:5432/ai_studio
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
+      AI_STUDIO_SESSION_SECRET: ${AI_STUDIO_SESSION_SECRET:?Set AI_STUDIO_SESSION_SECRET}
+      AI_STUDIO_ENV: ${AI_STUDIO_ENV:-production}
+      AI_STUDIO_RELEASE: ${AI_STUDIO_RELEASE:-}
+      AI_STUDIO_DATA_DIR: /app/data
+      TEST_ATELIER_SKILL_ROOT: /app/qa-doc-skills
+      AI_STUDIO_EXTERNAL_WORKER: "1"
+      AI_STUDIO_MAX_SUBMITTED_JOBS: ${AI_STUDIO_MAX_SUBMITTED_JOBS:-100}
+      AI_STUDIO_REQUIRE_MIGRATIONS: "1"
+      AI_STUDIO_MIGRATION_HEAD: ${AI_STUDIO_MIGRATION_HEAD:-20261024_queue_capacity}
+      AI_STUDIO_WORKER_POLL_SECONDS: ${AI_STUDIO_WORKER_POLL_SECONDS:-1}
+      AI_STUDIO_WORKER_HEARTBEAT_SECONDS: ${AI_STUDIO_WORKER_HEARTBEAT_SECONDS:-5}
+      AI_STUDIO_WORKER_LEASE_SECONDS: ${AI_STUDIO_WORKER_LEASE_SECONDS:-900}
+      AI_STUDIO_WORKER_ERROR_LOG_INTERVAL_SECONDS: ${AI_STUDIO_WORKER_ERROR_LOG_INTERVAL_SECONDS:-30}
+      AI_STUDIO_WORKER_HEARTBEAT: /app/data/.worker-heartbeat
+      AI_STUDIO_OLLAMA_URL: ${AI_STUDIO_OLLAMA_URL:-http://host.docker.internal:11434}
+      AI_STUDIO_OLLAMA_MODEL: ${AI_STUDIO_OLLAMA_MODEL:-qwen3:8b}
+      AI_STUDIO_REMOTE_ENABLED: ${AI_STUDIO_REMOTE_ENABLED:-0}
+      AI_STUDIO_REMOTE_URL: ${AI_STUDIO_REMOTE_URL:-}
+      AI_STUDIO_REMOTE_MODEL: ${AI_STUDIO_REMOTE_MODEL:-}
+      AI_STUDIO_CODEX_ENABLED: ${AI_STUDIO_CODEX_ENABLED:-0}
+      AI_STUDIO_CODEX_COMMAND: ${AI_STUDIO_CODEX_COMMAND:-codex}
+      AI_STUDIO_CODEX_MODEL: ${AI_STUDIO_CODEX_MODEL:-}
+      AI_STUDIO_CLAUDE_ENABLED: ${AI_STUDIO_CLAUDE_ENABLED:-0}
+      AI_STUDIO_CLAUDE_COMMAND: ${AI_STUDIO_CLAUDE_COMMAND:-claude}
+      AI_STUDIO_CLAUDE_MODEL: ${AI_STUDIO_CLAUDE_MODEL:-}
+      AI_STUDIO_CLI_TIMEOUT: ${AI_STUDIO_CLI_TIMEOUT:-600}
+      AI_STUDIO_SKILL_SCRIPT_TIMEOUT: ${AI_STUDIO_SKILL_SCRIPT_TIMEOUT:-120}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_INCLUDE_TRACEBACK: ${LOG_INCLUDE_TRACEBACK:-0}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - files_data:/app/data
+      - ${TEST_ATELIER_SKILL_ROOT:?Set TEST_ATELIER_SKILL_ROOT}:/app/qa-doc-skills:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["python", "-m", "api.worker_entrypoint"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,stat,time; p=os.environ.get('AI_STUDIO_WORKER_HEARTBEAT','/app/data/.worker-heartbeat'); s=os.lstat(p); threshold=max(30.0,float(os.environ.get('AI_STUDIO_WORKER_HEARTBEAT_SECONDS','5'))*3); assert stat.S_ISREG(s.st_mode) and time.time()-s.st_mtime<threshold"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    stop_grace_period: 30s
 
   web:
+    init: true
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m
+      - /var/cache/nginx:rw,nosuid,nodev,size=64m
+      - /var/run:rw,nosuid,nodev,size=16m
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
     build:
       context: .
       dockerfile: web/Dockerfile
     ports:
-      - 127.0.0.1:8080:80
+      - 127.0.0.1:8080:8080
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    stop_grace_period: 30s
 
 volumes:
   db_data:

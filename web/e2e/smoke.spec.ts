@@ -49,7 +49,9 @@ test('冒烟集预算提示与执行结果闭环', async ({ page }) => {
   await page.getByRole('button', { name: '创建冒烟集' }).click()
   await expect(page.getByText('冒烟集已创建')).toBeVisible()
 
-  const candidateSelect = page.getByRole('combobox', { name: '选择已审核用例' })
+  // The trigger's accessible name is its aria-label; the placeholder is
+  // visible text only and is not used for role queries.
+  const candidateSelect = page.getByRole('combobox', { name: '选择冒烟用例' })
   await candidateSelect.click()
   await page.getByRole('option').first().click()
   await page.getByRole('combobox', { name: '选择核心链路' }).click()

@@ -1,48 +1,436 @@
 import io
+import hashlib
+import ipaddress
+import json
+import logging
 import os
+import re
 import secrets
+import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
 from argon2 import PasswordHasher
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, exists, func, select, update
+from sqlalchemy import delete, exists, func, select, text, update
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 from openpyxl import Workbook
 
-from .db import (Base, AiSettings, AnalysisRun, Case, CaseComment, CaseDraft, CaseSuggestion, ConversionRecord, ExecutionRun, ImportBatch,
+from .db import (Base, AiQueueState, AiSettings, AiJob, AnalysisRun, Case, CaseComment, CaseDraft, CaseSuggestion, ConversionRecord, ExecutionRun, ImportBatch,
                  Membership, MembershipEvent, Project, ReviewEvent, RunCase, SessionLocal,
                  ProjectSkill, SmokeItem, SmokeSuite, SourceDocument, SuggestionJob, TaxonomyVersion, User,
-                 ExecutionEvent, engine, utcnow)
-from .skill_runner import SkillRunnerError, discover_skills
+                 ExecutionEvent, database_kind, engine, utcnow)
+from .skill_runner import SkillRunnerError, discover_skills, skill_root
 from .importers import ImportErrorDetail, parse
+from .observability import (FailureWindow, configure_logging, deployment_release, env_float, env_int,
+                            monotonic, new_request_id, redact_sensitive_text, reset_request_id, set_request_id)
+from .storage import ensure_private_directory, open_private_regular_file
+from . import config_file, metrics
+
+
+logger = configure_logging()
+
+
+class SessionSecretRequired(RuntimeError):
+    """Raised when the application session secret is missing or too short."""
 
 
 secret = os.getenv("AI_STUDIO_SESSION_SECRET")
 if not secret or len(secret) < 32:
-    raise RuntimeError("AI_STUDIO_SESSION_SECRET must contain at least 32 characters")
+    logger.error("application.import_failed", extra={
+        "event": "application.import_failed", "component": "configuration",
+        "error_type": "SessionSecretRequired",
+    })
+    raise SessionSecretRequired("AI_STUDIO_SESSION_SECRET must contain at least 32 characters")
 
 hasher = PasswordHasher()
+LOGIN_FAILURE_LIMIT = env_int("AI_STUDIO_LOGIN_FAILURE_LIMIT", 8, 1)
+LOGIN_FAILURE_WINDOW_SECONDS = env_float("AI_STUDIO_LOGIN_FAILURE_WINDOW_SECONDS", 60, 1.0)
+_login_failures = FailureWindow(LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW_SECONDS)
+MAX_REQUEST_BYTES = env_int("AI_STUDIO_MAX_REQUEST_BYTES", 25 * 1024 * 1024, 1)
+SESSION_MAX_AGE = env_int("AI_STUDIO_SESSION_MAX_AGE", 28800, 300)
+_ready_for_traffic = False
+_readiness_log_lock = threading.Lock()
+_readiness_log_last: dict[str, float] = {}
+_READINESS_LOG_INTERVAL_SECONDS = 30.0
+_HEARTBEAT_RELEASE_PATTERN = re.compile(r"^[A-Za-z0-9._/@:-]{1,128}$")
+# Keep the browser policy identical for direct API access and the bundled edge
+# proxy. The SPA has no inline scripts; component libraries only need inline
+# style attributes.
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
+    "script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+    "font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:;"
+)
+
+
+class RequestBodyTooLarge(Exception):
+    """Raised when a streamed request exceeds the global body limit."""
+
+
+class ProductionConfigurationError(RuntimeError):
+    """Raised when a production-only startup invariant is disabled."""
+
+
+class CookieSecureRequired(ProductionConfigurationError):
+    """Raised when production sessions are not marked HTTPS-only."""
+
+
+class MetricsTokenRequired(ProductionConfigurationError):
+    """Raised when the production metrics endpoint has no strong token."""
+
+
+class ExplicitMigrationsRequired(ProductionConfigurationError):
+    """Raised when production attempts to use implicit schema creation."""
+
+
+def _login_failure_keys(request: Request, username: str) -> tuple[str, ...]:
+    """Use opaque keys so account names and client addresses stay out of state dumps."""
+    client = _client_address(request)
+    return tuple(
+        hashlib.sha256(f"{prefix}:{value.casefold()}".encode("utf-8")).hexdigest()
+        for prefix, value in (("client", client), ("username", username.strip()))
+    )
+
+
+def _client_address(request: Request) -> str:
+    """Resolve a client address only when proxy headers are explicitly trusted.
+
+    API deployments behind the bundled Nginx proxy otherwise appear as one
+    source address to the process-local login limiter.  Never trust forwarded
+    headers for direct deployments; operators must opt in after placing the
+    API behind a controlled proxy network.
+    """
+    direct = request.client.host if request.client else "unknown"
+    if os.getenv("AI_STUDIO_TRUST_PROXY_HEADERS", "0").lower() not in {"1", "true", "yes", "on"}:
+        return direct
+    candidates = [request.headers.get("x-real-ip", "")]
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        candidates.extend(part.strip() for part in forwarded.split(","))
+    for candidate in candidates:
+        try:
+            return str(ipaddress.ip_address(candidate))
+        except ValueError:
+            continue
+    return direct
+
+
+def _route_template(request: Request) -> str:
+    """Return a bounded route label without putting IDs or queries in metrics."""
+    route = request.scope.get("route")
+    template = getattr(route, "path", None)
+    return template or "<unmatched>"
+
+
+def _log_path(request: Request) -> str:
+    """Bound and redact paths so malformed URLs cannot amplify or leak logs."""
+    # Query strings are excluded by ``request.url.path``, but clients can still
+    # place token-like values in an unmatched path.  Keep the diagnostic path
+    # useful while applying the same credential filter as exception messages.
+    return redact_sensitive_text(request.url.path[:512], 512)
+
+
+def _validate_runtime_security() -> None:
+    """Keep direct Uvicorn launches subject to production HTTP safeguards."""
+    if os.getenv("AI_STUDIO_ENV", "development").strip().lower() != "production":
+        return
+    if os.getenv("COOKIE_SECURE", "0").strip() != "1":
+        raise CookieSecureRequired("生产环境必须启用 COOKIE_SECURE=1")
+    if len(os.getenv("METRICS_TOKEN", "").strip()) < 16:
+        raise MetricsTokenRequired("生产环境必须配置至少 16 个字符的 METRICS_TOKEN")
+    if os.getenv("LOG_FORMAT", "json").strip().lower() != "json":
+        # The normal container entrypoint catches this in preflight. Keep the
+        # direct Uvicorn path safe too so an operator cannot accidentally boot
+        # production with human-readable logs that bypass the JSON contract.
+        raise ProductionConfigurationError("生产环境必须使用 LOG_FORMAT=json")
+    if os.getenv("LOG_LEVEL", "INFO").strip().upper() not in {
+        "CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG",
+    }:
+        raise ProductionConfigurationError("生产环境 LOG_LEVEL 配置无效")
+
+
+def _validate_migration_policy(environment: str, require_migrations: bool) -> None:
+    if environment == "production" and not require_migrations:
+        raise ExplicitMigrationsRequired("生产环境必须启用 AI_STUDIO_REQUIRE_MIGRATIONS=1")
+
+
+def _worker_heartbeat_path() -> str:
+    configured = os.getenv("AI_STUDIO_WORKER_HEARTBEAT", "").strip()
+    if configured:
+        return configured
+    return str(Path(os.getenv("AI_STUDIO_DATA_DIR", "data")) / ".worker-heartbeat")
+
+
+def _heartbeat_age(path: str | Path) -> float:
+    """Read heartbeat metadata from a descriptor without following links."""
+    heartbeat = Path(path)
+    # A custom heartbeat path is operator-controlled, but its parent must not
+    # redirect the API's health probe through a symlinked storage component.
+    stream, _ = open_private_regular_file(heartbeat, root=heartbeat.parent)
+    try:
+        return max(0.0, time.time() - os.fstat(stream.fileno()).st_mtime)
+    finally:
+        stream.close()
+
+
+def _heartbeat_release(path: str | Path) -> str:
+    """Read only the worker release marker from a bounded heartbeat file."""
+    heartbeat = Path(path)
+    stream, _ = open_private_regular_file(heartbeat, root=heartbeat.parent)
+    try:
+        raw = stream.read(4096)
+    finally:
+        stream.close()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        # Older workers wrote a plain timestamp. They remain liveness
+        # compatible, but intentionally do not claim a verified build.
+        return ""
+    release = payload.get("release", "") if isinstance(payload, dict) else ""
+    return release if isinstance(release, str) and _HEARTBEAT_RELEASE_PATTERN.fullmatch(release) else ""
+
+
+def _log_readiness_failure(event: str, *, level: int = logging.ERROR, **fields) -> None:
+    """Rate-limit repeated probe failures without hiding the 503 response.
+
+    Health checks can run every few seconds while a dependency is down. Keep
+    the first structured record and suppress identical noise for a short
+    window so an outage does not overwhelm the log collector.
+    """
+    key = f"{event}:{fields.get('component', '')}:{fields.get('error_type', '')}"
+    now = time.monotonic()
+    with _readiness_log_lock:
+        previous = _readiness_log_last.get(key, 0.0)
+        if previous and now - previous < _READINESS_LOG_INTERVAL_SECONDS:
+            return
+        _readiness_log_last[key] = now
+    logger.log(level, event, extra={"event": event, **fields})
+
+
+def _configured_skill_root_missing() -> list[str]:
+    """Return required skill-repository files missing from a configured root.
+
+    A mounted directory can exist while the actual workflow files are absent
+    (for example after an incorrect Docker volume mount).  Readiness must fail
+    before traffic reaches an otherwise healthy-looking API in that case.
+    Development keeps the historical implicit default path, so this stricter
+    check is only applied when ``TEST_ATELIER_SKILL_ROOT`` is explicitly set.
+    """
+    configured = os.getenv("TEST_ATELIER_SKILL_ROOT", "").strip()
+    if not configured:
+        return []
+    root = Path(configured).expanduser()
+    required = (
+        root / "AGENTS.md",
+        root / "skills" / "hub" / "SKILL.md",
+        root / "skills" / "requirement-analysis" / "SKILL.md",
+        root / "skills" / "test-cases" / "SKILL.md",
+    )
+    return [str(path) for path in required if not path.is_file()]
+
+
+def reconcile_queue_capacity(db: Session) -> tuple[int, int]:
+    """Repair durable admission state and return ``(active, released)``.
+
+    Terminal jobs should never hold a queue reservation.  Clearing those
+    flags before recounting also makes restore/upgrade recovery safe when a
+    previous process stopped between status finalization and cleanup.
+    """
+    active_statuses = ["queued", "running"]
+    external_worker = os.getenv("AI_STUDIO_EXTERNAL_WORKER", "0").lower() in {"1", "true", "yes", "on"}
+    recovered_reservations = 0
+    if external_worker:
+        # A process can crash after committing a job but before reserving its
+        # durable queue slot. Recover those rows before recounting so they do
+        # not bypass admission control or remain invisible to capacity gauges.
+        recovered_reservations = (
+            (db.execute(update(AiJob).where(
+                AiJob.queue_reserved.is_(False), AiJob.status.in_(active_statuses),
+            ).values(queue_reserved=True)).rowcount or 0)
+            + (db.execute(update(SuggestionJob).where(
+                SuggestionJob.queue_reserved.is_(False), SuggestionJob.status.in_(active_statuses),
+            ).values(queue_reserved=True)).rowcount or 0)
+        )
+    released_reservations = (
+        (db.execute(update(AiJob).where(
+            AiJob.queue_reserved.is_(True), ~AiJob.status.in_(active_statuses),
+        ).values(queue_reserved=False)).rowcount or 0)
+        + (db.execute(update(SuggestionJob).where(
+            SuggestionJob.queue_reserved.is_(True), ~SuggestionJob.status.in_(active_statuses),
+        ).values(queue_reserved=False)).rowcount or 0)
+    )
+    queue_state = db.scalar(select(AiQueueState).where(AiQueueState.id == 1).with_for_update())
+    if queue_state is None:
+        queue_state = AiQueueState(id=1)
+        try:
+            # Several API replicas can reconcile a fresh database together.
+            # Isolate the singleton insert so a duplicate winner does not
+            # abort the surrounding reservation/status transaction.
+            with db.begin_nested():
+                db.add(queue_state)
+                db.flush()
+        except IntegrityError:
+            queue_state = db.scalar(select(AiQueueState).where(AiQueueState.id == 1).with_for_update())
+            if queue_state is None:
+                raise
+    queue_state.active_jobs = (
+        (db.scalar(select(func.count()).select_from(AiJob).where(
+            AiJob.queue_reserved.is_(True), AiJob.status.in_(active_statuses))) or 0)
+        + (db.scalar(select(func.count()).select_from(SuggestionJob).where(
+            SuggestionJob.queue_reserved.is_(True), SuggestionJob.status.in_(active_statuses))) or 0)
+    )
+    queue_state.updated_at = utcnow()
+    db.flush()
+    if recovered_reservations:
+        logger.warning("queue.reservations.recovered", extra={
+            "event": "queue.reservations.recovered", "component": "queue",
+            "recovered_reservations": recovered_reservations,
+        })
+    return queue_state.active_jobs, released_reservations
+
+
+def _reconcile_queue_capacity_or_raise(db: Session, *, environment: str) -> tuple[int, int]:
+    """Reconcile durable admission state and enforce the production invariant."""
+    try:
+        return reconcile_queue_capacity(db)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        external_worker = os.getenv("AI_STUDIO_EXTERNAL_WORKER", "0").lower() in {"1", "true", "yes", "on"}
+        if environment == "production" or external_worker:
+            logger.error("queue.capacity.reconcile_failed", extra={
+                "event": "queue.capacity.reconcile_failed", "error_type": type(exc).__name__,
+                "required": True,
+            })
+            raise RuntimeError("队列容量状态无法校验，服务拒绝启动") from exc
+        logger.warning("queue.capacity.reconcile_failed", extra={
+            "event": "queue.capacity.reconcile_failed", "error_type": type(exc).__name__,
+            "required": False,
+        })
+        return 0, 0
 
 
 def initialize():
-    Base.metadata.create_all(engine)
+    environment = os.getenv("AI_STUDIO_ENV", "development").strip().lower()
+    _validate_runtime_security()
+    default_require_migrations = "1" if environment == "production" else "0"
+    require_migrations = os.getenv("AI_STUDIO_REQUIRE_MIGRATIONS", default_require_migrations).lower() in {"1", "true", "yes", "on"}
+    _validate_migration_policy(environment, require_migrations)
+    data_dir = Path(os.getenv("AI_STUDIO_DATA_DIR", "data")).expanduser()
+    try:
+        ensure_private_directory(data_dir)
+    except OSError as exc:
+        logger.error("storage.initialize.failed", extra={
+            "event": "storage.initialize.failed", "component": "storage",
+            "error_type": type(exc).__name__,
+        })
+        raise RuntimeError("数据目录不可用") from exc
+    logger.info("storage.initialized", extra={
+        "event": "storage.initialized", "component": "storage",
+    })
+    # Local one-command development may bootstrap a brand-new SQLite file.
+    # Production refuses implicit DDL and relies on the explicit Alembic step
+    # in the container/startup procedure instead.
+    if not require_migrations:
+        Base.metadata.create_all(engine)
+    from . import ai_engine
+
     with SessionLocal() as db:
+        expected_head = os.getenv("AI_STUDIO_MIGRATION_HEAD", "20261024_queue_capacity")
+        try:
+            migration_head = db.execute(text("SELECT version_num FROM alembic_version")).scalar()
+        except SQLAlchemyError as exc:
+            migration_head = None
+            if require_migrations:
+                raise RuntimeError("数据库迁移版本表不可用，请先执行 alembic upgrade head") from exc
+            logger.warning("database.migrations.unavailable", extra={
+                "event": "database.migrations.unavailable", "component": "migrations",
+                "error_type": type(exc).__name__, "required": False,
+            })
+        else:
+            logger.info("database.migrations.checked", extra={
+                "event": "database.migrations.checked", "component": "migrations",
+                "revision": migration_head or "unversioned", "required": require_migrations,
+                "database_kind": database_kind,
+            })
+        if require_migrations and migration_head != expected_head:
+            logger.error("database.migrations.version_mismatch", extra={
+                "event": "database.migrations.version_mismatch", "component": "migrations",
+                "error_type": "MigrationVersionMismatch", "revision": migration_head or "unversioned",
+                "expected_revision": expected_head, "database_kind": database_kind,
+            })
+            raise RuntimeError(f"数据库迁移版本不匹配：当前 {migration_head or '空'}，需要 {expected_head}")
         if not db.scalar(select(User.id).limit(1)):
-            password = os.getenv("AI_STUDIO_ADMIN_PASSWORD")
-            if not password or len(password) < 6:
-                raise RuntimeError("Set AI_STUDIO_ADMIN_PASSWORD (at least 6 characters) before first startup")
-            db.add(User(username=os.getenv("AI_STUDIO_ADMIN_USER", "admin"), password_hash=hasher.hash(password), role="admin"))
-            db.commit()
+            password = os.getenv("AI_STUDIO_ADMIN_PASSWORD", "").strip()
+            # Local one-click startup may leave the prompt empty; keep a
+            # predictable six-character bootstrap password for that case.
+            if not password:
+                if os.getenv("AI_STUDIO_ENV", "development").strip().lower() == "production":
+                    raise RuntimeError("Set AI_STUDIO_ADMIN_PASSWORD (at least 6 characters) before first startup")
+                password = "123456"
+            if len(password) < 6:
+                raise RuntimeError("AI_STUDIO_ADMIN_PASSWORD must contain at least 6 characters")
+            admin_username = (os.getenv("AI_STUDIO_ADMIN_USER", "admin").strip() or "admin")
+            db.add(User(username=admin_username, password_hash=hasher.hash(password), role="admin"))
+            try:
+                db.commit()
+            except IntegrityError:
+                # Multiple API replicas can observe an empty database at the
+                # same time. The first insert wins; the other replica rolls
+                # back and uses the row that was committed concurrently.
+                db.rollback()
+                existing_admin = db.scalar(select(User.id).where(User.username == admin_username))
+                if existing_admin is None:
+                    raise
+                logger.info("database.bootstrap.user_race", extra={
+                    "event": "database.bootstrap.user_race", "component": "bootstrap",
+                })
         settings = db.get(AiSettings, 1)
+        settings_seeded = False
         if not settings:
-            settings = AiSettings(id=1)
+            # Seed a brand-new database from environment defaults so a
+            # headless deployment can configure its provider before the first
+            # browser login. Later UI edits remain authoritative.
+            settings = AiSettings(
+                id=1,
+                local_url=os.getenv("AI_STUDIO_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/"),
+                local_model=os.getenv("AI_STUDIO_OLLAMA_MODEL", "qwen3:8b"),
+                remote_enabled=os.getenv("AI_STUDIO_REMOTE_ENABLED", "0").lower() in {"1", "true", "yes", "on"},
+                remote_url=os.getenv("AI_STUDIO_REMOTE_URL", "").rstrip("/"),
+                remote_model=os.getenv("AI_STUDIO_REMOTE_MODEL", ""),
+                codex_enabled=os.getenv("AI_STUDIO_CODEX_ENABLED", "0").lower() in {"1", "true", "yes", "on"},
+                codex_command=os.getenv("AI_STUDIO_CODEX_COMMAND", "codex") or "codex",
+                codex_model=os.getenv("AI_STUDIO_CODEX_MODEL", ""),
+                claude_enabled=os.getenv("AI_STUDIO_CLAUDE_ENABLED", "0").lower() in {"1", "true", "yes", "on"},
+                claude_command=os.getenv("AI_STUDIO_CLAUDE_COMMAND", "claude") or "claude",
+                claude_model=os.getenv("AI_STUDIO_CLAUDE_MODEL", ""),
+            )
+            remote_key = os.getenv("AI_STUDIO_REMOTE_API_KEY", "").strip()
+            if remote_key:
+                settings.remote_api_key = ai_engine.encrypt_secret(remote_key)
             db.add(settings)
-            db.commit()
+            try:
+                db.commit()
+            except IntegrityError:
+                # AiSettings is a singleton. Preserve the settings committed
+                # by another replica rather than overwriting its values.
+                db.rollback()
+                settings = db.get(AiSettings, 1)
+                if not settings:
+                    raise
+                logger.info("database.bootstrap.settings_race", extra={
+                    "event": "database.bootstrap.settings_race", "component": "bootstrap",
+                })
+            else:
+                settings_seeded = True
         # Existing databases created before CLI provider support have empty
         # command columns; normalize them before loading the runtime config.
         changed = False
@@ -54,33 +442,416 @@ def initialize():
             changed = True
         if changed:
             db.commit()
-        from . import ai_engine
+        # Keep the operator-facing control-plane snapshot on the durable data
+        # volume. Skill entries intentionally contain metadata and paths only.
+        try:
+            config_file.persist_skills(discover_skills(), root=str(skill_root()))
+        except (SkillRunnerError, OSError) as exc:
+            logger.warning("config.file.skills_snapshot_failed", extra={
+                "event": "config.file.skills_snapshot_failed", "component": "config-file",
+                "error_type": type(exc).__name__,
+            })
+        try:
+            config_file.persist_model_settings(settings)
+        except OSError as exc:
+            logger.error("config.file.write_failed", extra={
+                "event": "config.file.write_failed", "component": "config-file",
+                "error_type": type(exc).__name__,
+            })
+            raise RuntimeError("核心配置文件不可写，请检查数据目录权限") from exc
+        # Reconcile the singleton admission counter from durable job flags on
+        # every API start. This repairs a crash between a job finalization and
+        # the reservation counter update without trusting stale process state.
+        active_jobs, released_reservations = _reconcile_queue_capacity_or_raise(db, environment=environment)
+        db.commit()
+        metrics.set_ai_queue(active_jobs, env_int("AI_STUDIO_MAX_SUBMITTED_JOBS", 100, 1))
+        logger.info("queue.capacity.reconciled", extra={
+            "event": "queue.capacity.reconciled", "component": "queue",
+            "active_jobs": active_jobs,
+            "released_reservations": released_reservations,
+        })
+        try:
+            # A disabled provider may retain an old encrypted key so an admin
+            # can re-enable it later. Only an enabled provider should block
+            # startup when a session-secret rotation makes that key unreadable.
+            remote_api_key = (
+                ai_engine.decrypt_secret_checked(settings.remote_api_key)
+                if settings.remote_enabled else ai_engine.decrypt_secret(settings.remote_api_key)
+            )
+        except RuntimeError:
+            logger.error("ai.settings.secret_unavailable", extra={
+                "event": "ai.settings.secret_unavailable", "component": "ai-settings",
+                "error_type": "SecretDecryptionError",
+            })
+            raise
         ai_engine.apply_config({"local_url": settings.local_url, "local_model": settings.local_model,
+                                "local_enabled": ai_engine.catalog_provider_enabled(settings.providers_json, "local"),
                                 "remote_enabled": settings.remote_enabled, "remote_url": settings.remote_url,
                                 "remote_model": settings.remote_model,
-                                "remote_api_key": ai_engine.decrypt_secret(settings.remote_api_key),
+                                "remote_api_key": remote_api_key,
                                 "codex_enabled": settings.codex_enabled, "codex_command": settings.codex_command,
                                 "codex_model": settings.codex_model, "claude_enabled": settings.claude_enabled,
                                 "claude_command": settings.claude_command, "claude_model": settings.claude_model})
+        if settings_seeded:
+            logger.info("ai.settings.seeded", extra={
+                "event": "ai.settings.seeded", "component": "ai-settings", "source": "environment",
+            })
+        ai_engine.log_cli_availability("api")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    initialize()
-    from .ai_jobs import recover_jobs
-    from .suggestion_jobs import recover_jobs as recover_suggestion_jobs
-    recover_jobs()
-    recover_suggestion_jobs()
-    yield
+    global _ready_for_traffic
+    started = monotonic()
+    try:
+        # Uvicorn applies its own logging config after module import; refresh
+        # the application sinks here so request and lifecycle logs stay JSON.
+        configure_logging()
+        initialize()
+        from . import ai_jobs
+        from .suggestion_jobs import recover_jobs as recover_suggestion_jobs
+        ai_jobs.start_workers()
+        ai_jobs.recover_jobs()
+        recover_suggestion_jobs()
+        _ready_for_traffic = True
+    except Exception as exc:
+        logger.exception("application.start_failed", extra={
+            "event": "application.start_failed", "error_type": type(exc).__name__, "process_pid": os.getpid(),
+        })
+        try:
+            from . import ai_jobs
+            timeout = max(0.0, float(os.getenv("AI_STUDIO_SHUTDOWN_TIMEOUT", "25")))
+            remaining = ai_jobs.shutdown_workers(timeout)
+            logger.warning("application.start_cleanup", extra={
+                "event": "application.start_cleanup", "component": "ai-worker",
+                "active_jobs": remaining, "shutdown_timeout": timeout,
+            })
+        except Exception as cleanup_error:
+            logger.error("application.start_cleanup.failed", extra={
+                "event": "application.start_cleanup.failed", "component": "ai-worker",
+                "error_type": type(cleanup_error).__name__,
+            })
+        raise
+    logger.info("application.started", extra={"event": "application.started", "duration_ms": round((monotonic() - started) * 1000, 2),
+                                                "process_pid": os.getpid(), "queue_limit": ai_jobs.MAX_SUBMITTED_JOBS,
+                                                "session_max_age": SESSION_MAX_AGE, "max_request_bytes": MAX_REQUEST_BYTES,
+                                                "component": "external-worker" if ai_jobs.EXTERNAL_WORKER else "embedded-worker",
+                                                "database_kind": database_kind})
+    try:
+        yield
+    finally:
+        _ready_for_traffic = False
+        from . import ai_jobs
+        timeout = max(0.0, float(os.getenv("AI_STUDIO_SHUTDOWN_TIMEOUT", "25")))
+        remaining = ai_jobs.shutdown_workers(timeout)
+        logger.info("application.stopping", extra={"event": "application.stopping", "process_pid": os.getpid(),
+                                                    "active_jobs": remaining, "shutdown_timeout": timeout})
+        logger.info("application.stopped", extra={"event": "application.stopped", "process_pid": os.getpid(),
+                                                   "active_jobs": remaining})
 
 
 app = FastAPI(title="Test Atelier", version="0.2.0", lifespan=lifespan)
-app.add_middleware(SessionMiddleware, secret_key=secret, same_site="strict", https_only=os.getenv("COOKIE_SECURE") == "1")
+app.add_middleware(SessionMiddleware, secret_key=secret, same_site="strict",
+                   max_age=SESSION_MAX_AGE, https_only=os.getenv("COOKIE_SECURE") == "1")
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception(request: Request, exc: Exception):
+    """Return a stable error envelope while keeping traceback out of clients."""
+    correlation_id = getattr(request.state, "request_id", "") or new_request_id(request.headers.get("x-request-id"))
+    token = set_request_id(correlation_id)
+    try:
+        logger.exception("request.unhandled", extra={
+            "event": "request.unhandled", "method": request.method,
+            "path": _log_path(request), "error_type": type(exc).__name__, "process_pid": os.getpid(),
+        })
+    finally:
+        reset_request_id(token)
+    response = JSONResponse(status_code=500, content={"detail": "服务器内部错误", "request_id": correlation_id})
+    _set_response_headers(response, request, correlation_id)
+    return response
+
+
+def _set_response_headers(response, request: Request, correlation_id: str) -> None:
+    """Apply correlation and baseline security headers to every API response."""
+    response.headers["X-Request-ID"] = correlation_id
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+    response.headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+
+
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    """Correlate and time requests without recording body or query contents."""
+    correlation_id = new_request_id(request.headers.get("x-request-id"))
+    request.state.request_id = correlation_id
+    token = set_request_id(correlation_id)
+    started = monotonic()
+    metrics.begin_request()
+    response = None
+    error_type = None
+    try:
+        # Content-Length is easy to spoof or omit with chunked transfer. Wrap
+        # the ASGI receive channel as a second line of defense so large
+        # streamed JSON bodies cannot bypass the global request limit.
+        original_receive = request._receive
+        received_bytes = 0
+        declared_bytes = None
+
+        async def limited_receive():
+            nonlocal received_bytes
+            message = await original_receive()
+            if message.get("type") == "http.request":
+                received_bytes += len(message.get("body") or b"")
+                if received_bytes > MAX_REQUEST_BYTES:
+                    raise RequestBodyTooLarge()
+            return message
+
+        request._receive = limited_receive
+        content_length = request.headers.get("content-length", "").strip()
+        if content_length:
+            try:
+                declared_bytes = int(content_length)
+                too_large = declared_bytes > MAX_REQUEST_BYTES
+            except ValueError:
+                too_large = False
+            if too_large:
+                response = JSONResponse(status_code=413, content={
+                    "detail": "请求体超过大小限制", "request_id": correlation_id,
+                })
+            else:
+                response = await call_next(request)
+        else:
+            response = await call_next(request)
+        return response
+    except RequestBodyTooLarge:
+        error_type = "RequestBodyTooLarge"
+        response = JSONResponse(status_code=413, content={
+            "detail": "请求体超过大小限制", "request_id": correlation_id,
+        })
+        return response
+    except Exception as exc:
+        error_type = type(exc).__name__
+        logger.exception("request.failed", extra={
+            "event": "request.failed", "method": request.method,
+            "path": _log_path(request), "error_type": error_type, "process_pid": os.getpid(),
+        })
+        raise
+    finally:
+        duration_ms = round((monotonic() - started) * 1000, 2)
+        status = response.status_code if response is not None else 500
+        if response is not None:
+            _set_response_headers(response, request, correlation_id)
+        fields = {
+            "event": "request.completed", "method": request.method,
+            "path": _log_path(request), "route": _route_template(request),
+            "status": status, "duration_ms": duration_ms, "process_pid": os.getpid(),
+        }
+        if status == 413:
+            # Record only the byte count, never the rejected request body.
+            fields["request_bytes"] = received_bytes
+            if declared_bytes is not None:
+                fields["declared_bytes"] = declared_bytes
+        if error_type:
+            fields["error_type"] = error_type
+        level = logging.ERROR if status >= 500 else logging.WARNING if status >= 400 else logging.INFO
+        logger.log(level, "request.completed", extra=fields)
+        if request.method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            audit_fields = {
+                "event": "request.audit", "method": request.method,
+                "route": _route_template(request), "status": status,
+                "duration_ms": duration_ms, "process_pid": os.getpid(), "component": "audit",
+            }
+            actor_id = request.scope.get("session", {}).get("uid")
+            if actor_id is not None:
+                audit_fields["actor_id"] = actor_id
+            logger.info("request.audit", extra=audit_fields)
+        metrics.observe_request(request.method, _route_template(request), status, duration_ms)
+        reset_request_id(token)
 
 
 def get_db():
     with SessionLocal() as db:
         yield db
+
+
+@app.get("/api/v1/health", include_in_schema=False)
+@app.get("/api/v1/health/live", include_in_schema=False)
+def health_live():
+    payload = {"status": "ok", "service": "test-atelier", "version": app.version}
+    release = deployment_release()
+    if release:
+        payload["release"] = release
+    return payload
+
+
+@app.get("/api/v1/health/ready", include_in_schema=False)
+def health_ready(db: Session = Depends(get_db)):
+    if not _ready_for_traffic:
+        raise HTTPException(503, "服务正在启动或停止")
+    try:
+        db.execute(text("SELECT 1"))
+    except SQLAlchemyError as exc:
+        _log_readiness_failure("readiness.failed", error_type=type(exc).__name__)
+        raise HTTPException(503, "数据库暂不可用") from exc
+    configured_skill_root = os.getenv("TEST_ATELIER_SKILL_ROOT", "").strip()
+    if configured_skill_root and not os.path.isdir(configured_skill_root):
+        _log_readiness_failure("readiness.failed", component="skill_root", error_type="MissingDirectory")
+        raise HTTPException(503, "技能仓目录不可用")
+    missing_skill_files = _configured_skill_root_missing()
+    if missing_skill_files:
+        _log_readiness_failure("readiness.failed", component="skill_root", error_type="MissingWorkflowFiles",
+                               required=len(missing_skill_files))
+        raise HTTPException(503, "技能仓工作流文件不可用")
+    data_dir = Path(os.getenv("AI_STUDIO_DATA_DIR", "data")).expanduser()
+    if data_dir.is_symlink() or not data_dir.is_dir() or not os.access(data_dir, os.W_OK):
+        _log_readiness_failure("readiness.failed", component="storage",
+                               error_type="StorageSymlink" if data_dir.is_symlink() else "StorageUnavailable")
+        raise HTTPException(503, "数据目录不可写")
+    payload = {"status": "ready", "service": "test-atelier", "version": app.version}
+    release = deployment_release()
+    if release:
+        payload["release"] = release
+    return payload
+
+
+@app.get("/api/v1/health/worker", include_in_schema=False)
+def health_worker():
+    """Report the durable worker heartbeat without making API readiness circular."""
+    from . import ai_jobs
+    if not ai_jobs.EXTERNAL_WORKER:
+        metrics.set_worker_health(False)
+        _log_readiness_failure("worker.readiness.disabled", level=logging.WARNING, component="external-worker")
+        payload = {"status": "disabled", "service": "test-atelier", "component": "external-worker"}
+        release = deployment_release()
+        if release:
+            payload["release"] = release
+        return payload
+    heartbeat = _worker_heartbeat_path()
+    threshold = max(30.0, env_float("AI_STUDIO_WORKER_HEARTBEAT_SECONDS", 5, 1.0) * 3)
+    metrics.set_worker_heartbeat_threshold(threshold)
+    try:
+        age = _heartbeat_age(heartbeat)
+    except OSError as exc:
+        metrics.set_worker_health(False)
+        _log_readiness_failure("worker.readiness.failed", component="external-worker",
+                               error_type=type(exc).__name__)
+        raise HTTPException(503, "AI worker 心跳不可用") from exc
+    if age > threshold:
+        metrics.set_worker_health(False, age)
+        _log_readiness_failure("worker.readiness.stale", component="external-worker",
+                               worker_age_seconds=round(age, 3))
+        raise HTTPException(503, "AI worker 心跳已过期")
+    metrics.set_worker_health(True, age)
+    payload = {"status": "ready", "service": "test-atelier", "component": "external-worker",
+               "heartbeat_age_seconds": round(age, 3)}
+    try:
+        worker_release = _heartbeat_release(heartbeat)
+    except OSError as exc:
+        # The heartbeat can be replaced during a restart. Treat a vanished or
+        # unsafe metadata file as the same unavailable dependency as a stale
+        # mtime instead of leaking a generic 500 from the health endpoint.
+        metrics.set_worker_health(False, age)
+        _log_readiness_failure("worker.readiness.failed", component="external-worker",
+                               error_type=type(exc).__name__)
+        raise HTTPException(503, "AI worker 心跳元数据不可用") from exc
+    if worker_release:
+        payload["worker_release"] = worker_release
+    release = deployment_release()
+    if release:
+        payload["release"] = release
+        if worker_release and worker_release != release:
+            _log_readiness_failure(
+                "worker.readiness.version_mismatch",
+                level=logging.WARNING,
+                component="external-worker",
+                error_type="ReleaseMismatch",
+                worker_release=worker_release,
+            )
+        elif not worker_release:
+            # A legacy worker may still update the heartbeat without recording
+            # its build. Keep readiness green for backwards compatibility,
+            # but surface the unverifiable rollout state to operators.
+            _log_readiness_failure(
+                "worker.readiness.version_unknown",
+                level=logging.WARNING,
+                component="external-worker",
+                error_type="MissingWorkerRelease",
+            )
+    return payload
+
+
+def _refresh_database_pool_metrics() -> None:
+    """Read SQLAlchemy pool gauges without making a diagnostic DB request."""
+    pool = getattr(engine, "pool", None)
+    if pool is None:
+        return
+    try:
+        def value(name: str, default: int = 0) -> int:
+            attribute = getattr(pool, name, None)
+            return int(attribute() if callable(attribute) else default)
+
+        metrics.set_database_pool(
+            value("size"), value("checkedout"), value("overflow"),
+        )
+    except Exception:
+        # Pool implementations differ between SQLite and PostgreSQL. Metrics
+        # must never turn a healthy diagnostics endpoint into a 500 response.
+        metrics.set_database_pool(0, 0, 0)
+
+
+@app.get("/api/v1/metrics", include_in_schema=False, response_class=PlainTextResponse)
+def metrics_endpoint(request: Request):
+    """Expose low-cardinality Prometheus metrics for internal scrapers."""
+    if not metrics.enabled():
+        raise HTTPException(404, "Not found")
+    configured_token = os.getenv("METRICS_TOKEN", "").strip()
+    if configured_token:
+        supplied = request.headers.get("x-metrics-token", "")
+        authorization = request.headers.get("authorization", "")
+        if not supplied and authorization.lower().startswith("bearer "):
+            supplied = authorization[7:].strip()
+        # Authenticate before touching the database or worker heartbeat so an
+        # unauthorised scrape cannot turn this diagnostic endpoint into a
+        # repeated database/IO probe.
+        if not secrets.compare_digest(supplied, configured_token):
+            logger.warning("metrics.auth.failed", extra={
+                "event": "metrics.auth.failed", "component": "metrics",
+                "error_type": "InvalidMetricsToken",
+            })
+            raise HTTPException(401, "Metrics authentication required")
+    from . import ai_jobs
+    if not ai_jobs.EXTERNAL_WORKER:
+        metrics.set_worker_health(False)
+    else:
+        threshold = max(30.0, env_float("AI_STUDIO_WORKER_HEARTBEAT_SECONDS", 5, 1.0) * 3)
+        metrics.set_worker_heartbeat_threshold(threshold)
+        # Queue reservations are finalized in the external worker process,
+        # so refresh this gauge from the durable singleton row before serving
+        # metrics instead of exposing a stale API-process snapshot.
+        try:
+            with SessionLocal() as db:
+                active_jobs = db.scalar(select(AiQueueState.active_jobs).where(AiQueueState.id == 1)) or 0
+            metrics.set_ai_queue(active_jobs, env_int("AI_STUDIO_MAX_SUBMITTED_JOBS", 100, 1))
+        except SQLAlchemyError as exc:
+            logger.warning("metrics.queue_refresh_failed", extra={
+                "event": "metrics.queue_refresh_failed", "component": "external-queue",
+                "error_type": type(exc).__name__,
+            })
+        heartbeat = _worker_heartbeat_path()
+        try:
+            age = _heartbeat_age(heartbeat)
+            metrics.set_worker_health(age <= threshold, age)
+        except OSError:
+            metrics.set_worker_health(False)
+    _refresh_database_pool_metrics()
+    return PlainTextResponse(metrics.render_prometheus(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 def current_user(request: Request, db: Session = Depends(get_db)):
@@ -129,7 +900,19 @@ def ensure_project_skills(project_id: int, db: Session) -> list[ProjectSkill]:
     try:
         specs = discover_skills()
     except SkillRunnerError as exc:
-        raise HTTPException(503, str(exc)) from exc
+        logger.warning("project.skills.unavailable", extra={
+            "event": "project.skills.unavailable",
+            "error_type": type(exc).__name__, "component": "skill-runner",
+        })
+        raise HTTPException(503, "项目技能仓不可用") from exc
+    try:
+        config_file.persist_skills(specs)
+    except OSError as exc:
+        logger.error("config.file.write_failed", extra={
+            "event": "config.file.write_failed", "component": "config-file",
+            "error_type": type(exc).__name__,
+        })
+        raise HTTPException(503, "核心配置文件不可写") from exc
     existing = {row.skill_id: row for row in db.scalars(select(ProjectSkill).where(ProjectSkill.project_id == project_id)).all()}
     changed = False
     for spec in specs:
@@ -166,8 +949,12 @@ class Named(BaseModel):
 
 class UserCreate(BaseModel):
     username: str = Field(min_length=2, max_length=80)
-    password: str = Field(min_length=12)
+    password: str = Field(min_length=6, max_length=256)
     role: str
+
+
+class PasswordUpdate(BaseModel):
+    password: str = Field(min_length=6, max_length=256)
 
 
 class MembershipCreate(BaseModel):
@@ -182,7 +969,7 @@ class MembershipRoleUpdate(BaseModel):
 
 class ProjectMemberCreate(BaseModel):
     username: str = Field(min_length=2, max_length=80)
-    password: str = Field(min_length=12)
+    password: str = Field(min_length=6, max_length=256)
     role: Literal["manager", "reviewer", "reader"] = "reviewer"
 
 
@@ -231,22 +1018,38 @@ def csrf_token(request: Request):
 
 @app.post("/api/v1/auth/login", dependencies=[Depends(csrf)])
 def login(payload: Login, request: Request, db: Session = Depends(get_db)):
+    failure_keys = _login_failure_keys(request, payload.username)
+    if _login_failures.blocked(failure_keys):
+        retry_after = _login_failures.retry_after(failure_keys)
+        logger.warning("auth.login.rate_limited", extra={
+            "event": "auth.login.rate_limited", "error_type": "too_many_attempts",
+            "retry_after_seconds": retry_after,
+        })
+        raise HTTPException(429, "登录失败次数过多，请稍后重试",
+                            headers={"Retry-After": str(retry_after)})
     user = db.scalar(select(User).where(User.username == payload.username))
     try:
         valid = bool(user and hasher.verify(user.password_hash, payload.password))
     except Exception:
         valid = False
     if not valid:
+        _login_failures.record(failure_keys)
+        logger.warning("auth.login.failed", extra={"event": "auth.login.failed", "error_type": "invalid_credentials"})
         raise HTTPException(401, "用户名或密码错误")
+    _login_failures.clear(failure_keys)
     request.session.clear()
     request.session["uid"] = user.id
     request.session["csrf"] = secrets.token_urlsafe(32)
+    logger.info("auth.login.succeeded", extra={"event": "auth.login.succeeded", "actor_id": user.id, "role": user.role})
     return {"id": user.id, "username": user.username, "role": user.role, "csrf": request.session["csrf"]}
 
 
 @app.post("/api/v1/auth/logout", dependencies=[Depends(csrf)])
 def logout(request: Request):
+    actor_id = request.session.get("uid")
     request.session.clear()
+    if actor_id is not None:
+        logger.info("auth.logout.succeeded", extra={"event": "auth.logout.succeeded", "actor_id": actor_id})
     return {"ok": True}
 
 
@@ -274,13 +1077,30 @@ def create_project(payload: Named, user: User = Depends(current_user), db: Sessi
     db.add(Membership(project_id=project.id, user_id=user.id, role="manager"))
     db.add(MembershipEvent(project_id=project.id, user_id=user.id, actor_id=user.id, action="added", after_role="manager"))
     try:
-        for spec in discover_skills():
+        specs = discover_skills()
+        try:
+            config_file.persist_skills(specs)
+        except OSError as exc:
+            logger.error("config.file.write_failed", extra={
+                "event": "config.file.write_failed", "component": "config-file",
+                "error_type": type(exc).__name__, "actor_id": user.id,
+            })
+            raise HTTPException(503, "核心配置文件不可写") from exc
+        for spec in specs:
             db.add(ProjectSkill(project_id=project.id, skill_id=spec.skill_id, name=spec.name,
                                 label=spec.label, source_path=spec.path, description=spec.description,
                                 enabled=spec.enabled_by_default))
     except SkillRunnerError as exc:
-        raise HTTPException(503, str(exc)) from exc
+        logger.warning("project.skills.unavailable", extra={
+            "event": "project.skills.unavailable", "actor_id": user.id,
+            "error_type": type(exc).__name__, "component": "skill-runner",
+        })
+        raise HTTPException(503, "项目技能仓不可用") from exc
     db.commit()
+    logger.info("project.created", extra={
+        "event": "project.created", "project_id": project.id, "actor_id": user.id,
+        "component": "project",
+    })
     return {"id": project.id, "name": project.name, "role": "admin" if user.role == "admin" else "manager"}
 
 
@@ -368,7 +1188,29 @@ def create_user(payload: UserCreate, user: User = Depends(current_user), db: Ses
     created = User(username=payload.username, password_hash=hasher.hash(payload.password), role=payload.role)
     db.add(created)
     db.commit()
+    logger.info("user.created", extra={
+        "event": "user.created", "actor_id": user.id, "role": payload.role,
+        "component": "identity",
+    })
     return {"id": created.id, "username": created.username, "role": created.role}
+
+
+@app.patch("/api/v1/users/{user_id}/password", dependencies=[Depends(csrf)])
+def update_user_password(user_id: int, payload: PasswordUpdate,
+                         user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Allow a global administrator to rotate an account password in the UI."""
+    if user.role != "admin":
+        raise HTTPException(403, "仅全局管理员可修改账号密码")
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(404, "账号不存在")
+    target.password_hash = hasher.hash(payload.password)
+    db.commit()
+    logger.info("user.password_updated", extra={
+        "event": "user.password_updated", "actor_id": user.id, "target_user_id": target.id,
+        "component": "identity",
+    })
+    return {"id": target.id, "username": target.username, "role": target.role}
 
 
 @app.post("/api/v1/projects/{project_id}/members", dependencies=[Depends(csrf)])
@@ -477,15 +1319,28 @@ async def preview(project_id: int, file: UploadFile = File(...), user: User = De
     if not file.filename or file.filename.lower().rsplit(".", 1)[-1] not in ("xls", "xlsx", "xmind"):
         raise HTTPException(400, "文件类型不支持")
     data = await file.read(10 * 1024 * 1024 + 1)
+    preview_started = monotonic()
     try:
         headers, rows, warnings = parse(file.filename, data)
     except ImportErrorDetail as exc:
+        logger.warning("import.preview.failed", extra={
+            "event": "import.preview.failed", "project_id": project_id,
+            "actor_id": user.id, "error_type": type(exc).__name__,
+            "source": Path(file.filename).suffix.lower().lstrip("."),
+            "duration_ms": round((monotonic() - preview_started) * 1000, 2),
+        })
         raise HTTPException(400, str(exc)) from exc
     if not rows:
         raise HTTPException(400, "没有可导入的用例")
     batch = ImportBatch(project_id=project_id, filename=file.filename[:255], headers=headers, rows=rows, warnings=warnings)
     db.add(batch)
     db.commit()
+    logger.info("import.preview.completed", extra={
+        "event": "import.preview.completed", "project_id": project_id,
+        "actor_id": user.id, "source": Path(file.filename).suffix.lower().lstrip("."),
+        "file_size": len(data), "row_count": len(rows), "warning_count": len(warnings),
+        "duration_ms": round((monotonic() - preview_started) * 1000, 2),
+    })
     return {"id": batch.id, "filename": batch.filename, "headers": headers, "count": len(rows), "sample": rows[:5], "warnings": warnings}
 
 
@@ -511,6 +1366,10 @@ def confirm(project_id: int, batch_id: int, user: User = Depends(current_user), 
                     level=field(row, "用例等级"), smoke=field(row, "是否冒烟用例"), original=row))
     batch.status = "done"
     db.commit()
+    logger.info("import.confirmed", extra={
+        "event": "import.confirmed", "project_id": project_id,
+        "actor_id": user.id, "row_count": len(batch.rows),
+    })
     return {"count": len(batch.rows), "status": "done"}
 
 
