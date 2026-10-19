@@ -320,6 +320,7 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
     def create_codex_session(project_id: int, payload: CodexSessionCreate,
                              user: User = Depends(current_user), db: Session = Depends(get_db)):
         scope(project_id, user, db)
+        writable(user, project_id, db)
         command, model, enabled = codex_config(db)
         if not ai_engine.CODEX_ENABLED or not enabled:
             raise HTTPException(409, "Codex CLI 未启用")
