@@ -22,7 +22,7 @@ jobs:
       DATABASE_URL: sqlite://
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -189,7 +189,7 @@ jobs:
       # The preflight checks the same cryptography baseline used by the API
       # image. Install the declared Linux dependencies instead of relying on
       # whatever packages happen to be preloaded on the GitHub runner.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
