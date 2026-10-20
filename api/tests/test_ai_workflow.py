@@ -125,6 +125,15 @@ def test_document_analysis_authoring_and_exports(context, monkeypatch, tmp_path)
     assert structured_prompt["prompts"][0]["text"] == analysis_prompt.json()["prompts"][0]
     report = client.get(f"{root}/analyses/{analysis_id}").json()
     assert report["result"]["requirements"][0]["source_ids"] == [doc_id]
+    # Analysis history entries should identify the source material rather than
+    # exposing only an opaque timestamp.  The detail and collection payloads
+    # share the same filename/title metadata used by the UI history rail.
+    assert report["source_filenames"] == ["r.md"]
+    assert report["title"] == "r.md"
+    assert report["created_at"]
+    listed = client.get(f"{root}/analyses").json()
+    assert listed[0]["source_filenames"] == ["r.md"]
+    assert listed[0]["title"] == "r.md"
     assert client.post(f"{root}/analyses/{analysis_id}/generate", headers=headers).status_code == 409
     edited = client.patch(f"{root}/analyses/{analysis_id}/report", json={"version": report["version"], "report_markdown": "# 人工修订\n登录规则"}, headers=headers)
     assert edited.status_code == 200
@@ -133,10 +142,15 @@ def test_document_analysis_authoring_and_exports(context, monkeypatch, tmp_path)
     assert decision.status_code == 200, decision.text
     assert decision.json()["result"]["report_markdown"] == "# 人工修订\n登录规则"
     assert client.patch(f"{root}/analyses/{analysis_id}/ambiguities/AQ-1", json={"version": report["version"], "decision": "8 次"}, headers=headers).status_code == 409
-    generated = client.post(f"{root}/analyses/{analysis_id}/generate", headers=headers)
+    # Case generation can use a different enabled tool than the analysis
+    # stage; the selected provider is persisted on the run before enqueueing.
+    monkeypatch.setattr(ai_engine, "CODEX_ENABLED", True)
+    generated = client.post(f"{root}/analyses/{analysis_id}/generate",
+                            json={"provider": "codex"}, headers=headers)
     assert generated.status_code == 200, generated.text
     cases_job_id = generated.json()["job_id"]
     assert wait_job(client, root, cases_job_id)["status"] == "done"
+    assert client.get(f"{root}/analyses/{analysis_id}").json()["provider"] == "codex_cli"
     cases_prompt = client.get(f"{root}/ai/jobs/{cases_job_id}/prompt")
     assert cases_prompt.status_code == 200
     assert cases_prompt.json()["prompt_calls"] == 1

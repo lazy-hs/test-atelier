@@ -1,5 +1,6 @@
 import os
 import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -52,6 +53,9 @@ def enable_codex(client: TestClient, headers: dict[str, str], project_id: int):
 def test_codex_session_turn_keeps_bounded_conversation(context, monkeypatch):
     client, headers, project_id = context
     enable_codex(client, headers, project_id)
+    # The legacy project workdir setting must not reintroduce checkout context
+    # into a newly created workbench session.
+    monkeypatch.setenv("AI_STUDIO_CODEX_WORKDIR", str(Path.cwd()))
     calls = []
 
     def fake_turn(prompt, command, model, cwd):
@@ -63,6 +67,13 @@ def test_codex_session_turn_keeps_bounded_conversation(context, monkeypatch):
     created = client.post(root, json={"title": "验证会话"}, headers=headers)
     assert created.status_code == 200, created.text
     session_id = created.json()["id"]
+    workspace = Path(created.json()["working_directory"])
+    assert workspace.is_dir()
+    assert not list(workspace.iterdir())
+    assert workspace.resolve() != Path.cwd().resolve()
+    assert workspace.stat().st_mode & 0o777 == 0o700
+    second_created = client.post(root, json={"title": "另一个会话"}, headers=headers).json()
+    assert second_created["working_directory"] != str(workspace)
 
     first = client.post(f"{root}/{session_id}/turn", json={"prompt": "检查项目"}, headers=headers)
     assert first.status_code == 200, first.text
@@ -72,6 +83,8 @@ def test_codex_session_turn_keeps_bounded_conversation(context, monkeypatch):
     assert second.json()["messages"][-1]["content"] == "answer-2"
     assert "user: 检查项目" in calls[1][0]
     assert calls[0][1:] == ("codex", "gpt-test", calls[0][3])
+    client.post("/api/v1/auth/logout", headers=headers)
+    assert client.get(root, headers=login(client)).json()[0]["messages"][-1]["content"] == "answer-2"
 
 
 def test_codex_session_creation_requires_project_write_access(context):
@@ -120,3 +133,23 @@ def test_embedded_runner_uses_workspace_write_and_extracts_text(monkeypatch, tmp
     assert calls["args"][-1] == "-"
     assert calls["kwargs"]["cwd"] == str(tmp_path)
     assert calls["kwargs"]["shell"] is False
+
+
+def test_codex_turn_stream_persists_transcript_and_sends_sse(context, monkeypatch):
+    client, headers, project_id = context
+    enable_codex(client, headers, project_id)
+    monkeypatch.setattr("api.ai_engine.stream_cli_text", lambda *args, **kwargs: iter([
+        None,
+        '{"type":"item.completed","item":{"type":"agent_message","text":"第一段"}}\n',
+        '{"type":"item.completed","item":{"type":"agent_message","text":"第一段第二段"}}\n',
+    ]))
+    root = f"/api/v1/projects/{project_id}/codex/sessions"
+    created = client.post(root, json={"title": "流式验证"}, headers=headers).json()
+    response = client.post(f"{root}/{created['id']}/turn/stream", json={"prompt": "流式执行"}, headers=headers)
+    assert response.status_code == 200, response.text
+    assert "event: status" in response.text and '"phase": "waiting"' in response.text
+    assert 'event: delta\ndata: {"text": "第一段"}' in response.text
+    assert 'event: delta\ndata: {"text": "第二段"}' in response.text
+    assert "event: done" in response.text
+    listed = client.get(root, headers=headers).json()
+    assert listed[0]["messages"][-1]["content"] == "第一段第二段"

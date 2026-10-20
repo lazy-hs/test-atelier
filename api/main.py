@@ -6,7 +6,9 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import threading
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -14,7 +16,7 @@ from pathlib import Path
 from typing import Literal
 
 from argon2 import PasswordHasher
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, exists, func, select, text, update
@@ -23,7 +25,7 @@ from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 from openpyxl import Workbook
 
-from .db import (Base, AiQueueState, AiSettings, AiJob, AnalysisRun, Case, CaseComment, CaseDraft, CaseSuggestion, ConversionRecord, ExecutionRun, ImportBatch,
+from .db import (Base, AiQueueState, AiSettings, AiModel, AiTool, AiJob, AnalysisRun, Case, CaseComment, CaseDraft, CaseSuggestion, CodexMessage, CodexSession, ConversionRecord, ConversionSettings, ExecutionRun, ImportBatch,
                  Membership, MembershipEvent, Project, ReviewEvent, RunCase, SessionLocal,
                  ProjectSkill, SmokeItem, SmokeSuite, SourceDocument, SuggestionJob, TaxonomyVersion, User,
                  ExecutionEvent, database_kind, engine, utcnow)
@@ -344,7 +346,7 @@ def initialize():
     from . import ai_engine
 
     with SessionLocal() as db:
-        expected_head = os.getenv("AI_STUDIO_MIGRATION_HEAD", "20261024_queue_capacity")
+        expected_head = os.getenv("AI_STUDIO_MIGRATION_HEAD", "20261028_codex_sessions")
         try:
             migration_head = db.execute(text("SELECT version_num FROM alembic_version")).scalar()
         except SQLAlchemyError as exc:
@@ -442,6 +444,58 @@ def initialize():
             changed = True
         if changed:
             db.commit()
+        # Keep the normalized tool table populated for development databases
+        # that bootstrap via ``create_all`` instead of running Alembic.
+        tool_defaults = (("codex_cli", "Codex CLI", settings.codex_enabled, settings.codex_command, settings.codex_model),
+                         ("claude_code", "Claude Code", settings.claude_enabled, settings.claude_command, settings.claude_model))
+        tools_changed = False
+        for tool_id, name, enabled, command, model in tool_defaults:
+            tool = db.scalar(select(AiTool).where(AiTool.tool_id == tool_id))
+            if tool is None:
+                db.add(AiTool(tool_id=tool_id, name=name, enabled=bool(enabled), command=command or name.lower(), model=model or ""))
+                tools_changed = True
+        if tools_changed:
+            db.commit()
+        # ``create_all`` development databases also need built-in model rows;
+        # production migrations perform the equivalent backfill.
+        model_defaults = (
+            ("local", "本机 Ollama", "local", settings.local_url, settings.local_model,
+             ai_engine.catalog_provider_enabled(settings.providers_json, "local")),
+            ("remote", "远程模型", "remote", settings.remote_url, settings.remote_model, bool(settings.remote_enabled)),
+        )
+        models_changed = False
+        for provider_id, name, scope, endpoint, model, enabled in model_defaults:
+            model_row = db.scalar(select(AiModel).where(AiModel.provider_id == provider_id))
+            if model_row is None:
+                db.add(AiModel(provider_id=provider_id, name=name, scope=scope, endpoint=endpoint or "",
+                               model=model or "", enabled=enabled,
+                               api_key_encrypted=settings.remote_api_key if provider_id == "remote" else ""))
+                models_changed = True
+        if models_changed:
+            db.commit()
+        # Normalized model/tool rows are authoritative after migration. Keep
+        # legacy singleton fields as a fallback for old/unmigrated databases.
+        model_rows = {row.provider_id: row for row in db.scalars(select(AiModel)).all()}
+        tool_rows = {row.tool_id: row for row in db.scalars(select(AiTool)).all()}
+        local_row = model_rows.get("local")
+        remote_row = model_rows.get("remote")
+        codex_row = tool_rows.get("codex_cli")
+        claude_row = tool_rows.get("claude_code")
+        local_url = local_row.endpoint if local_row else settings.local_url
+        local_model = local_row.model if local_row else settings.local_model
+        local_enabled = local_row.enabled if local_row else ai_engine.catalog_provider_enabled(settings.providers_json, "local")
+        remote_enabled = remote_row.enabled if remote_row else settings.remote_enabled
+        remote_url = remote_row.endpoint if remote_row else settings.remote_url
+        remote_model = remote_row.model if remote_row else settings.remote_model
+        # The singleton keeps the canonical remote secret; row value is a
+        # migration fallback for databases created before that field existed.
+        remote_secret = settings.remote_api_key or (remote_row.api_key_encrypted if remote_row else "")
+        codex_enabled = codex_row.enabled if codex_row else settings.codex_enabled
+        codex_command = codex_row.command if codex_row else settings.codex_command
+        codex_model = codex_row.model if codex_row else settings.codex_model
+        claude_enabled = claude_row.enabled if claude_row else settings.claude_enabled
+        claude_command = claude_row.command if claude_row else settings.claude_command
+        claude_model = claude_row.model if claude_row else settings.claude_model
         # Keep the operator-facing control-plane snapshot on the durable data
         # volume. Skill entries intentionally contain metadata and paths only.
         try:
@@ -475,8 +529,8 @@ def initialize():
             # can re-enable it later. Only an enabled provider should block
             # startup when a session-secret rotation makes that key unreadable.
             remote_api_key = (
-                ai_engine.decrypt_secret_checked(settings.remote_api_key)
-                if settings.remote_enabled else ai_engine.decrypt_secret(settings.remote_api_key)
+                ai_engine.decrypt_secret_checked(remote_secret)
+                if remote_enabled else ai_engine.decrypt_secret(remote_secret)
             )
         except RuntimeError:
             logger.error("ai.settings.secret_unavailable", extra={
@@ -484,14 +538,14 @@ def initialize():
                 "error_type": "SecretDecryptionError",
             })
             raise
-        ai_engine.apply_config({"local_url": settings.local_url, "local_model": settings.local_model,
-                                "local_enabled": ai_engine.catalog_provider_enabled(settings.providers_json, "local"),
-                                "remote_enabled": settings.remote_enabled, "remote_url": settings.remote_url,
-                                "remote_model": settings.remote_model,
+        ai_engine.apply_config({"local_url": local_url, "local_model": local_model,
+                                "local_enabled": local_enabled,
+                                "remote_enabled": remote_enabled, "remote_url": remote_url,
+                                "remote_model": remote_model,
                                 "remote_api_key": remote_api_key,
-                                "codex_enabled": settings.codex_enabled, "codex_command": settings.codex_command,
-                                "codex_model": settings.codex_model, "claude_enabled": settings.claude_enabled,
-                                "claude_command": settings.claude_command, "claude_model": settings.claude_model})
+                                "codex_enabled": codex_enabled, "codex_command": codex_command,
+                                "codex_model": codex_model, "claude_enabled": claude_enabled,
+                                "claude_command": claude_command, "claude_model": claude_model})
         if settings_seeded:
             logger.info("ai.settings.seeded", extra={
                 "event": "ai.settings.seeded", "component": "ai-settings", "source": "environment",
@@ -886,11 +940,17 @@ def project_role(project_id: int, user: User, db: Session) -> str:
 
 
 def writable(user: User, project_id: int, db: Session):
+    project = project_access(project_id, user, db)
+    if project.archived_at:
+        raise HTTPException(409, "项目已归档，请先恢复后再修改")
     if project_role(project_id, user, db) == "reader":
         raise HTTPException(403, "只读账号不能修改")
 
 
 def project_manager(user: User, project_id: int, db: Session):
+    project = project_access(project_id, user, db)
+    if project.archived_at:
+        raise HTTPException(409, "项目已归档，请先恢复后再修改")
     if project_role(project_id, user, db) not in ("admin", "manager"):
         raise HTTPException(403, "仅项目管理员可管理成员")
 
@@ -938,6 +998,117 @@ def release_assignments(project_id: int, member_id: int, actor_id: int, db: Sess
                            reason="成员权限变更，负责人已清除"))
 
 
+def _require_project_manager(project_id: int, user: User, db: Session) -> Project:
+    """Return a project when the actor can administer its lifecycle."""
+    project = project_access(project_id, user, db)
+    if user.role != "admin":
+        membership = db.get(Membership, (project_id, user.id))
+        if not membership or membership.role != "manager":
+            raise HTTPException(403, "仅项目管理员可管理项目")
+    return project
+
+
+def _delete_project_data(project_id: int, db: Session) -> None:
+    """Delete project-owned rows in dependency order.
+
+    The baseline schema predates explicit ORM relationships and most foreign
+    keys do not have ``ON DELETE CASCADE``.  Keep deletion explicit so this
+    endpoint behaves consistently on SQLite and PostgreSQL and never leaves
+    orphaned review, AI, or execution records behind.
+    """
+    # A running worker may still hold a project job.  Reject deletion rather
+    # than racing a worker that could recreate references after this cleanup.
+    active_ai = db.scalar(select(func.count()).select_from(AiJob).where(
+        AiJob.project_id == project_id, AiJob.status.in_(("queued", "running")))) or 0
+    active_suggestions = db.scalar(select(func.count()).select_from(SuggestionJob).where(
+        SuggestionJob.project_id == project_id, SuggestionJob.status.in_(("queued", "running")))) or 0
+    if active_ai or active_suggestions:
+        raise HTTPException(409, "项目存在运行中的任务，请稍后再删除")
+
+    # Remove uploaded source documents and generated conversion files before
+    # deleting their history rows. Paths are derived from durable IDs and are
+    # kept under their respective private storage roots.
+    try:
+        from . import ai_routes
+        document_dir = ai_routes.DOCUMENT_DIR / str(project_id)
+        for document in db.scalars(select(SourceDocument).where(SourceDocument.project_id == project_id)).all():
+            (document_dir / f"{document.id}.bin").unlink(missing_ok=True)
+        document_dir.rmdir()
+    except (OSError, ValueError):
+        logger.warning("project.cleanup_document_files_failed", extra={
+            "event": "project.cleanup_document_files_failed", "project_id": project_id,
+            "component": "project", "error_type": "OSError",
+        })
+    try:
+        from .conversion_routes import DATA_DIR, output_path
+        for record in db.scalars(select(ConversionRecord).where(ConversionRecord.project_id == project_id)).all():
+            output_path(record).unlink(missing_ok=True)
+        conversion_dir = DATA_DIR / str(project_id)
+        if conversion_dir.exists():
+            conversion_dir.rmdir()
+    except OSError:
+        # Database deletion remains safe even if an old output file is already
+        # gone or the configured data directory is read-only.
+        logger.warning("project.cleanup_file_failed", extra={
+            "event": "project.cleanup_file_failed", "project_id": project_id,
+            "component": "project", "error_type": "OSError",
+        })
+
+    def ids(model, column):
+        return list(db.scalars(select(model.id).where(column == project_id)).all())
+
+    suite_ids = ids(SmokeSuite, SmokeSuite.project_id)
+    run_ids = ids(ExecutionRun, ExecutionRun.project_id)
+    case_ids = ids(Case, Case.project_id)
+    analysis_ids = ids(AnalysisRun, AnalysisRun.project_id)
+    suggestion_job_ids = ids(SuggestionJob, SuggestionJob.project_id)
+
+    if run_ids:
+        db.execute(delete(ExecutionEvent).where(ExecutionEvent.run_case_id.in_(
+            select(RunCase.id).where(RunCase.run_id.in_(run_ids)))))
+        db.execute(delete(RunCase).where(RunCase.run_id.in_(run_ids)))
+    if suite_ids:
+        db.execute(delete(SmokeItem).where(SmokeItem.suite_id.in_(suite_ids)))
+    if run_ids:
+        db.execute(delete(ExecutionRun).where(ExecutionRun.id.in_(run_ids)))
+    if suite_ids:
+        db.execute(delete(SmokeSuite).where(SmokeSuite.id.in_(suite_ids)))
+
+    if case_ids:
+        db.execute(delete(ReviewEvent).where(ReviewEvent.case_id.in_(case_ids)))
+        db.execute(delete(CaseComment).where(CaseComment.case_id.in_(case_ids)))
+        db.execute(delete(CaseSuggestion).where(CaseSuggestion.case_id.in_(case_ids)))
+        db.execute(delete(CaseDraft).where(CaseDraft.case_id.in_(case_ids)))
+    if suggestion_job_ids:
+        db.execute(delete(CaseSuggestion).where(CaseSuggestion.job_id.in_(suggestion_job_ids)))
+    if analysis_ids:
+        db.execute(delete(AiJob).where(AiJob.analysis_id.in_(analysis_ids)))
+        db.execute(delete(CaseDraft).where(CaseDraft.analysis_id.in_(analysis_ids)))
+    db.execute(delete(CaseSuggestion).where(CaseSuggestion.project_id == project_id))
+    db.execute(delete(CaseDraft).where(CaseDraft.project_id == project_id))
+    db.execute(delete(AiJob).where(AiJob.project_id == project_id))
+    db.execute(delete(SuggestionJob).where(SuggestionJob.project_id == project_id))
+    db.execute(delete(Case).where(Case.project_id == project_id))
+    db.execute(delete(ImportBatch).where(ImportBatch.project_id == project_id))
+    db.execute(delete(AnalysisRun).where(AnalysisRun.project_id == project_id))
+    db.execute(delete(SourceDocument).where(SourceDocument.project_id == project_id))
+    db.execute(delete(ConversionRecord).where(ConversionRecord.project_id == project_id))
+    db.execute(delete(ConversionSettings).where(ConversionSettings.project_id == project_id))
+    db.execute(delete(TaxonomyVersion).where(TaxonomyVersion.project_id == project_id))
+    db.execute(delete(ProjectSkill).where(ProjectSkill.project_id == project_id))
+    codex_sessions = db.scalars(select(CodexSession).where(CodexSession.project_id == project_id)).all()
+    codex_session_ids = select(CodexSession.id).where(CodexSession.project_id == project_id)
+    db.execute(delete(CodexMessage).where(CodexMessage.session_id.in_(codex_session_ids)))
+    db.execute(delete(CodexSession).where(CodexSession.project_id == project_id))
+    session_root = (Path(tempfile.gettempdir()) / "test-atelier-codex-sessions").resolve()
+    for session in codex_sessions:
+        workspace = Path(session.working_directory).resolve()
+        if workspace.parent == session_root and workspace.name == session.id:
+            shutil.rmtree(workspace, ignore_errors=True)
+    db.execute(delete(MembershipEvent).where(MembershipEvent.project_id == project_id))
+    db.execute(delete(Membership).where(Membership.project_id == project_id))
+
+
 class Login(BaseModel):
     username: str
     password: str
@@ -945,6 +1116,15 @@ class Login(BaseModel):
 
 class Named(BaseModel):
     name: str = Field(min_length=1, max_length=120)
+
+
+class ProjectUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    archived: bool | None = None
+
+
+class ProjectDuplicate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
 
 
 class UserCreate(BaseModel):
@@ -1059,11 +1239,20 @@ def me(user: User = Depends(current_user)):
 
 
 @app.get("/api/v1/projects")
-def projects(user: User = Depends(current_user), db: Session = Depends(get_db)):
+def projects(include_archived: bool = Query(False), user: User = Depends(current_user), db: Session = Depends(get_db)):
+    query = select(Project).order_by(Project.id.desc())
+    if not include_archived:
+        query = query.where(Project.archived_at.is_(None))
     if user.role == "admin":
-        return [{"id": item.id, "name": item.name, "role": "admin"} for item in db.scalars(select(Project).order_by(Project.id.desc()))]
-    rows = db.execute(select(Project, Membership.role).join(Membership).where(Membership.user_id == user.id).order_by(Project.id.desc()))
-    return [{"id": project.id, "name": project.name, "role": role} for project, role in rows]
+        rows = ((item, "admin") for item in db.scalars(query))
+    else:
+        rows = db.execute(select(Project, Membership.role).join(Membership).where(
+            Membership.user_id == user.id,
+            *([Project.archived_at.is_(None)] if not include_archived else []),
+        ).order_by(Project.id.desc()))
+    return [{"id": project.id, "name": project.name, "role": role,
+             "created_at": project.created_at, "archived": project.archived_at is not None,
+             "archived_at": project.archived_at} for project, role in rows]
 
 
 @app.post("/api/v1/projects", dependencies=[Depends(csrf)])
@@ -1101,7 +1290,80 @@ def create_project(payload: Named, user: User = Depends(current_user), db: Sessi
         "event": "project.created", "project_id": project.id, "actor_id": user.id,
         "component": "project",
     })
-    return {"id": project.id, "name": project.name, "role": "admin" if user.role == "admin" else "manager"}
+    return {"id": project.id, "name": project.name, "role": "admin" if user.role == "admin" else "manager",
+            "created_at": project.created_at, "archived": False, "archived_at": None}
+
+
+@app.patch("/api/v1/projects/{project_id}", dependencies=[Depends(csrf)])
+def update_project(project_id: int, payload: ProjectUpdate, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    project = _require_project_manager(project_id, user, db)
+    if payload.name is None and payload.archived is None:
+        raise HTTPException(422, "至少提供项目名称或归档状态")
+    if payload.name is not None:
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(422, "项目名称不能为空")
+        project.name = name
+    if payload.archived is not None:
+        project.archived_at = utcnow() if payload.archived else None
+    db.commit()
+    return {"id": project.id, "name": project.name,
+            "role": "admin" if user.role == "admin" else "manager",
+            "created_at": project.created_at, "archived": project.archived_at is not None,
+            "archived_at": project.archived_at}
+
+
+@app.post("/api/v1/projects/{project_id}/archive", dependencies=[Depends(csrf)])
+def archive_project(project_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    return update_project(project_id, ProjectUpdate(archived=True), user, db)
+
+
+@app.post("/api/v1/projects/{project_id}/restore", dependencies=[Depends(csrf)])
+def restore_project(project_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    return update_project(project_id, ProjectUpdate(archived=False), user, db)
+
+
+@app.post("/api/v1/projects/{project_id}/duplicate", dependencies=[Depends(csrf)])
+def duplicate_project(project_id: int, payload: ProjectDuplicate | None = None,
+                      user: User = Depends(current_user), db: Session = Depends(get_db)):
+    source = _require_project_manager(project_id, user, db)
+    name = (payload.name if payload else None) or f"{source.name} 副本"
+    name = name.strip()
+    if not name:
+        raise HTTPException(422, "项目名称不能为空")
+    project = Project(name=name)
+    db.add(project)
+    db.flush()
+    db.add(Membership(project_id=project.id, user_id=user.id, role="manager"))
+    db.add(MembershipEvent(project_id=project.id, user_id=user.id, actor_id=user.id,
+                           action="added", after_role="manager"))
+    # Copy project-local settings, but intentionally do not copy members or
+    # test data; this prevents accidental cross-team data disclosure.
+    for skill in db.scalars(select(ProjectSkill).where(ProjectSkill.project_id == project_id)).all():
+        db.add(ProjectSkill(project_id=project.id, skill_id=skill.skill_id, name=skill.name,
+                            label=skill.label, source_path=skill.source_path,
+                            description=skill.description, enabled=skill.enabled))
+    settings = db.get(ConversionSettings, project_id)
+    if settings:
+        db.add(ConversionSettings(project_id=project.id, default_prefix_path=settings.default_prefix_path,
+                                   default_case_type=settings.default_case_type,
+                                   default_case_status=settings.default_case_status,
+                                   history_retention_days=settings.history_retention_days))
+    db.commit()
+    return {"id": project.id, "name": project.name,
+            "role": "admin" if user.role == "admin" else "manager",
+            "created_at": project.created_at, "archived": False, "archived_at": None}
+
+
+@app.delete("/api/v1/projects/{project_id}", dependencies=[Depends(csrf)])
+def delete_project(project_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    project = _require_project_manager(project_id, user, db)
+    _delete_project_data(project_id, db)
+    db.delete(project)
+    db.commit()
+    logger.info("project.deleted", extra={"event": "project.deleted", "project_id": project_id,
+                                           "actor_id": user.id, "component": "project"})
+    return {"ok": True, "id": project_id}
 
 
 @app.get("/api/v1/projects/{project_id}/skills")
@@ -1148,13 +1410,18 @@ def project_overview(project_id: int, user: User = Depends(current_user), db: Se
                                   ExecutionRun.status == "active")) or 0
     imports = db.scalars(select(ImportBatch).where(ImportBatch.project_id == project_id).order_by(ImportBatch.id.desc()).limit(5)).all()
     analyses = db.scalars(select(AnalysisRun).where(AnalysisRun.project_id == project_id).order_by(AnalysisRun.created_at.desc()).limit(5)).all()
+    analysis_documents = db.scalars(select(SourceDocument).where(SourceDocument.project_id == project_id)).all()
+    analysis_source_names = {document.id: document.filename for document in analysis_documents}
     drafts = db.scalars(select(CaseDraft).where(CaseDraft.project_id == project_id).order_by(CaseDraft.created_at.desc()).limit(5)).all()
     conversions = db.scalars(select(ConversionRecord).where(ConversionRecord.project_id == project_id).order_by(ConversionRecord.created_at.desc()).limit(5)).all()
     documents = db.scalars(select(SourceDocument).where(SourceDocument.project_id == project_id).order_by(SourceDocument.created_at.desc()).limit(5)).all()
     runs = db.scalars(select(ExecutionRun).where(ExecutionRun.project_id == project_id).order_by(ExecutionRun.id.desc()).limit(5)).all()
     activity = (
         [{"id": f"import-{item.id}", "kind": "import", "title": item.filename, "status": "已导入" if item.status == "done" else "待确认", "created_at": item.created_at, "view": "imports"} for item in imports]
-        + [{"id": f"analysis-{item.id}", "kind": "analysis", "title": f"需求分析 · {len(item.source_ids)} 份材料", "status": {"ready": "已完成", "failed": "失败", "queued": "排队中", "running": "处理中"}.get(item.status, item.status), "created_at": item.created_at, "view": "requirements"} for item in analyses]
+        + [{"id": f"analysis-{item.id}", "kind": "analysis",
+            "title": "、".join(analysis_source_names.get(source_id, source_id) for source_id in item.source_ids) or "需求分析",
+            "status": {"ready": "已完成", "failed": "失败", "queued": "排队中", "running": "处理中"}.get(item.status, item.status),
+            "created_at": item.created_at, "view": "requirements"} for item in analyses]
         + [{"id": f"draft-{item.id}", "kind": "draft", "title": item.payload.get("title", "用例草稿"), "status": "已发布" if item.status == "published" else "草稿", "created_at": item.created_at, "view": "authoring"} for item in drafts]
         + [{"id": f"conversion-{item.id}", "kind": "conversion", "title": item.output_filename, "status": "已导出", "created_at": item.created_at, "view": "conversion"} for item in conversions]
         + [{"id": f"document-{item.id}", "kind": "document", "title": item.filename, "status": "已上传", "created_at": item.created_at, "view": "requirements"} for item in documents]

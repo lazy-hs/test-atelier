@@ -42,6 +42,19 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
   }, [base])
 
   useEffect(() => { void refresh().catch(cause => setError(cause.message)) }, [refresh])
+  // Keep the controlled select aligned with the provider catalog after the
+  // async config request. A stale initial "local" value could otherwise be
+  // submitted even though only the remote model is enabled.
+  useEffect(() => {
+    if (!model) return
+    const enabled = [
+      model.local_enabled !== false ? 'local' : '',
+      model.remote_enabled ? 'remote' : '',
+      model.codex_enabled ? 'codex' : '',
+      model.claude_enabled ? 'claude' : '',
+    ].filter(Boolean)
+    if (!enabled.includes(provider)) setProvider(enabled[0] ?? '')
+  }, [model, provider])
   useEffect(() => {
     if (!analysisId) return
     let active = true
@@ -134,12 +147,24 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
           <button className={documentId === doc.id && !analysisId ? 'is-active' : ''} onClick={() => { setDocumentId(doc.id); setAnalysisId('') }}><FileText size={15} /><span>{doc.filename}</span></button>
         </div>) : <div className="ai-empty"><Upload size={22} /><span>尚无需求材料</span></div>}
         <div className="ai-rail-heading ai-analysis-heading"><h2>分析记录</h2></div>
-        {analyses.map(run => <button key={run.id} className={`ai-rail-row ${analysisId === run.id ? 'is-active' : ''}`} onClick={() => setAnalysisId(run.id)}>
-          <span>{new Date(run.created_at).toLocaleString('zh-CN')}</span><Badge variant="secondary">{run.status === 'ready' ? '已完成' : run.status === 'failed' ? '失败' : '处理中'}</Badge>
-        </button>)}
-        <div className="ai-rail-footer"><label htmlFor="model-provider">分析模型</label><select id="model-provider" value={provider} onChange={event => setProvider(event.target.value)} disabled={readonly}>
+        <AnimatePresence initial={false}>
+          {analyses.map((run, index) => {
+            const filenames = run.source_filenames?.length ? run.source_filenames : run.source_ids
+              .map(sourceId => documents.find(document => document.id === sourceId)?.filename)
+              .filter((filename): filename is string => Boolean(filename))
+            // Keep older records readable when their source document was removed.
+            const title = run.title?.trim() || filenames.join('、') || `需求分析 · ${run.source_ids.length} 份材料`
+            return <motion.button key={run.id} className={`ai-rail-row ${analysisId === run.id ? 'is-active' : ''}`} onClick={() => setAnalysisId(run.id)}
+              initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 6 }}
+              transition={{ duration: .2, delay: Math.min(index * .035, .21) }} title={title}>
+              <span className="ai-rail-row-copy"><strong>{title}</strong><small>{new Date(run.created_at).toLocaleString('zh-CN')}</small></span>
+              <Badge variant="secondary">{run.status === 'ready' ? '已完成' : run.status === 'failed' ? '失败' : '处理中'}</Badge>
+            </motion.button>
+          })}
+        </AnimatePresence>
+        <div className="ai-rail-footer"><label htmlFor="model-provider">分析模型</label><select id="model-provider" value={provider} onChange={event => setProvider(event.target.value)} disabled={readonly || !model}>
           {model?.local_enabled !== false && <option value="local">本地 {model?.local_model ?? 'Ollama'}</option>}{model?.remote_enabled && <option value="remote">远程模型（发送正文）</option>}{model?.codex_enabled && <option value="codex">Codex CLI（本机）</option>}{model?.claude_enabled && <option value="claude">Claude Code（本机）</option>}
-        </select><Button onClick={() => void start()} disabled={readonly || busy || !selectedIds.length}>开始分析</Button></div>
+        </select><Button onClick={() => void start()} disabled={readonly || busy || !selectedIds.length || !model || !provider}>开始分析</Button></div>
       </aside>
       <section className="ai-main">
         <AnimatePresence mode="wait">{analysis ? <motion.div key={analysis.id} initial={{ opacity: 0, y: 7 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -7 }} className="ai-report">

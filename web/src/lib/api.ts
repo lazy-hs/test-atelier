@@ -1,12 +1,17 @@
 export type User = { id: number; username: string; role: 'admin' | 'reviewer' | 'reader' }
-export type Project = { id: number; name: string; role: 'admin' | 'manager' | 'reviewer' | 'reader' }
+export type Project = { id: number; name: string; role: 'admin' | 'manager' | 'reviewer' | 'reader'; created_at?: string; archived?: boolean; archived_at?: string | null }
 export type ProjectSkill = { skill_id: string; name: string; label: string; source_path: string; description: string; enabled: boolean; updated_at: string }
 export type AiConfig = {
   local_url: string; local_model: string; local_enabled?: boolean; remote_enabled: boolean; remote_url: string; remote_model: string
   remote_api_key_set: boolean; remote_api_key_mask: string
   codex_enabled: boolean; codex_command: string; codex_binary?: string; codex_model: string
   claude_enabled: boolean; claude_command: string; claude_model: string
+  /** Legacy mixed catalog retained for older API workers. Prefer models/tools. */
   providers?: { id: string; kind: 'local' | 'remote' | 'cli'; name: string; endpoint: string; model: string; enabled: boolean; detail: string; protocol?: 'openai' | 'responses' | 'anthropic' | 'gemini' | 'system-one'; api_key_set?: boolean }[]
+  /** Model connections. kind is the explicit local/remote deployment scope. */
+  models?: { id: string; kind: 'local' | 'remote'; name: string; endpoint: string; model: string; enabled: boolean; detail: string; protocol?: 'openai' | 'responses' | 'anthropic' | 'gemini' | 'system-one'; api_key_set?: boolean }[]
+  /** Installed AI tools are kept separate from model connections. */
+  tools?: { id: 'codex_cli' | 'claude_code' | string; name: string; enabled: boolean; command: string; model: string; detail?: string }[]
 }
 export type Case = {
   id: number; original_id: string; title: string; directory: string; level: string; smoke: string
@@ -39,7 +44,7 @@ export type ImportRecord = { id: number; filename: string; count: number; status
 export type SourceDocument = { id: string; filename: string; warnings: string[]; created_at: string; text_length: number }
 export type Requirement = { id: string; title: string; summary: string; source_ids: string[]; acceptance: string[]; methods: string[] }
 export type Ambiguity = { id: string; description: string; critical: boolean; decision: string }
-export type Analysis = { id: string; source_ids: string[]; status: string; provider: string; result: {
+export type Analysis = { id: string; source_ids: string[]; source_filenames?: string[]; title?: string; status: string; provider: string; result: {
   requirements?: Requirement[]; ambiguities?: Ambiguity[]; risks?: string[]; report_markdown?: string
 }; error: string; version: number; created_at: string; updated_at: string }
 export type DraftPayload = { module: string[]; title: string; priority: string; precondition: string;
@@ -98,6 +103,33 @@ export async function rawApi(path: string, init: RequestInit = {}): Promise<Resp
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (await rawApi(path, init)).json()
+}
+
+export type StreamEvent = { event: string; data: unknown }
+
+/** Read a same-origin Server-Sent Event response using the existing CSRF path. */
+export async function streamApi(path: string, init: RequestInit, onEvent: (event: StreamEvent) => void) {
+  const response = await rawApi(path, init)
+  if (!response.body) throw new Error('流式响应不可用')
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  const consume = (block: string) => {
+    let event = 'message'; let data = ''
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      else if (line.startsWith('data:')) data += line.slice(5).trim()
+    }
+    if (!data) return
+    try { onEvent({ event, data: JSON.parse(data) }) } catch { onEvent({ event, data }) }
+  }
+  while (true) {
+    const chunk = await reader.read()
+    buffer += decoder.decode(chunk.value ?? new Uint8Array(), { stream: !chunk.done })
+    let boundary = buffer.indexOf('\n\n')
+    while (boundary >= 0) { consume(buffer.slice(0, boundary)); buffer = buffer.slice(boundary + 2); boundary = buffer.indexOf('\n\n') }
+    if (chunk.done) { if (buffer.trim()) consume(buffer); break }
+  }
 }
 
 export async function refreshCsrf() {

@@ -184,6 +184,69 @@ def test_model_request_records_cli_timeout_as_distinct_outcome(monkeypatch):
     assert records[-1][1]["error_type"] == "CliTimeout"
 
 
+def test_remote_request_inlines_schema_and_falls_back_to_json_object(monkeypatch):
+    calls = []
+
+    class Response:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                request = type("Request", (), {"url": "https://relay.example/v1/chat/completions"})()
+                response = type("ResponseError", (), {"status_code": self.status_code, "request": request})()
+                raise ai_engine.httpx.HTTPStatusError("provider error", request=request, response=response)
+
+        def json(self):
+            return self._payload
+
+    def post(url, **kwargs):
+        calls.append(kwargs["json"])
+        if len(calls) == 1:
+            return Response(500, {"error": {"message": "schema unsupported"}})
+        return Response(200, {"choices": [{"message": {"content": "```json\n{\"ok\":true}\n```"}}]})
+
+    monkeypatch.setattr(ai_engine.httpx, "post", post)
+    monkeypatch.setattr(ai_engine, "REMOTE_ENABLED", True)
+    monkeypatch.setattr(ai_engine, "REMOTE_URL", "https://relay.example/v1")
+    monkeypatch.setattr(ai_engine, "REMOTE_MODEL", "relay-model")
+    monkeypatch.setattr(ai_engine, "REMOTE_API_KEY", "remote-secret")
+    schema = {
+        "$defs": {"Item": {"title": "Item", "type": "object", "properties": {
+            "ok": {"type": "boolean", "default": False}}, "required": ["ok"]}},
+        "type": "object", "properties": {"item": {"$ref": "#/$defs/Item"}},
+        "required": ["item"], "title": "Result",
+    }
+    result = ai_engine.request_structured("return JSON", schema, "remote")
+    assert result == {"ok": True}
+    assert calls[0]["response_format"]["type"] == "json_schema"
+    assert "$defs" not in json.dumps(calls[0]["response_format"])
+    assert calls[0]["response_format"]["json_schema"]["schema"]["properties"]["item"]["properties"]["ok"]["type"] == "boolean"
+    assert calls[1]["response_format"] == {"type": "json_object"}
+
+
+def test_remote_request_keeps_provider_error_when_json_object_fallback_fails(monkeypatch):
+    class Response:
+        status_code = 500
+
+        def raise_for_status(self):
+            request = type("Request", (), {"url": "https://relay.example/v1/chat/completions"})()
+            response = type("ResponseError", (), {"status_code": 500, "request": request})()
+            raise ai_engine.httpx.HTTPStatusError("provider error", request=request, response=response)
+
+        def json(self):
+            return {"error": {"message": "still unavailable"}}
+
+    monkeypatch.setattr(ai_engine.httpx, "post", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(ai_engine, "REMOTE_ENABLED", True)
+    monkeypatch.setattr(ai_engine, "REMOTE_URL", "https://relay.example/v1")
+    monkeypatch.setattr(ai_engine, "REMOTE_MODEL", "relay-model")
+    monkeypatch.setattr(ai_engine, "REMOTE_API_KEY", "remote-secret")
+    with pytest.raises(ai_engine.httpx.HTTPStatusError):
+        ai_engine.request_structured("return JSON", {"type": "object"}, "remote")
+
+
 def test_cli_availability_logs_missing_enabled_provider(monkeypatch):
     records = []
     monkeypatch.setattr(ai_engine, "CODEX_ENABLED", True)

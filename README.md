@@ -1,6 +1,6 @@
 # Test Atelier
 
-面向个人和团队的测试资产工作台：把需求材料、AI 分析、用例编写、人工审核、格式转换和冒烟执行放在同一个项目空间中。AI 服务不可用时，登录、项目协作、导入审核、转换和历史下载仍可独立使用。
+面向个人和团队的测试资产工作台：把需求材料、AI 分析、用例编写、人工审核和格式转换放在同一个项目空间中。AI 服务不可用时，登录、项目协作、导入审核、转换和历史下载仍可独立使用。
 
 仓库建议使用名称 `test-atelier`。运行时环境变量仍保留 `AI_STUDIO_*` 前缀，以兼容现有部署和数据库，不影响品牌名称变更。
 
@@ -20,7 +20,7 @@
 
 | 模块 | 能力 | 关键约束 |
 | --- | --- | --- |
-| 工作台 | 项目概览、待审核、分析、草稿、转换和冒烟指标 | 数据按项目隔离 |
+| 工作台 | 项目概览、待审核、分析、草稿和转换 | 数据按项目隔离 |
 | 团队协作 | 项目管理员、评审员、只读成员；成员变更记录 | 全局管理员可救援；只读成员不能写入 |
 | 用例库 | `.xls`、`.xlsx`、`.xmind` 预览导入、审核、分派、评论、审计、Excel 导出 | 原值、建议和最终值分开保存；并发修改返回冲突；XMind 导入限制压缩比、节点数量和层级 |
 | 智能梳理 | 分类版本、规则候选、AI 候选、逐条接受/修改/驳回 | AI 结果永远是候选，关键歧义需人工确认 |
@@ -28,7 +28,6 @@
 | 用例编写 | 从已确认分析生成草稿，编辑后发布或导出 XMind/Excel | 未确认的关键歧义会阻断生成；导出不等于发布 |
 | 项目技能 | 按项目启用/停用 qa-doc-skills 子技能，统一加载外部 Skill 规范和脚本 | 项目状态保存在 `project_skills`；技能源默认位于 `/Users/lazy/huangsheng/project/qa-doc-skills` |
 | 用例转换 | Excel/CSV → Excel、XMind → Excel、Excel → XMind，预览和项目级历史 | 单文件 20 MB；历史保留 30/60/180 天 |
-| 冒烟执行 | 冒烟集、核心链路、30 分钟预算提示、通过/失败/阻塞/跳过和事件记录 | 执行时冻结套件修订和用例版本 |
 
 ## 快速开始
 
@@ -117,7 +116,6 @@ export TEST_ATELIER_SKILL_ROOT=/Users/lazy/huangsheng/project/qa-doc-skills
 4. 在“用例审核”分派、评论并保存最终等级和冒烟值
 5. 需要智能分析时，在“需求分析”上传材料并等待任务完成
 6. 确认关键歧义后进入“用例编写”，审核草稿再发布
-7. 在“冒烟执行”配置核心链路，确认用例版本后开始执行
 
 详细操作顺序、角色矩阵、文件限制和失败处理见 [docs/USAGE.md](docs/USAGE.md)。
 
@@ -140,7 +138,7 @@ export TEST_ATELIER_SKILL_ROOT=/Users/lazy/huangsheng/project/qa-doc-skills
 | `AI_STUDIO_BACKUP_TIMEOUT` | `120` | PostgreSQL `pg_dump`/`pg_restore` 超时秒数 |
 | `AI_STUDIO_BACKUP_MAX_UNCOMPRESSED_BYTES` | `8589934592` | 备份归档解压后的总大小上限，防止压缩炸弹 |
 | `AI_STUDIO_DATA_DIR` | `./data` | 原始文档和转换结果目录 |
-| `AI_STUDIO_REQUIRE_MIGRATIONS` / `AI_STUDIO_MIGRATION_HEAD` / `AI_STUDIO_MIGRATION_TIMEOUT` | 开发 `0`、生产 `1` / `20261024_queue_capacity` / `120` | 启动时执行并校验数据库迁移版本；生产前置检查强制保持 `1`，迁移超时后以结构化错误退出 |
+| `AI_STUDIO_REQUIRE_MIGRATIONS` / `AI_STUDIO_MIGRATION_HEAD` / `AI_STUDIO_MIGRATION_TIMEOUT` | 开发 `0`、生产 `1` / `20261028_codex_sessions` / `120` | 启动时执行并校验数据库迁移版本；生产前置检查强制保持 `1`，迁移超时后以结构化错误退出 |
 | `AI_STUDIO_OLLAMA_URL` | `http://127.0.0.1:11434` | 本地 Ollama 地址 |
 | `AI_STUDIO_OLLAMA_MODEL` | `qwen3:8b` | 本地模型名称，需自行下载 |
 | `AI_STUDIO_REMOTE_ENABLED` | `0` | 是否允许管理员使用远程 OpenAI 兼容接口 |
@@ -173,6 +171,8 @@ export TEST_ATELIER_SKILL_ROOT=/Users/lazy/huangsheng/project/qa-doc-skills
 登录后进入项目侧栏的“模型配置”，全局管理员可以直接修改本地 Ollama 地址与模型、启用远程 OpenAI 兼容接口，或启用本机 Codex CLI/Claude Code 并填写可执行文件路径和可选模型，然后使用“测试连接”验证服务。空数据库首次启动时也会读取 `AI_STUDIO_*` provider 环境变量作为初始配置，之后以页面保存的数据库配置为准。CLI 任务和技能仓库辅助脚本使用无 shell 的参数数组启动，不把命令字符串交给 shell；技能仓库辅助脚本还会隔离应用会话密钥、数据库地址、远程 API Key、指标令牌、技能仓路径以及常见云服务和源码托管凭据。CLI 子进程还会移除 `AI_STUDIO_*` 和 Codex 桌面 app-server 的 `CODEX_*` 管道/会话变量，避免后台任务意外连接当前桌面会话，同时保留 CLI 自身需要的 `HOME`、`PATH` 和认证变量。CLI 任务额外使用临时 JSON Schema 和只读沙箱，Codex 后台任务还会跳过项目规则并清空桌面通知钩子，避免交互式配置阻塞服务；仍应先确认 CLI 的账号、工作区和权限策略。网页保存的远程密钥使用当前会话密钥加密存储，只返回“已配置”状态，不回显原文；修改只影响新建 AI 任务，独立 worker 会在领取新任务时重新加载配置。
 
 Codex CLI 与 Claude Code 均是可选的本机 provider。安装对应 CLI 后，在页面启用并选择它即可用于需求分析、用例编写和分类建议；未安装或未启用时，原有 Ollama、规则候选和人工审核流程不受影响。不要把包含敏感信息的材料提交给未审计的本机 CLI 账号。
+
+启用 Codex 后，项目侧栏的“Codex 工作台”可直接创建会话并发送任务。工作台使用 `codex exec` 在每个会话独立创建的空白临时工作区中执行，采用 `workspace-write` 沙箱；不会把当前项目目录或项目规则带入会话。工作区根目录固定在系统临时目录，避免被配置到项目源码目录。会话通过 SSE 流式返回，并将会话和消息持久化到数据库。只读成员不能执行 Codex 任务，部署前请固定 CLI 版本并审计会话工作区权限。
 
 不要把包含敏感信息的需求文件上传到不受信任的实例；日志不应记录原文、令牌或模型密钥。
 
@@ -244,7 +244,7 @@ AI_STUDIO_E2E_PASSWORD='管理员密码' npm run test:e2e
 
 ## 数据库迁移与历史导入
 
-升级数据库（当前 head 为 `20261024_queue_capacity`）：
+升级数据库（当前 head 为 `20261028_codex_sessions`）：
 
 ```bash
 python -m alembic upgrade head

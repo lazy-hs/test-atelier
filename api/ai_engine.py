@@ -18,7 +18,7 @@ import tempfile
 import threading
 import signal
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
@@ -339,6 +339,38 @@ def _cli_diagnostic(value: object, limit: int = 500) -> str:
     return redact_sensitive_text(" ".join(lines[-3:]), limit)
 
 
+def cli_event_text(value: object) -> str | None:
+    """Extract assistant text from a Codex JSONL event or plain output."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return raw
+    if isinstance(value, dict):
+        event_type = str(value.get("type", ""))
+        if event_type in {"item.completed", "item.updated"}:
+            item = value.get("item")
+            if isinstance(item, dict) and item.get("type") not in {"agent_message", "assistant_message"}:
+                return None
+        if event_type in {"error", "turn.failed", "turn.completed", "turn.started", "thread.started"}:
+            return None
+        for key in ("text", "content", "message", "output", "result", "last_agent_message", "item"):
+            found = cli_event_text(value.get(key))
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in reversed(value):
+            found = cli_event_text(child)
+            if found:
+                return found
+    return None
+
+
 def _cli_environment() -> dict[str, str]:
     """Keep application secrets out of a user-configured CLI subprocess."""
     # The CLI still receives its normal HOME, PATH and provider credentials;
@@ -368,6 +400,7 @@ def _run_cli(args: list[str], prompt: str, cwd: str, timeout: int) -> subprocess
     process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, cwd=cwd, shell=False,
                                start_new_session=(os.name != "nt"), env=_cli_environment())
+    limit = timeout or CLI_TIMEOUT
     started = monotonic()
     sent_input = False
     try:
@@ -621,6 +654,92 @@ def request_cli_text(prompt: str, command: str, model: str = "", cwd: str | None
         if all(isinstance(item, dict) for item in lines):
             return json.dumps(lines[-1], ensure_ascii=False)
     return text
+
+
+def stream_cli_text(prompt: str, command: str, model: str = "", cwd: str | None = None,
+                    timeout: int | None = None) -> Iterator[str | None]:
+    """Yield Codex JSONL output as it arrives, with ``None`` keepalives.
+
+    Keepalives let the HTTP/SSE layer render a waiting state even when Codex
+    spends several seconds preparing a model response before its first event.
+    The subprocess is always placed in its own process group so cancellation
+    or a timeout cannot leave a child agent running after the request closes.
+    """
+    command = _validate_cli_command(command)
+    args = [command, "exec", "--ephemeral", "--skip-git-repo-check", "--ignore-rules",
+            "--disable", "plugins", "--sandbox", "workspace-write", "--color", "never",
+            "--json", "-c", "notify=[]", "-c", 'model_reasoning_effort="low"']
+    if model.strip():
+        args.extend(["--model", model.strip()])
+    args.append("-")
+    workdir = cwd or os.getcwd()
+    process = subprocess.Popen(
+        args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, cwd=workdir, shell=False, start_new_session=(os.name != "nt"),
+        env=_cli_environment(), bufsize=1,
+    )
+    output_queue: queue.Queue[str | None] = queue.Queue()
+    error_queue: queue.Queue[str] = queue.Queue()
+
+    def read_output() -> None:
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                output_queue.put(line)
+        finally:
+            output_queue.put(None)
+
+    def read_error() -> None:
+        if process.stderr is None:
+            return
+        for line in process.stderr:
+            error_queue.put(line)
+
+    stdout_thread = threading.Thread(target=read_output, name="codex-stream-stdout", daemon=True)
+    stderr_thread = threading.Thread(target=read_error, name="codex-stream-stderr", daemon=True)
+    stdout_thread.start(); stderr_thread.start()
+    started = monotonic()
+    limit = timeout or CLI_TIMEOUT
+    finished = False
+    try:
+        if process.stdin is not None:
+            try:
+                process.stdin.write(prompt)
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+        while True:
+            if monotonic() - started >= limit:
+                _stop_process(process)
+                raise CliTimeout(f"Codex CLI 执行超时（{limit} 秒）")
+            try:
+                line = output_queue.get(timeout=0.35)
+            except queue.Empty:
+                if process.poll() is None:
+                    yield None
+                    continue
+                # The reader may have one final line queued after the process
+                # exits; drain it before checking the return code.
+                try:
+                    line = output_queue.get(timeout=0.2)
+                except queue.Empty:
+                    break
+            if line is None:
+                finished = True
+                break
+            yield line
+        returncode = process.wait(timeout=2)
+        if returncode != 0:
+            details = "".join(list(error_queue.queue)[-3:])
+            raise RuntimeError(f"Codex CLI 执行失败{': ' + _cli_diagnostic(details) if details else ''}")
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"找不到 Codex CLI：{command}") from exc
+    finally:
+        if not finished and process.poll() is None:
+            _stop_process(process)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
 
 
 def test_cli_connection(provider: str, command: str, model: str = "") -> None:

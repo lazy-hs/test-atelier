@@ -1,7 +1,8 @@
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 
-from sqlalchemy import ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, event
+from sqlalchemy import CheckConstraint, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from sqlalchemy.pool import QueuePool
 from .observability import env_float, env_int
@@ -13,7 +14,12 @@ def utcnow():
 
 # Keep the local SQLite file with the rest of the runtime data. Deployments
 # using PostgreSQL (or an explicit DATABASE_URL) are unaffected.
-database_url = os.getenv("DATABASE_URL", "sqlite:///./data/ai_studio.db")
+_DEFAULT_DATABASE_URL = "sqlite:///./data/ai_studio.db"
+database_url = os.getenv("DATABASE_URL", _DEFAULT_DATABASE_URL)
+if database_url == _DEFAULT_DATABASE_URL:
+    # Alembic runs before API startup and therefore cannot rely on the API's
+    # storage initialization to create the SQLite parent directory.
+    Path("data").mkdir(parents=True, exist_ok=True)
 _is_sqlite = database_url.startswith("sqlite")
 database_kind = "sqlite" if _is_sqlite else "postgresql" if database_url.startswith(("postgresql", "postgres")) else "unknown"
 _is_memory_sqlite = _is_sqlite and (":memory:" in database_url or database_url.rstrip("/") in {"sqlite:", "sqlite+pysqlite:"})
@@ -105,6 +111,66 @@ class AiSettings(Base):
     updated_at: Mapped[str] = mapped_column(String(40), default=utcnow)
 
 
+class AiModel(Base):
+    """Durable model endpoint catalog, separate from non-model AI tools.
+
+    ``scope`` is deliberately explicit (``local`` or ``remote``) so callers
+    do not infer deployment location from provider names or URLs.
+    """
+    __tablename__ = "ai_models"
+    __table_args__ = (CheckConstraint("scope IN ('local', 'remote')", name="ck_ai_models_scope"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    scope: Mapped[str] = mapped_column(String(16), default="remote")
+    endpoint: Mapped[str] = mapped_column(String(255), default="")
+    model: Mapped[str] = mapped_column(String(120), default="")
+    protocol: Mapped[str] = mapped_column(String(32), default="openai")
+    enabled: Mapped[bool] = mapped_column(default=False)
+    detail: Mapped[str] = mapped_column(String(160), default="")
+    api_key_encrypted: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+    updated_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
+class AiTool(Base):
+    """Installed AI command-line tools such as Codex CLI and Claude Code."""
+    __tablename__ = "ai_tools"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tool_id: Mapped[str] = mapped_column(String(40), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    enabled: Mapped[bool] = mapped_column(default=False)
+    command: Mapped[str] = mapped_column(String(255), default="")
+    model: Mapped[str] = mapped_column(String(120), default="")
+    detail: Mapped[str] = mapped_column(String(160), default="")
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+    updated_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
+class CodexSession(Base):
+    """A durable project-scoped conversation with an isolated CLI workspace."""
+    __tablename__ = "codex_sessions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(160), default="新建 Codex 会话")
+    status: Mapped[str] = mapped_column(String(20), default="ready")
+    model: Mapped[str] = mapped_column(String(120), default="")
+    working_directory: Mapped[str] = mapped_column(String(1024), default="")
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+    updated_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
+class CodexMessage(Base):
+    """Append-only transcript entries for a Codex session."""
+    __tablename__ = "codex_messages"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("codex_sessions.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
 class AiQueueState(Base):
     """Singleton row used to atomically reserve durable worker capacity."""
     __tablename__ = "ai_queue_state"
@@ -118,6 +184,9 @@ class Project(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
     created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+    # Archived projects stay available for audit/read-only access but are
+    # omitted from the default project picker.
+    archived_at: Mapped[str | None] = mapped_column(String(40), nullable=True, default=None)
 
 
 class ProjectSkill(Base):

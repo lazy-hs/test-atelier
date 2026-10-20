@@ -4,8 +4,10 @@ import io
 import json
 import logging
 import os
+import shutil
 import subprocess
 import threading
+import tempfile
 import uuid
 import httpx
 from pathlib import Path
@@ -23,7 +25,8 @@ from starlette.background import BackgroundTask
 
 from . import ai_engine, ai_jobs, config_file
 from .skill_runner import SkillRunnerError, discover_skills, generate_xmind as generate_skill_xmind
-from .db import AiJob, AiModel, AiSettings, AiTool, AnalysisRun, Case, CaseDraft, ImportBatch, ProjectSkill, SourceDocument, User, utcnow
+from .db import (AiJob, AiModel, AiSettings, AiTool, AnalysisRun, Case, CaseDraft, CodexMessage,
+                 CodexSession, ImportBatch, ProjectSkill, SessionLocal, SourceDocument, User, utcnow)
 from .document_extract import extract
 from .observability import monotonic, redact_sensitive_text, request_id as current_request_id
 from .storage import open_private_regular_file, write_private_atomic
@@ -51,13 +54,10 @@ def _prompt_texts(job: AiJob) -> list[str]:
 DOCUMENT_DIR = Path(os.getenv("AI_STUDIO_DATA_DIR", str(Path(__file__).resolve().parents[1] / "data"))) / "documents"
 MAX_FILE_BYTES = 20 * 1024 * 1024
 
-# Embedded Codex sessions are intentionally process-local.  Conversation
-# transcripts are transient UI state; the actual project data remains on disk
-# and is modified only by the CLI sandbox.  A bounded store avoids retaining
-# unbounded prompts in a long-lived API worker.
-_CODEX_SESSIONS: dict[str, dict] = {}
+# The database is authoritative for session history.  This process-local set
+# only prevents two requests from starting the same session concurrently.
+_CODEX_RUNNING_SESSIONS: set[str] = set()
 _CODEX_SESSIONS_LOCK = threading.RLock()
-_CODEX_SESSION_LIMIT = 200
 
 
 class CodexSessionCreate(BaseModel):
@@ -68,11 +68,57 @@ class CodexTurnRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=20_000)
 
 
-def _codex_session_view(session: dict) -> dict:
-    """Return a JSON-safe snapshot without internal ownership metadata."""
-    return {key: session[key] for key in (
-        "id", "title", "status", "model", "working_directory", "created_at", "updated_at", "messages"
-    )}
+def _create_codex_session_workspace(session_id: str) -> str:
+    """Create an empty workspace for one embedded Codex conversation.
+
+    The workbench is rendered inside a project page for navigation and access
+    control, but its CLI process must not inherit that project's checkout. A
+    per-session directory also keeps files created during later turns isolated
+    from both the application source tree and other conversations.
+    """
+    # Keep workbench sessions outside the checkout by construction.  Do not
+    # make this root configurable: pointing it at the application repository
+    # would defeat the clean-session guarantee.
+    root = Path(tempfile.gettempdir()) / "test-atelier-codex-sessions"
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.chmod(0o700)
+    except OSError:
+        pass
+    workspace = root / session_id
+    workspace.mkdir(mode=0o700)
+    try:
+        workspace.chmod(0o700)
+    except OSError:
+        # Some mounted filesystems do not support chmod; mkdir still applies
+        # the requested restrictive mode under the normal umask.
+        pass
+    return str(workspace)
+
+
+def _workspace_belongs_to_session(path: str, session_id: str) -> bool:
+    root = (Path(tempfile.gettempdir()) / "test-atelier-codex-sessions").resolve()
+    workspace = Path(path).expanduser().resolve()
+    return workspace.parent == root and workspace.name == session_id
+
+
+def _codex_session_view(session: CodexSession, db: Session) -> dict:
+    """Return a persisted session snapshot with its ordered transcript."""
+    messages = db.scalars(
+        select(CodexMessage)
+        .where(CodexMessage.session_id == session.id)
+        .order_by(CodexMessage.id)
+    ).all()
+    return {
+        "id": session.id,
+        "title": session.title,
+        "status": session.status,
+        "model": session.model,
+        "working_directory": session.working_directory,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+        "messages": [{"role": item.role, "content": item.content, "created_at": item.created_at} for item in messages],
+    }
 
 
 class AnalysisCreate(BaseModel):
@@ -300,21 +346,32 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
                     tool.model or settings.codex_model or "", bool(tool.enabled))
         return (settings.codex_command or "codex", settings.codex_model or "", bool(settings.codex_enabled))
 
-    def find_codex_session(project_id: int, session_id: str, user: User) -> dict:
-        with _CODEX_SESSIONS_LOCK:
-            session = _CODEX_SESSIONS.get(session_id)
-            if not session or session["project_id"] != project_id or session["user_id"] != user.id:
-                raise HTTPException(404, "Codex 会话不存在")
-            return session
+    def find_codex_session(project_id: int, session_id: str, user: User, db: Session) -> CodexSession:
+        session = db.get(CodexSession, session_id)
+        if not session or session.project_id != project_id or session.user_id != user.id:
+            raise HTTPException(404, "Codex 会话不存在")
+        # Sessions created before isolated workspaces were introduced may
+        # still point at the API checkout. Repair them before the next turn.
+        if not _workspace_belongs_to_session(session.working_directory, session.id):
+            session.working_directory = _create_codex_session_workspace(session.id)
+            db.commit()
+        return session
 
     @router.get("/codex/sessions")
     def list_codex_sessions(project_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
         scope(project_id, user, db)
-        with _CODEX_SESSIONS_LOCK:
-            rows = [_codex_session_view(item) for item in _CODEX_SESSIONS.values()
-                    if item["project_id"] == project_id and item["user_id"] == user.id]
-        rows.sort(key=lambda item: item["updated_at"], reverse=True)
-        return rows
+        sessions = db.scalars(select(CodexSession).where(
+            CodexSession.project_id == project_id,
+            CodexSession.user_id == user.id,
+        ).order_by(CodexSession.updated_at.desc())).all()
+        changed = False
+        for session in sessions:
+            if not _workspace_belongs_to_session(session.working_directory, session.id):
+                session.working_directory = _create_codex_session_workspace(session.id)
+                changed = True
+        if changed:
+            db.commit()
+        return [_codex_session_view(item, db) for item in sessions]
 
     @router.post("/codex/sessions", dependencies=[Depends(csrf)])
     def create_codex_session(project_id: int, payload: CodexSessionCreate,
@@ -329,67 +386,172 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         except RuntimeError as exc:
             raise HTTPException(422, str(exc)) from exc
         now = utcnow()
-        session = {"id": uuid.uuid4().hex, "project_id": project_id, "user_id": user.id,
-                   "title": payload.title.strip() or "新建 Codex 会话", "status": "ready",
-                   "model": model, "working_directory": str(Path(os.getenv("AI_STUDIO_CODEX_WORKDIR", os.getcwd())).expanduser()),
-                   "created_at": now, "updated_at": now, "messages": []}
-        with _CODEX_SESSIONS_LOCK:
-            _CODEX_SESSIONS[session["id"]] = session
-            # Evict oldest entries globally when workers have handled many
-            # transient sessions; active user sessions are not special-cased.
-            if len(_CODEX_SESSIONS) > _CODEX_SESSION_LIMIT:
-                oldest = min(_CODEX_SESSIONS, key=lambda key: _CODEX_SESSIONS[key]["updated_at"])
-                _CODEX_SESSIONS.pop(oldest, None)
-        return _codex_session_view(session)
+        session_id = uuid.uuid4().hex
+        working_directory = _create_codex_session_workspace(session_id)
+        session = CodexSession(
+            id=session_id, project_id=project_id, user_id=user.id,
+            title=payload.title.strip() or "新建 Codex 会话", status="ready",
+            model=model,
+            working_directory=working_directory,
+            created_at=now, updated_at=now,
+        )
+        try:
+            db.add(session)
+            db.commit(); db.refresh(session)
+        except Exception:
+            db.rollback()
+            shutil.rmtree(working_directory, ignore_errors=True)
+            raise
+        return _codex_session_view(session, db)
 
     @router.post("/codex/sessions/{session_id}/turn", dependencies=[Depends(csrf)])
     def codex_turn(project_id: int, session_id: str, payload: CodexTurnRequest,
                    user: User = Depends(current_user), db: Session = Depends(get_db)):
         scope(project_id, user, db)
-        # A turn mutates the project through Codex and therefore requires the
-        # same project write permission as other AI jobs.
+        # The route remains project-scoped for membership and audit access, but
+        # the CLI itself runs in the session's isolated workspace.
         writable(user, project_id, db)
-        session = find_codex_session(project_id, session_id, user)
+        session = find_codex_session(project_id, session_id, user, db)
         command, model, enabled = codex_config(db)
         if not ai_engine.CODEX_ENABLED or not enabled:
             raise HTTPException(409, "Codex CLI 未启用")
         prompt = payload.prompt.strip()
         with _CODEX_SESSIONS_LOCK:
-            if session["status"] == "running":
+            if session_id in _CODEX_RUNNING_SESSIONS or session.status == "running":
                 raise HTTPException(409, "Codex 会话正在执行任务")
-            history = list(session["messages"])
-            session["status"] = "running"
-            session["updated_at"] = utcnow()
-        context = "\n\n".join(f"{item['role']}: {item['content']}" for item in history[-20:])
+            _CODEX_RUNNING_SESSIONS.add(session_id)
+        history = db.scalars(select(CodexMessage).where(
+            CodexMessage.session_id == session.id,
+        ).order_by(CodexMessage.id.desc()).limit(20)).all()
+        history.reverse()
+        session.status = "running"
+        session.updated_at = utcnow()
+        db.add(CodexMessage(session_id=session.id, role="user", content=prompt, created_at=utcnow()))
+        db.commit()
+        context = "\n\n".join(f"{item.role}: {item.content}" for item in history[-20:])
         # Keep repeated turns from producing an oversized subprocess stdin.
         if len(context) > 80_000:
             context = context[-80_000:]
         full_prompt = f"{context}\n\nuser: {prompt}" if context else prompt
         try:
-            working_directory = session["working_directory"]
+            working_directory = session.working_directory
             if not Path(working_directory).is_dir():
                 raise RuntimeError("Codex 工作目录不存在")
             reply = ai_engine.request_cli_text(full_prompt, command, model, working_directory)
         except Exception as exc:
             detail = ai_engine._cli_diagnostic(exc)
+            session.status = "failed"; session.updated_at = utcnow(); db.commit()
             with _CODEX_SESSIONS_LOCK:
-                session["status"] = "failed"
-                session["updated_at"] = utcnow()
+                _CODEX_RUNNING_SESSIONS.discard(session_id)
             raise HTTPException(502, detail or "Codex CLI 执行失败") from exc
         now = utcnow()
+        db.add(CodexMessage(session_id=session.id, role="assistant", content=reply, created_at=now))
+        session.status = "ready"; session.updated_at = now
+        if len(history) == 0 and session.title == "新建 Codex 会话":
+            session.title = prompt[:64]
+        db.commit(); db.refresh(session)
         with _CODEX_SESSIONS_LOCK:
-            session["messages"].extend([
-                {"role": "user", "content": prompt, "created_at": now},
-                {"role": "assistant", "content": reply, "created_at": now},
-            ])
-            # Keep transcript bounded while retaining enough context for the
-            # next turn and avoid oversized API responses.
-            session["messages"] = session["messages"][-40:]
-            session["status"] = "ready"
-            session["updated_at"] = now
-            if len(session["messages"]) == 2 and session["title"] == "新建 Codex 会话":
-                session["title"] = prompt[:64]
-            return _codex_session_view(session)
+            _CODEX_RUNNING_SESSIONS.discard(session_id)
+        return _codex_session_view(session, db)
+
+    def sse(event: str, payload: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    @router.post("/codex/sessions/{session_id}/turn/stream", dependencies=[Depends(csrf)])
+    def codex_turn_stream(project_id: int, session_id: str, payload: CodexTurnRequest,
+                          user: User = Depends(current_user), db: Session = Depends(get_db)):
+        scope(project_id, user, db)
+        writable(user, project_id, db)
+        session = find_codex_session(project_id, session_id, user, db)
+        command, model, enabled = codex_config(db)
+        if not ai_engine.CODEX_ENABLED or not enabled:
+            raise HTTPException(409, "Codex CLI 未启用")
+        prompt = payload.prompt.strip()
+        with _CODEX_SESSIONS_LOCK:
+            if session_id in _CODEX_RUNNING_SESSIONS or session.status == "running":
+                raise HTTPException(409, "Codex 会话正在执行任务")
+            _CODEX_RUNNING_SESSIONS.add(session_id)
+        history = db.scalars(select(CodexMessage).where(
+            CodexMessage.session_id == session.id,
+        ).order_by(CodexMessage.id.desc()).limit(20)).all()
+        history.reverse()
+        context = "\n\n".join(f"{item.role}: {item.content}" for item in history)
+        if len(context) > 80_000:
+            context = context[-80_000:]
+        full_prompt = f"{context}\n\nuser: {prompt}" if context else prompt
+        now = utcnow()
+        session.status = "running"; session.updated_at = now
+        db.add(CodexMessage(session_id=session.id, role="user", content=prompt, created_at=now))
+        db.commit()
+        session_id_value = session.id
+        working_directory = session.working_directory
+        # Release the request-scoped connection while the CLI streams. The
+        # generator uses short-lived sessions for its final transcript write,
+        # so a slow model response cannot occupy a pool slot for its duration.
+        db.close()
+
+        def stream_events():
+            collected = ""
+            yield sse("status", {"status": "running", "phase": "starting"})
+            try:
+                if not Path(working_directory).is_dir():
+                    raise RuntimeError("Codex 工作目录不存在")
+                for raw in ai_engine.stream_cli_text(full_prompt, command, model, working_directory):
+                    if raw is None:
+                        yield sse("status", {"status": "running", "phase": "waiting"})
+                        continue
+                    candidate = ai_engine.cli_event_text(raw)
+                    if not candidate:
+                        continue
+                    if candidate.startswith(collected):
+                        delta = candidate[len(collected):]
+                        collected = candidate
+                    elif candidate != collected:
+                        delta = candidate
+                        collected += candidate
+                    else:
+                        delta = ""
+                    if delta:
+                        yield sse("delta", {"text": delta})
+                if not collected:
+                    raise RuntimeError("Codex CLI 未返回内容")
+                with SessionLocal() as final_db:
+                    final_session = final_db.get(CodexSession, session_id_value)
+                    if final_session is None:
+                        raise RuntimeError("Codex 会话不存在")
+                    final_session.status = "ready"; final_session.updated_at = utcnow()
+                    if not history and final_session.title == "新建 Codex 会话":
+                        final_session.title = prompt[:64]
+                    final_db.add(CodexMessage(session_id=session_id_value, role="assistant", content=collected, created_at=utcnow()))
+                    final_db.commit(); final_db.refresh(final_session)
+                    snapshot = _codex_session_view(final_session, final_db)
+                yield sse("done", {"session": snapshot})
+            except GeneratorExit:
+                with SessionLocal() as final_db:
+                    final_session = final_db.get(CodexSession, session_id_value)
+                    if final_session is not None and final_session.status == "running":
+                        final_session.status = "failed"; final_session.updated_at = utcnow(); final_db.commit()
+                raise
+            except Exception as exc:
+                detail = ai_engine._cli_diagnostic(exc) or "Codex CLI 执行失败"
+                with SessionLocal() as final_db:
+                    final_session = final_db.get(CodexSession, session_id_value)
+                    if final_session is not None:
+                        final_session.status = "failed"; final_session.updated_at = utcnow(); final_db.commit()
+                yield sse("error", {"message": detail})
+            finally:
+                # A browser disconnect can close the generator without
+                # entering the normal done/error branches.
+                with SessionLocal() as final_db:
+                    final_session = final_db.get(CodexSession, session_id_value)
+                    if final_session is not None and final_session.status == "running":
+                        final_session.status = "failed"; final_session.updated_at = utcnow(); final_db.commit()
+                with _CODEX_SESSIONS_LOCK:
+                    _CODEX_RUNNING_SESSIONS.discard(session_id_value)
+
+        return StreamingResponse(stream_events(), media_type="text/event-stream", headers={
+            "Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+        })
 
     def model_rows(db: Session, settings: AiSettings) -> list[dict]:
         """Return the normalized model catalog, migrating legacy JSON lazily."""

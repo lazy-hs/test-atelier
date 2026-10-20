@@ -1,11 +1,11 @@
 import { motion } from 'motion/react'
-import { ArrowRight, Archive, FileSpreadsheet, FileText, ListChecks, PlayCircle, Plus, RefreshCw, Upload, WandSparkles, type LucideIcon } from 'lucide-react'
+import { ArrowRight, Archive, FileSpreadsheet, FileText, ListChecks, Plus, RefreshCw, Upload, WandSparkles, type LucideIcon } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 
-export type HomeView = 'cases' | 'imports' | 'requirements' | 'authoring' | 'conversion' | 'smoke'
+export type HomeView = 'cases' | 'imports' | 'requirements' | 'authoring' | 'conversion'
 export type RecentActivity = {
   id: string
-  kind: 'import' | 'analysis' | 'draft' | 'conversion' | 'document' | 'run'
+  kind: 'import' | 'analysis' | 'draft' | 'conversion' | 'document'
   title: string
   status: string
   created_at: string
@@ -32,13 +32,12 @@ const tools: { label: string; detail: string; view: HomeView; icon: LucideIcon }
   { label: '用例编写', detail: '编辑草稿并确认发布', view: 'authoring', icon: WandSparkles },
   { label: '用例转换', detail: '核对 Excel 与 XMind', view: 'conversion', icon: RefreshCw },
   { label: '用例库', detail: '检索与审核项目用例', view: 'cases', icon: ListChecks },
-  { label: '冒烟执行', detail: '组织核心链路并记录结果', view: 'smoke', icon: PlayCircle },
 ]
 const activityIcons: Record<RecentActivity['kind'], LucideIcon> = {
-  import: Upload, analysis: FileText, draft: WandSparkles, conversion: RefreshCw, document: FileSpreadsheet, run: PlayCircle,
+  import: Upload, analysis: FileText, draft: WandSparkles, conversion: RefreshCw, document: FileSpreadsheet,
 }
 const activityLabels: Record<RecentActivity['kind'], string> = {
-  import: '导入', analysis: '分析', draft: '编写', conversion: '转换', document: '材料', run: '执行',
+  import: '导入', analysis: '分析', draft: '编写', conversion: '转换', document: '材料',
 }
 
 function formatTime(value: string) {
@@ -66,8 +65,6 @@ export function HomePage({ overview, readonly, onNavigate, onMyReviews, onPendin
     { label: '分析记录', count: overview?.analysis_count, view: 'requirements', icon: FileText },
     { label: '导入批次', count: overview?.import_count, view: 'imports', icon: Archive },
     { label: '转换结果', count: overview?.conversion_count, view: 'conversion', icon: RefreshCw },
-    { label: '冒烟集', count: overview?.smoke_suite_count, view: 'smoke', icon: PlayCircle },
-    { label: '执行中', count: overview?.active_run_count, view: 'smoke', icon: PlayCircle },
   ]
 
   return <div className="home-view">
@@ -110,7 +107,7 @@ export function HomePage({ overview, readonly, onNavigate, onMyReviews, onPendin
     <section className="home-section home-activity" aria-labelledby="home-activity-title">
       <div className="home-section-heading"><h2 id="home-activity-title">最近工作</h2><span>按时间排序</span></div>
       <div className="home-activity-header" aria-hidden="true"><span>事项</span><span>状态</span><span>时间</span></div>
-      {overview?.recent_activity.length ? overview.recent_activity.map(item => {
+      {overview?.recent_activity.filter(item => (item as { kind: string }).kind !== 'run').length ? overview.recent_activity.filter(item => (item as { kind: string }).kind !== 'run').map(item => {
         const Icon = activityIcons[item.kind]
         return <button className="home-activity-row" type="button" key={item.id} onClick={() => onNavigate(item.view)}>
           <span className="home-activity-title"><Icon size={16} /><span><strong>{item.title}</strong><small>{activityLabels[item.kind]}</small></span></span>

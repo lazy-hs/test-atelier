@@ -1,6 +1,6 @@
 # Test Atelier 前端
 
-React 19、Vite、TypeScript、shadcn/ui、Motion 与 Lucide。登录会话、项目导航和 `/api/v1/projects/{project_id}` 项目边界由根应用统一管理；需求分析、用例编写、用例库、导入记录、分类规则、团队协作、冒烟执行和转换工具共享同一项目上下文。
+React 19、Vite、TypeScript、shadcn/ui、Motion 与 Lucide。登录会话、项目导航和 `/api/v1/projects/{project_id}` 项目边界由根应用统一管理；需求分析、用例编写、用例库、导入记录、分类规则、团队协作和转换工具共享同一项目上下文。
 
 ## 本地开发
 
@@ -43,7 +43,7 @@ AI_STUDIO_E2E_PASSWORD='管理员密码' npm run test:e2e
 
 ```text
 src/App.tsx             登录、项目选择和一级导航
-src/components/         首页、审核、分析、团队和冒烟页面
+src/components/         首页、审核、分析、团队和项目管理页面
 src/converter/           旧转换器的 React 宿主和 Shadow DOM 样式
 src/lib/api.ts           带会话和 CSRF 的 API 客户端
 e2e/                    Playwright 工作流回归

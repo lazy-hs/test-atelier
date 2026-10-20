@@ -331,7 +331,7 @@ class JsonFormatter(logging.Formatter):
         "prompt_length", "case_id", "completed", "total", "error_count", "process_pid", "queue_limit",
         "actor_id", "target_user_id", "role", "active_jobs", "released_reservations", "recovered_reservations", "shutdown_timeout", "component",
         "version", "revision", "expected_revision", "taxonomy_version_id", "suggestion_id", "case_version", "action", "count",
-        "required", "source", "retry_after_seconds", "worker_id", "lease_seconds",
+        "required", "source", "retry_after_seconds", "worker_id", "lease_seconds", "status_code",
         "script", "returncode", "recovered_jobs", "reason", "file_size", "row_count", "warning_count", "failure_count", "failed_checks",
         "text_length", "conversion_mode", "output_mode", "database_kind", "session_max_age", "max_request_bytes", "request_bytes", "declared_bytes",
         "worker_age_seconds", "worker_release", "error_log_interval_seconds",

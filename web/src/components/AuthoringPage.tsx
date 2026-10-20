@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { AlertCircle, Download, Eye, Plus, RefreshCw, Save, Send, Trash2 } from 'lucide-react'
+import { AlertCircle, ChevronLeft, ChevronRight, Download, Eye, ListFilter, Plus, RefreshCw, Save, Search, Send, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
-import { api, formatAiError, rawApi, type AiJob, type Analysis, type Draft, type DraftPayload } from '@/lib/api'
+import { api, formatAiError, rawApi, type AiConfig, type AiJob, type Analysis, type Draft, type DraftPayload } from '@/lib/api'
 import { PromptViewerDialog } from '@/components/PromptViewerDialog'
 
 function download(response: Response, blob: Blob) {
@@ -18,12 +18,19 @@ function download(response: Response, blob: Blob) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
+function uiProvider(provider: string) {
+  return provider === 'codex_cli' ? 'codex' : provider === 'claude_code' ? 'claude' : provider
+}
+
 export function AuthoringPage({ projectId, readonly, onOpenCases }: { projectId: number; readonly: boolean; onOpenCases: () => void }) {
   const base = `/projects/${projectId}`
   const [analyses, setAnalyses] = useState<Analysis[]>([])
+  const [model, setModel] = useState<Pick<AiConfig, 'local_model' | 'local_enabled' | 'remote_enabled' | 'codex_enabled' | 'codex_model' | 'claude_enabled' | 'claude_model'> | null>(null)
+  const [provider, setProvider] = useState('local')
   const [analysisId, setAnalysisId] = useState('')
   const [drafts, setDrafts] = useState<Draft[]>([])
   const [selected, setSelected] = useState('')
+  const [draftQuery, setDraftQuery] = useState('')
   const [form, setForm] = useState<DraftPayload | null>(null)
   const [job, setJob] = useState<AiJob | null>(null)
   const [quality, setQuality] = useState<{ coverage: number; errors: string[]; warnings: string[] } | null>(null)
@@ -33,9 +40,17 @@ export function AuthoringPage({ projectId, readonly, onOpenCases }: { projectId:
   const [promptOpen, setPromptOpen] = useState(false)
 
   const refresh = useCallback(async () => {
-    const runs = await api<Analysis[]>(`${base}/analyses`)
+    const [runs, config] = await Promise.all([
+      api<Analysis[]>(`${base}/analyses`),
+      api<Pick<AiConfig, 'local_model' | 'local_enabled' | 'remote_enabled' | 'codex_enabled' | 'codex_model' | 'claude_enabled' | 'claude_model'>>(`${base}/ai/config`),
+    ])
     setAnalyses(runs.filter(run => run.status === 'ready'))
-    if (!analysisId && runs.some(run => run.status === 'ready')) setAnalysisId(runs.find(run => run.status === 'ready')!.id)
+    setModel(config)
+    if (!analysisId && runs.some(run => run.status === 'ready')) {
+      const next = runs.find(run => run.status === 'ready')!
+      setAnalysisId(next.id)
+      setProvider(uiProvider(next.provider))
+    }
   }, [base, analysisId])
   const loadDrafts = useCallback(async () => {
     if (!analysisId) { setDrafts([]); return }
@@ -43,9 +58,23 @@ export function AuthoringPage({ projectId, readonly, onOpenCases }: { projectId:
       api<Draft[]>(`${base}/drafts?analysis_id=${analysisId}`), api<AiJob[]>(`${base}/ai/jobs?analysis_id=${analysisId}`),
       api<{ coverage: number; errors: string[]; warnings: string[] }>(`${base}/analyses/${analysisId}/quality`),
     ])
-    setDrafts(result); setJob(tasks.find(item => item.kind === 'cases') ?? null); setQuality(summary)
+    setDrafts(result)
+    // Select the first result as soon as generation finishes so the main pane
+    // is useful immediately, while preserving the reader's current selection.
+    setSelected(previous => previous && result.some(item => item.id === previous) ? previous : result[0]?.id ?? '')
+    setJob(tasks.find(item => item.kind === 'cases') ?? null); setQuality(summary)
   }, [base, analysisId])
   useEffect(() => { void refresh().catch(cause => setError(cause.message)) }, [refresh])
+  useEffect(() => {
+    if (!model) return
+    const enabled = [
+      model.local_enabled !== false ? 'local' : '',
+      model.remote_enabled ? 'remote' : '',
+      model.codex_enabled ? 'codex' : '',
+      model.claude_enabled ? 'claude' : '',
+    ].filter(Boolean)
+    if (!enabled.includes(provider)) setProvider(enabled[0] ?? '')
+  }, [model, provider])
   useEffect(() => { setSelected(''); setForm(null); void loadDrafts().catch(cause => setError(cause.message)) }, [loadDrafts])
   useEffect(() => {
     if (job?.status !== 'queued' && job?.status !== 'running') return
@@ -56,15 +85,23 @@ export function AuthoringPage({ projectId, readonly, onOpenCases }: { projectId:
     const draft = drafts.find(item => item.id === selected)
     if (draft) setForm(structuredClone(draft.payload))
   }, [drafts, selected])
-
   const current = drafts.find(item => item.id === selected)
+  const filteredDrafts = useMemo(() => {
+    const query = draftQuery.trim().toLocaleLowerCase()
+    if (!query) return drafts
+    return drafts.filter(item => [item.payload.title, item.payload.module.join(' / '), item.payload.requirement_ids.join(' '), item.payload.method, item.payload.priority]
+      .some(value => value.toLocaleLowerCase().includes(query)))
+  }, [draftQuery, drafts])
+  const currentIndex = filteredDrafts.findIndex(item => item.id === selected)
+  const publishedCount = drafts.filter(item => item.status === 'published').length
   const analysis = analyses.find(item => item.id === analysisId)
   const unresolved = analysis?.result.ambiguities?.some(item => item.critical && !item.decision)
   async function generate() {
     if (!analysisId) return
+    if (provider === 'remote' && !window.confirm('远程模型会接收分析报告内容。确认发送吗？')) return
     setBusy(true); setError('')
     try {
-      const result = await api<{ job_id: string }>(`${base}/analyses/${analysisId}/generate`, { method: 'POST' })
+      const result = await api<{ job_id: string }>(`${base}/analyses/${analysisId}/generate`, { method: 'POST', body: JSON.stringify({ provider }) })
       setJob({ id: result.job_id, kind: 'cases', status: 'queued', attempts: 0, error: '', analysis_id: analysisId }); setNotice('生成任务已创建')
     } catch (cause) { setError((cause as Error).message) } finally { setBusy(false) }
   }
@@ -102,18 +139,21 @@ export function AuthoringPage({ projectId, readonly, onOpenCases }: { projectId:
   return <div className="ai-workspace">
     {error && <div className="ai-alert error" role="alert"><AlertCircle size={16} />{error}</div>}
     {notice && <div className="ai-alert" role="status">{notice}</div>}
-    <div className="authoring-toolbar"><label htmlFor="analysis-select">分析报告</label><select id="analysis-select" value={analysisId} onChange={event => setAnalysisId(event.target.value)}>
-      {analyses.length ? analyses.map(item => <option value={item.id} key={item.id}>{new Date(item.created_at).toLocaleString('zh-CN')} · {item.result.requirements?.length ?? 0} 条需求</option>) : <option value="">暂无已完成的分析报告</option>}
-    </select>{job && <Button variant="outline" onClick={() => setPromptOpen(true)} disabled={busy}><Eye data-icon="inline-start" />查看提示词</Button>}<Button onClick={() => void generate()} disabled={readonly || busy || !analysisId || Boolean(unresolved) || drafts.length > 0 || job?.status === 'running' || job?.status === 'queued'}><Plus data-icon="inline-start" />生成草稿</Button>
+    <div className="authoring-toolbar"><label htmlFor="analysis-select">分析报告</label><select id="analysis-select" value={analysisId} onChange={event => { const next = analyses.find(item => item.id === event.target.value); setAnalysisId(event.target.value); setDraftQuery(''); if (next) setProvider(uiProvider(next.provider)) }}>
+      {analyses.length ? analyses.map(item => <option value={item.id} key={item.id}>{item.title || new Date(item.created_at).toLocaleString('zh-CN')} · {item.result.requirements?.length ?? 0} 条需求</option>) : <option value="">暂无已完成的分析报告</option>}
+    </select><label htmlFor="authoring-provider">生成模型</label><select id="authoring-provider" value={provider} onChange={event => setProvider(event.target.value)} disabled={readonly || busy || !model}>
+      {model?.local_enabled !== false && <option value="local">本地 {model?.local_model || 'Ollama'}</option>}{model?.remote_enabled && <option value="remote">远程模型（发送报告内容）</option>}{model?.codex_enabled && <option value="codex">Codex CLI（本机）{model.codex_model ? ` · ${model.codex_model}` : ''}</option>}{model?.claude_enabled && <option value="claude">Claude Code（本机）{model.claude_model ? ` · ${model.claude_model}` : ''}</option>}
+    </select>{job && <Button variant="outline" onClick={() => setPromptOpen(true)} disabled={busy}><Eye data-icon="inline-start" />查看提示词</Button>}<Button onClick={() => void generate()} disabled={readonly || busy || !model || !analysisId || !provider || Boolean(unresolved) || drafts.length > 0 || job?.status === 'running' || job?.status === 'queued'}><Plus data-icon="inline-start" />生成草稿</Button>
       {drafts.length > 0 && <><Button variant="outline" onClick={() => void exportFile('xlsx')} disabled={busy}><Download data-icon="inline-start" />Excel</Button><Button variant="outline" onClick={() => void exportFile('xmind')} disabled={busy}><Download data-icon="inline-start" />XMind</Button></>}</div>
     {unresolved && <div className="ai-alert warning"><AlertCircle size={16} />分析报告仍有关键歧义待确认</div>}
     {drafts.length > 0 && quality && <div className={`ai-alert ${quality.errors.length ? 'error' : quality.warnings.length ? 'warning' : ''}`} role="status">需求覆盖 {quality.coverage}% · {drafts.length} 条草稿{quality.errors.map(item => ` · ${item}`)}{quality.warnings.map(item => ` · ${item}`)}</div>}
     {job?.status === 'failed' && <div className="ai-alert error"><AlertCircle size={16} />{formatAiError(job.error)}{!readonly && <Button variant="outline" size="sm" onClick={() => void retry()} disabled={busy}><RefreshCw data-icon="inline-start" />重试</Button>}</div>}
     {(job?.status === 'queued' || job?.status === 'running') && <div className="ai-processing" role="status">正在生成用例草稿</div>}
-    <div className="ai-columns authoring-columns"><aside className="ai-rail"><div className="ai-rail-heading"><h2>用例草稿</h2><Badge variant="secondary">{drafts.length}</Badge></div>
-      {drafts.length ? drafts.map(item => <button className={`draft-row ${item.id === selected ? 'is-active' : ''}`} key={item.id} onClick={() => setSelected(item.id)}><strong>{item.payload.title}</strong><span>{item.payload.requirement_ids.join(', ')} · {item.payload.priority} · {item.status === 'published' ? '已发布' : '草稿'}</span></button>) : <div className="ai-empty">从已确认的分析报告生成草稿</div>}
+    <div className="ai-columns authoring-columns"><aside className="ai-rail"><div className="ai-rail-heading"><div><h2>用例草稿</h2><p className="draft-list-summary">{drafts.length} 条 · 已发布 {publishedCount} 条</p></div><Badge variant="secondary">{drafts.length}</Badge></div>
+      {drafts.length > 0 && <label className="draft-search"><Search size={14} /><input value={draftQuery} onChange={event => setDraftQuery(event.target.value)} placeholder="搜索标题、模块或需求 ID" aria-label="搜索用例草稿" /></label>}
+      {filteredDrafts.length ? filteredDrafts.map((item, index) => <button className={`draft-row ${item.id === selected ? 'is-active' : ''}`} key={item.id} onClick={() => setSelected(item.id)}><span className="draft-row-index">{String(index + 1).padStart(2, '0')}</span><span className="draft-row-copy"><strong>{item.payload.title}</strong><span>{item.payload.module.join(' / ') || '未分类'} · {item.payload.priority} · {item.status === 'published' ? '已发布' : '草稿'}</span></span></button>) : drafts.length ? <div className="draft-filter-empty"><ListFilter size={18} /><span>没有匹配的用例</span></div> : <div className="ai-empty">从已确认的分析报告生成草稿</div>}
     </aside><section className="ai-main"><AnimatePresence mode="wait">{current && form ? <motion.div key={current.id} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} className="draft-editor">
-      <div className="ai-section-heading"><div><h2>编写用例</h2><p>来源需求 {form.requirement_ids.join(', ')}</p></div>{current.status === 'published' && <Button variant="outline" size="sm" onClick={onOpenCases}>查看用例库</Button>}</div>
+      <div className="ai-section-heading"><div><div className="draft-title-line"><h2>编写用例</h2><Badge variant="secondary">{currentIndex >= 0 ? `${currentIndex + 1} / ${filteredDrafts.length}` : '已选'}</Badge></div><p>来源需求 {form.requirement_ids.join(', ')}</p></div><div className="draft-navigation"><Button variant="ghost" size="icon-sm" aria-label="上一个用例" onClick={() => currentIndex > 0 && setSelected(filteredDrafts[currentIndex - 1].id)} disabled={currentIndex <= 0}><ChevronLeft /></Button><Button variant="ghost" size="icon-sm" aria-label="下一个用例" onClick={() => currentIndex >= 0 && currentIndex < filteredDrafts.length - 1 && setSelected(filteredDrafts[currentIndex + 1].id)} disabled={currentIndex < 0 || currentIndex >= filteredDrafts.length - 1}><ChevronRight /></Button>{current.status === 'published' && <Button variant="outline" size="sm" onClick={onOpenCases}>查看用例库</Button>}</div></div>
       <div className="draft-fields"><label>标题<Input value={form.title} onChange={event => change({ title: event.target.value })} disabled={readonly || current.status === 'published'} /></label><label>模块路径<Input value={form.module.join(' / ')} onChange={event => change({ module: event.target.value.split('/').map(text => text.trim()).filter(Boolean) })} disabled={readonly || current.status === 'published'} /></label>
         <label>需求 ID<Input value={form.requirement_ids.join(', ')} onChange={event => change({ requirement_ids: event.target.value.split(',').map(text => text.trim()).filter(Boolean) })} disabled={readonly || current.status === 'published'} /></label>
         <label>优先级<select value={form.priority} onChange={event => change({ priority: event.target.value })} disabled={readonly || current.status === 'published'}>{['P0', 'P1', 'P2', 'P3'].map(value => <option key={value}>{value}</option>)}</select></label>

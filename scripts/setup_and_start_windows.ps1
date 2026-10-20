@@ -91,7 +91,7 @@ if (-not $SkipConfigure -and -not (Test-Path $SecretFile)) {
 }
 $env:AI_STUDIO_SESSION_SECRET = (Get-Content -Raw $SecretFile).Trim()
 $env:AI_STUDIO_REQUIRE_MIGRATIONS = "1"
-$env:AI_STUDIO_MIGRATION_HEAD = "20261024_queue_capacity"
+$env:AI_STUDIO_MIGRATION_HEAD = "20261028_codex_sessions"
 # This launcher starts only the API and Vite. Do not inherit a production
 # external-worker flag or queued AI jobs would have no consumer.
 $env:AI_STUDIO_EXTERNAL_WORKER = "0"

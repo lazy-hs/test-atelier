@@ -41,7 +41,7 @@ def test_existing_database_roles_are_backfilled_without_data_loss(tmp_path):
         assert db.execute("SELECT username FROM users ORDER BY id").fetchall() == [("admin",), ("reader",), ("tester",)]
         assert db.execute("SELECT original_id,smoke,final_smoke,version FROM cases WHERE id=1").fetchone() == ("001", "", None, 2)
         assert db.execute("SELECT action,reason FROM review_events WHERE id=1").fetchone() == ("review", "人工核对")
-        assert db.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "20261024_queue_capacity"
+        assert db.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "20261028_codex_sessions"
         assert db.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='ix_ai_jobs_status'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='ix_suggestion_jobs_status'").fetchone()
         assert "request_id" in {column[1] for column in db.execute("PRAGMA table_info(ai_jobs)")}
@@ -57,6 +57,14 @@ def test_existing_database_roles_are_backfilled_without_data_loss(tmp_path):
         assert any(key[2] == "taxonomy_versions" and key[3] == "final_taxonomy_version_id" for key in db.execute("PRAGMA foreign_key_list(cases)"))
         assert db.execute("SELECT name FROM sqlite_master WHERE name='project_skills'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE name='ai_queue_state'").fetchone()
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='ai_models'").fetchone()
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='ai_tools'").fetchone()
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='codex_sessions'").fetchone()
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='codex_messages'").fetchone()
+        model_columns = {column[1] for column in db.execute("PRAGMA table_info(ai_models)")}
+        assert {"provider_id", "scope", "endpoint", "model", "api_key_encrypted"} <= model_columns
+        tool_columns = {column[1] for column in db.execute("PRAGMA table_info(ai_tools)")}
+        assert {"tool_id", "command", "model", "enabled"} <= tool_columns
         assert db.execute("SELECT id,active_jobs FROM ai_queue_state").fetchone() == (1, 0)
         assert db.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='ix_ai_jobs_status'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='ix_suggestion_jobs_status'").fetchone()
@@ -82,6 +90,10 @@ def test_fresh_database_reaches_team_schema(tmp_path):
         assert db.execute("SELECT name FROM sqlite_master WHERE name='execution_events'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE name='ai_settings'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE name='project_skills'").fetchone()
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='ai_models'").fetchone()
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='ai_tools'").fetchone()
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='codex_sessions'").fetchone()
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='codex_messages'").fetchone()
 
 
 def test_queue_capacity_migration_recovers_a_partially_created_state_table(tmp_path):

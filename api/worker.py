@@ -20,7 +20,7 @@ from pathlib import Path
 from sqlalchemy import select, text, update
 
 from . import ai_engine, ai_jobs, suggestion_jobs
-from .db import AiJob, AiSettings, SessionLocal, SuggestionJob, database_kind
+from .db import AiJob, AiModel, AiSettings, AiTool, SessionLocal, SuggestionJob, database_kind
 from .observability import (configure_logging, deployment_release, env_float, monotonic,
                             reset_request_id, set_request_id)
 from .storage import ensure_private_directory, write_private_atomic
@@ -84,10 +84,27 @@ def _load_ai_config(*, log_availability: bool = True) -> None:
         settings = db.get(AiSettings, 1)
         if settings is None:
             return
+        model_rows = {row.provider_id: row for row in db.scalars(select(AiModel)).all()}
+        tool_rows = {row.tool_id: row for row in db.scalars(select(AiTool)).all()}
+        local_row, remote_row = model_rows.get("local"), model_rows.get("remote")
+        codex_row, claude_row = tool_rows.get("codex_cli"), tool_rows.get("claude_code")
+        local_url = local_row.endpoint if local_row else settings.local_url
+        local_model = local_row.model if local_row else settings.local_model
+        local_enabled = local_row.enabled if local_row else ai_engine.catalog_provider_enabled(settings.providers_json, "local")
+        remote_enabled = remote_row.enabled if remote_row else settings.remote_enabled
+        remote_url = remote_row.endpoint if remote_row else settings.remote_url
+        remote_model = remote_row.model if remote_row else settings.remote_model
+        remote_secret = settings.remote_api_key or (remote_row.api_key_encrypted if remote_row else "")
+        codex_enabled = codex_row.enabled if codex_row else settings.codex_enabled
+        codex_command = codex_row.command if codex_row else settings.codex_command
+        codex_model = codex_row.model if codex_row else settings.codex_model
+        claude_enabled = claude_row.enabled if claude_row else settings.claude_enabled
+        claude_command = claude_row.command if claude_row else settings.claude_command
+        claude_model = claude_row.model if claude_row else settings.claude_model
         try:
             remote_api_key = (
-                ai_engine.decrypt_secret_checked(settings.remote_api_key)
-                if settings.remote_enabled else ai_engine.decrypt_secret(settings.remote_api_key)
+                ai_engine.decrypt_secret_checked(remote_secret)
+                if remote_enabled else ai_engine.decrypt_secret(remote_secret)
             )
         except RuntimeError:
             logger.error("ai.settings.secret_unavailable", extra={
@@ -97,26 +114,26 @@ def _load_ai_config(*, log_availability: bool = True) -> None:
             })
             raise
         ai_engine.apply_config({
-            "local_url": settings.local_url,
-            "local_model": settings.local_model,
-            "local_enabled": ai_engine.catalog_provider_enabled(settings.providers_json, "local"),
-            "remote_enabled": settings.remote_enabled,
-            "remote_url": settings.remote_url,
-            "remote_model": settings.remote_model,
+            "local_url": local_url,
+            "local_model": local_model,
+            "local_enabled": local_enabled,
+            "remote_enabled": remote_enabled,
+            "remote_url": remote_url,
+            "remote_model": remote_model,
             "remote_api_key": remote_api_key,
-            "codex_enabled": settings.codex_enabled,
-            "codex_command": settings.codex_command,
-            "codex_model": settings.codex_model,
-            "claude_enabled": settings.claude_enabled,
-            "claude_command": settings.claude_command,
-            "claude_model": settings.claude_model,
+            "codex_enabled": codex_enabled,
+            "codex_command": codex_command,
+            "codex_model": codex_model,
+            "claude_enabled": claude_enabled,
+            "claude_command": claude_command,
+            "claude_model": claude_model,
         })
         if log_availability:
             ai_engine.log_cli_availability("external-worker")
 
 
 def _check_migrations() -> None:
-    expected = os.getenv("AI_STUDIO_MIGRATION_HEAD", "20261024_queue_capacity")
+    expected = os.getenv("AI_STUDIO_MIGRATION_HEAD", "20261028_codex_sessions")
     with SessionLocal() as db:
         actual = db.execute(text("SELECT version_num FROM alembic_version")).scalar()
     if actual != expected:
