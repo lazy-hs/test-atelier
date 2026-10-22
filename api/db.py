@@ -189,6 +189,27 @@ class Project(Base):
     archived_at: Mapped[str | None] = mapped_column(String(40), nullable=True, default=None)
 
 
+class WorkItem(Base):
+    """A personal work-board entry, optionally linked to a project.
+
+    Work items belong to the author rather than a project so the board can
+    aggregate work across every project the user can access.
+    """
+    __tablename__ = "work_items"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[int | None] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(32), default="other")
+    title: Mapped[str] = mapped_column(String(240))
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(24), default="todo", index=True)
+    start_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    due_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    completed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+    updated_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
 class ProjectSkill(Base):
     """Project-local activation state for a skill from qa-doc-skills."""
     __tablename__ = "project_skills"
@@ -231,6 +252,15 @@ class ImportBatch(Base):
     warnings: Mapped[list] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(20), default="preview")
     created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+    # Governance imports retain an immutable source fingerprint and snapshot
+    # while legacy imports continue to use the original fields unchanged.
+    kind: Mapped[str] = mapped_column(String(24), default="workspace", server_default="workspace")
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    source_sheet: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    snapshot_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    parent_batch_id: Mapped[int | None] = mapped_column(ForeignKey("import_batches.id"), nullable=True)
+    rules_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class Case(Base):
@@ -253,6 +283,24 @@ class Case(Base):
     assignee_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     final_categories: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=dict)
     final_taxonomy_version_id: Mapped[int | None] = mapped_column(ForeignKey("taxonomy_versions.id"), nullable=True)
+    platform_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    name_key: Mapped[str | None] = mapped_column(String(512), nullable=True, index=True)
+    governance_status: Mapped[str] = mapped_column(String(24), default="active", server_default="active", index=True)
+    domain: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    subdomain: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    endpoint: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    steps: Mapped[str | None] = mapped_column(Text, nullable=True)
+    precondition: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expected: Mapped[str | None] = mapped_column(Text, nullable=True)
+    remark: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tag_iteration: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    tag_requirement: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    tag_change: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    fingerprint: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    merged_into: Mapped[int | None] = mapped_column(ForeignKey("cases.id"), nullable=True)
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow, nullable=False)
+    updated_at: Mapped[str] = mapped_column(String(40), default=utcnow, nullable=False)
 
 
 class ReviewEvent(Base):
@@ -264,6 +312,98 @@ class ReviewEvent(Base):
     after: Mapped[dict] = mapped_column(JSON)
     reason: Mapped[str] = mapped_column(Text)
     action: Mapped[str] = mapped_column(String(20), default="review", server_default="review")
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
+class GovernanceDuplicateGroup(Base):
+    __tablename__ = "governance_duplicate_groups"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("import_batches.id", ondelete="CASCADE"), index=True)
+    gid: Mapped[str] = mapped_column(String(32), index=True)
+    name_key: Mapped[str] = mapped_column(String(512), index=True)
+    name: Mapped[str] = mapped_column(Text)
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    cluster_count: Mapped[int] = mapped_column(Integer, default=0)
+    category: Mapped[str] = mapped_column(String(8), default="C")
+    suggested_discard_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    decided_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    decided_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+
+class GovernanceDuplicateMember(Base):
+    __tablename__ = "governance_duplicate_members"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    group_id: Mapped[int] = mapped_column(ForeignKey("governance_duplicate_groups.id", ondelete="CASCADE"), index=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("cases.id", ondelete="CASCADE"), index=True)
+    cluster_fp: Mapped[str] = mapped_column(String(32), index=True)
+    score: Mapped[int] = mapped_column(Integer, default=0)
+    decision: Mapped[str] = mapped_column(String(24), default="keep")
+    reason: Mapped[str] = mapped_column(Text, default="")
+
+
+class GovernanceValidationRun(Base):
+    __tablename__ = "governance_validation_runs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    filename: Mapped[str] = mapped_column(String(255), default="")
+    rows: Mapped[list] = mapped_column(JSON, default=list)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(24), default="blocked", index=True)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
+class GovernanceDirectory(Base):
+    __tablename__ = "governance_directories"
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True)
+    path: Mapped[str] = mapped_column(String(1024), primary_key=True)
+    parent: Mapped[str] = mapped_column(String(1024), default="")
+    level: Mapped[int] = mapped_column(Integer, default=0)
+    domain: Mapped[str] = mapped_column(String(160), default="")
+    subdomain: Mapped[str] = mapped_column(String(240), default="")
+    whitelisted: Mapped[bool] = mapped_column(default=False)
+    frozen: Mapped[bool] = mapped_column(default=False)
+    status: Mapped[str] = mapped_column(String(24), default="active")
+
+
+class GovernanceChangeLog(Base):
+    __tablename__ = "governance_change_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    entity: Mapped[str] = mapped_column(String(64))
+    entity_id: Mapped[str] = mapped_column(String(128))
+    action: Mapped[str] = mapped_column(String(32))
+    before_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    after_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    batch_key: Mapped[str] = mapped_column(String(64), index=True)
+    operator_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    ts: Mapped[str] = mapped_column(String(40), default=utcnow)
+    revert_of: Mapped[int | None] = mapped_column(ForeignKey("governance_change_logs.id"), nullable=True)
+
+
+class GovernanceMetricSnapshot(Base):
+    __tablename__ = "governance_metric_snapshots"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("import_batches.id", ondelete="CASCADE"), index=True)
+    key: Mapped[str] = mapped_column(String(80))
+    value: Mapped[float] = mapped_column(default=0)
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
+class GovernanceExportJob(Base):
+    __tablename__ = "governance_export_jobs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(32), default="cases")
+    format: Mapped[str] = mapped_column(String(8), default="xlsx")
+    path: Mapped[str] = mapped_column(String(1024), default="")
+    rows: Mapped[int] = mapped_column(Integer, default=0)
+    selfcheck: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
 
 

@@ -230,7 +230,7 @@ def run_preflight(env: dict[str, str] | None = None, *, compose: bool = False,
     else:
         _result(results, "AI_STUDIO_REQUIRE_MIGRATIONS", "ok" if require_migrations else "warn",
                 "已启用" if require_migrations else "开发环境允许隐式初始化")
-    migration_head = values.get("AI_STUDIO_MIGRATION_HEAD", "20261028_codex_sessions").strip()
+    migration_head = values.get("AI_STUDIO_MIGRATION_HEAD", "20261032_case_timestamps").strip()
     known_revisions = _known_migration_revisions()
     if not migration_head:
         _result(results, "AI_STUDIO_MIGRATION_HEAD", "fail", "未设置迁移 head")

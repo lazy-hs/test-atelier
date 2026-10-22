@@ -264,11 +264,33 @@ def _validate_cli_command(command: str) -> str:
     return value
 
 
-def _json_from_cli_output(stdout: str, schema: dict) -> dict:
-    """Extract the structured final message from Codex/Claude JSON or JSONL."""
+class StructuredOutputError(RuntimeError):
+    def __init__(self, message: str, raw_output: str = ""):
+        super().__init__(message)
+        self.raw_output = raw_output
+
+
+def _json_from_cli_output(stdout: str, schema: dict) -> dict | list:
+    """Extract strict object/array output while retaining raw model text on failure."""
     expected = set(schema.get("properties", {}))
+    expects_array = schema.get("type") == "array"
+    array_required = set((schema.get("items") or {}).get("required", []))
 
     def visit(value):
+        # A JSON-array schema must be matched as a whole; only descend into
+        # dict children when the caller asked for an object.
+        if expects_array:
+            if isinstance(value, list):
+                if not array_required or all(isinstance(item, dict) and array_required.issubset(item) for item in value):
+                    return value
+                for child in value:
+                    found = visit_any(child)
+                    if found is not None:
+                        return found
+            return visit_any(value)
+        return visit_any(value)
+
+    def visit_any(value):
         if isinstance(value, dict):
             if expected and expected.issubset(value):
                 return value
@@ -302,7 +324,7 @@ def _json_from_cli_output(stdout: str, schema: dict) -> dict:
             continue
         if found is not None:
             return found
-    raise RuntimeError("CLI 未返回符合结构化格式的结果")
+    raise StructuredOutputError("CLI 未返回符合结构化格式的结果", stdout[-12000:])
 
 
 def _stop_process(process: subprocess.Popen[str]) -> None:
@@ -537,8 +559,8 @@ def _remote_json_content(payload: object) -> dict:
         result = json.loads(text)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise RuntimeError("远程模型返回了无效 JSON") from exc
-    if not isinstance(result, dict):
-        raise RuntimeError("远程模型返回的 JSON 必须是对象")
+    if not isinstance(result, (dict, list)):
+        raise RuntimeError("远程模型返回的 JSON 必须是对象或数组")
     return result
 
 

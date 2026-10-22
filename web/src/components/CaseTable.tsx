@@ -5,26 +5,28 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import type { Case } from '@/lib/api'
+import { formatDateTime, type Case } from '@/lib/api'
+
+function lastDirectorySegment(value: string) { return value.split(' - ').map(item => item.trim()).filter(Boolean).at(-1) ?? value }
 
 type Props = {
   items: Case[]; total: number; page: number; selected: number | null; loading: boolean; query: string
   onQuery: (value: string) => void; onPage: (page: number) => void; onSelect: (id: number) => void
   readonly: boolean; checked: number[]; onCheck: (id: number, value: boolean) => void; onCheckPage: (value: boolean) => void
-  onBatchOpen: () => void; onDeleteBatch: () => void; onDelete: (id: number) => void; assigneeFilter: string; statusFilter: string
+  onBatchOpen: () => void; onDeleteBatch: () => void; onDeleteAll: () => void; onDelete: (id: number) => void; assigneeFilter: string; statusFilter: string
   onAssigneeFilter: (value: string) => void; onStatusFilter: (value: string) => void
   suggestionFilter: string; onSuggestionFilter: (value: string) => void
   suggestionBusy: boolean; onRules: () => void; onModel: () => void
 }
 
 export function CaseTable({ items, total, page, selected, loading, query, onQuery, onPage, onSelect,
-  readonly, checked, onCheck, onCheckPage, onBatchOpen, onDeleteBatch, onDelete, assigneeFilter, statusFilter,
+  readonly, checked, onCheck, onCheckPage, onBatchOpen, onDeleteBatch, onDeleteAll, onDelete, assigneeFilter, statusFilter,
   onAssigneeFilter, onStatusFilter, suggestionFilter, onSuggestionFilter, suggestionBusy, onRules, onModel }: Props) {
   const allChecked = items.length > 0 && items.every(item => checked.includes(item.id))
   const someChecked = items.some(item => checked.includes(item.id))
   return <section className="case-list" aria-label="用例列表">
     <div className="list-heading">
-      <div><h2>用例库</h2><span>{total} 条用例</span></div>
+      <div><h2>用例库</h2><span>{total} 条用例</span></div><div className="list-heading-actions">{!readonly && total > 0 && <Button variant="destructive" size="sm" onClick={onDeleteAll}><Trash2 data-icon="inline-start" />删除全部</Button>}</div>
       <div className="list-tools"><div className="search-wrap"><Search size={16} aria-hidden="true" /><Input aria-label="搜索 ID、名称或目录" placeholder="搜索 ID 名称或目录" value={query} onChange={event => onQuery(event.target.value)} /></div>
         <Select value={assigneeFilter} onValueChange={onAssigneeFilter}><SelectTrigger aria-label="负责人筛选"><SelectValue /></SelectTrigger><SelectContent><SelectGroup>
           <SelectItem value="all">全部负责人</SelectItem><SelectItem value="me">分派给我</SelectItem><SelectItem value="unassigned">未分派</SelectItem>
@@ -46,7 +48,7 @@ export function CaseTable({ items, total, page, selected, loading, query, onQuer
           {items.map(item => <motion.tr key={item.id} layout initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -5 }} transition={{ duration: .2 }}
             className={`case-row ${selected === item.id ? 'selected' : ''}`} tabIndex={0} aria-selected={selected === item.id} onClick={() => onSelect(item.id)} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(item.id) } }}>
             {!readonly && <TableCell onClick={event => event.stopPropagation()} onKeyDown={event => event.stopPropagation()}><Checkbox aria-label={`选择用例 ${item.original_id}`} checked={checked.includes(item.id)} onCheckedChange={value => onCheck(item.id, value === true)} /></TableCell>}
-            <TableCell className="id-cell">{item.original_id}</TableCell><TableCell><div className="case-title">{item.title}</div><div className="case-directory">{item.directory || '未设置目录'}</div></TableCell>
+            <TableCell className="id-cell">{item.original_id}</TableCell><TableCell><div className="case-title">{item.title}{item.governance_status === 'retired' && <span className="pending-text" title={item.merged_into ? `已合并到用例 ${item.merged_into}` : '治理建议已废弃'}> · 已废弃</span>}</div><div className="case-directory" title={item.directory || '未设置目录'}>{item.directory ? lastDirectorySegment(item.directory) : '未设置目录'}</div><div className="case-directory">创建 {formatDateTime(item.created_at)} · 修改 {formatDateTime(item.updated_at)}</div></TableCell>
             <TableCell><span className="level-mark">{item.final_level || item.level || '—'}</span></TableCell>
             <TableCell><span className={(item.final_smoke ?? item.smoke) ? '' : 'pending-text'}>{(item.final_smoke ?? item.smoke) || '待判定'}</span></TableCell>
             <TableCell><span className={item.assignee ? '' : 'pending-text'} title={item.assignee ?? ''}>{item.assignee ?? '未分派'}</span></TableCell>

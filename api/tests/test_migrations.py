@@ -41,7 +41,7 @@ def test_existing_database_roles_are_backfilled_without_data_loss(tmp_path):
         assert db.execute("SELECT username FROM users ORDER BY id").fetchall() == [("admin",), ("reader",), ("tester",)]
         assert db.execute("SELECT original_id,smoke,final_smoke,version FROM cases WHERE id=1").fetchone() == ("001", "", None, 2)
         assert db.execute("SELECT action,reason FROM review_events WHERE id=1").fetchone() == ("review", "人工核对")
-        assert db.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "20261028_codex_sessions"
+        assert db.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "20261032_case_timestamps"
         assert db.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='ix_ai_jobs_status'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='ix_suggestion_jobs_status'").fetchone()
         assert "request_id" in {column[1] for column in db.execute("PRAGMA table_info(ai_jobs)")}
@@ -51,12 +51,15 @@ def test_existing_database_roles_are_backfilled_without_data_loss(tmp_path):
         assert {column[1] for column in db.execute("PRAGMA table_info(ai_jobs)")} >= {"queue_reserved"}
         assert {column[1] for column in db.execute("PRAGMA table_info(suggestion_jobs)")} >= {"queue_reserved"}
         assert "assignee_id" in {column[1] for column in db.execute("PRAGMA table_info(cases)")}
+        assert {"created_at", "updated_at"} <= {column[1] for column in db.execute("PRAGMA table_info(cases)")}
         assert db.execute("SELECT final_categories,final_taxonomy_version_id FROM cases WHERE id=1").fetchone() == (None, None)
         assert "action" in {column[1] for column in db.execute("PRAGMA table_info(review_events)")}
         assert any(key[2] == "users" and key[3] == "assignee_id" for key in db.execute("PRAGMA foreign_key_list(cases)"))
         assert any(key[2] == "taxonomy_versions" and key[3] == "final_taxonomy_version_id" for key in db.execute("PRAGMA foreign_key_list(cases)"))
         assert db.execute("SELECT name FROM sqlite_master WHERE name='project_skills'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE name='ai_queue_state'").fetchone()
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='governance_duplicate_groups'").fetchone()
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='governance_change_logs'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE name='ai_models'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE name='ai_tools'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE name='codex_sessions'").fetchone()
@@ -88,6 +91,8 @@ def test_fresh_database_reaches_team_schema(tmp_path):
         assert db.execute("SELECT name FROM sqlite_master WHERE name='execution_runs'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE name='run_cases'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE name='execution_events'").fetchone()
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='governance_validation_runs'").fetchone()
+        assert db.execute("SELECT name FROM sqlite_master WHERE name='governance_directories'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE name='ai_settings'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE name='project_skills'").fetchone()
         assert db.execute("SELECT name FROM sqlite_master WHERE name='ai_models'").fetchone()

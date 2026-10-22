@@ -26,11 +26,13 @@ from starlette.middleware.sessions import SessionMiddleware
 from openpyxl import Workbook
 
 from .db import (Base, AiQueueState, AiSettings, AiModel, AiTool, AiJob, AnalysisRun, Case, CaseComment, CaseDraft, CaseSuggestion, CodexMessage, CodexSession, ConversionRecord, ConversionSettings, ExecutionRun, ImportBatch,
+                 GovernanceChangeLog, GovernanceDirectory, GovernanceDuplicateGroup, GovernanceDuplicateMember, GovernanceExportJob, GovernanceMetricSnapshot, GovernanceValidationRun,
                  Membership, MembershipEvent, Project, ReviewEvent, RunCase, SessionLocal,
                  ProjectSkill, SmokeItem, SmokeSuite, SourceDocument, SuggestionJob, TaxonomyVersion, User,
-                 ExecutionEvent, database_kind, engine, utcnow)
+                 ExecutionEvent, WorkItem, database_kind, engine, utcnow)
 from .skill_runner import SkillRunnerError, discover_skills, skill_root
 from .importers import ImportErrorDetail, parse
+from .governance_core import source_case_timestamps
 from .observability import (FailureWindow, configure_logging, deployment_release, env_float, env_int,
                             monotonic, new_request_id, redact_sensitive_text, reset_request_id, set_request_id)
 from .storage import ensure_private_directory, open_private_regular_file
@@ -346,7 +348,7 @@ def initialize():
     from . import ai_engine
 
     with SessionLocal() as db:
-        expected_head = os.getenv("AI_STUDIO_MIGRATION_HEAD", "20261028_codex_sessions")
+        expected_head = os.getenv("AI_STUDIO_MIGRATION_HEAD", "20261032_case_timestamps")
         try:
             migration_head = db.execute(text("SELECT version_num FROM alembic_version")).scalar()
         except SQLAlchemyError as exc:
@@ -1025,6 +1027,10 @@ def _delete_project_data(project_id: int, db: Session) -> None:
     if active_ai or active_suggestions:
         raise HTTPException(409, "项目存在运行中的任务，请稍后再删除")
 
+    # Keep personal board entries while detaching them from a deleted project.
+    # The board is user-owned and should not lose unrelated task history.
+    db.execute(update(WorkItem).where(WorkItem.project_id == project_id).values(project_id=None, updated_at=utcnow()))
+
     # Remove uploaded source documents and generated conversion files before
     # deleting their history rows. Paths are derived from durable IDs and are
     # kept under their respective private storage roots.
@@ -1153,6 +1159,26 @@ class ProjectMemberCreate(BaseModel):
     role: Literal["manager", "reviewer", "reader"] = "reviewer"
 
 
+class WorkItemCreate(BaseModel):
+    kind: str = Field(default="other", min_length=1, max_length=32)
+    title: str = Field(min_length=1, max_length=240)
+    description: str = Field(default="", max_length=10000)
+    status: str = Field(default="todo", min_length=1, max_length=24)
+    start_at: str | None = Field(default=None, max_length=40)
+    due_at: str | None = Field(default=None, max_length=40)
+    project_id: int | None = None
+
+
+class WorkItemUpdate(BaseModel):
+    kind: str | None = Field(default=None, min_length=1, max_length=32)
+    title: str | None = Field(default=None, min_length=1, max_length=240)
+    description: str | None = Field(default=None, max_length=10000)
+    status: str | None = Field(default=None, min_length=1, max_length=24)
+    start_at: str | None = Field(default=None, max_length=40)
+    due_at: str | None = Field(default=None, max_length=40)
+    project_id: int | None = None
+
+
 class SkillUpdate(BaseModel):
     enabled: bool
 
@@ -1236,6 +1262,135 @@ def logout(request: Request):
 @app.get("/api/v1/auth/me")
 def me(user: User = Depends(current_user)):
     return {"id": user.id, "username": user.username, "role": user.role}
+
+
+def _work_item_payload(item: WorkItem, project_name: str | None = None) -> dict:
+    return {
+        "id": item.id, "user_id": item.user_id, "project_id": item.project_id,
+        "kind": item.kind, "title": item.title, "description": item.description,
+        "status": item.status, "start_at": item.start_at, "due_at": item.due_at, "completed_at": item.completed_at,
+        "created_at": item.created_at, "updated_at": item.updated_at,
+        "project_name": project_name,
+    }
+
+
+def _work_item_projects(user: User, db: Session):
+    """Return the project scope visible to a personal board query."""
+    query = select(Project.id, Project.name)
+    if user.role != "admin":
+        query = query.join(Membership, Membership.project_id == Project.id).where(Membership.user_id == user.id)
+    return {project_id: name for project_id, name in db.execute(query).all()}
+
+
+@app.get("/api/v1/workboard")
+def get_workboard(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    projects = _work_item_projects(user, db)
+    query = select(WorkItem).where(WorkItem.user_id == user.id)
+    rows = db.scalars(query.order_by(WorkItem.updated_at.desc(), WorkItem.id.desc())).all()
+    # Items linked to a project the user no longer belongs to are not exposed.
+    rows = [item for item in rows if item.project_id is None or item.project_id in projects]
+    items = [_work_item_payload(item, projects.get(item.project_id)) for item in rows]
+    now = datetime.now(timezone.utc)
+    overdue = 0
+    for item in rows:
+        if item.status not in ("done", "completed") and item.due_at:
+            try:
+                due = datetime.fromisoformat(item.due_at.replace("Z", "+00:00"))
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=timezone.utc)
+                overdue += due < now
+            except ValueError:
+                pass
+    by_kind: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    for item in rows:
+        by_kind[item.kind] = by_kind.get(item.kind, 0) + 1
+        by_status[item.status] = by_status.get(item.status, 0) + 1
+    # Published drafts and imported case rows are the durable output signals
+    # already present in the project workflow. Keep them scoped to projects
+    # visible to this user while the board entries remain personally owned.
+    project_ids = tuple(projects)
+    published_drafts = db.scalar(select(func.count()).select_from(CaseDraft).where(
+        CaseDraft.status == "published", CaseDraft.project_id.in_(project_ids))) if project_ids else 0
+    imported_case_rows = db.scalars(select(ImportBatch.rows).where(
+        ImportBatch.status == "done", ImportBatch.project_id.in_(project_ids))).all() if project_ids else []
+    output_count = int(published_drafts or 0) + sum(len(rows_value or []) for rows_value in imported_case_rows)
+    return {"summary": {"total": len(rows), "active": sum(item.status not in ("done", "completed") for item in rows),
+                         "completed": sum(item.status in ("done", "completed") for item in rows),
+                         "overdue": overdue, "followed_requirements": by_kind.get("requirement", 0),
+                         "tested_requirements": by_kind.get("tested_requirement", 0),
+                         "test_plans": by_kind.get("test_plan", 0), "test_case_outputs": output_count,
+                         "project_count": len(projects), "by_kind": by_kind, "by_status": by_status}, "items": items}
+
+
+@app.post("/api/v1/workboard", dependencies=[Depends(csrf)])
+def create_work_item(payload: WorkItemCreate, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(422, "任务标题不能为空")
+    project_name = None
+    if payload.project_id is not None:
+        project = project_access(payload.project_id, user, db)
+        project_name = project.name
+    kind = payload.kind.strip()
+    status = payload.status.strip()
+    if not kind or not status:
+        raise HTTPException(422, "事项类型和状态不能为空")
+    if kind not in {"requirement", "tested_requirement", "task", "test_plan", "other"}:
+        raise HTTPException(422, "不支持的工作项类型")
+    if status not in {"todo", "in_progress", "done"}:
+        raise HTTPException(422, "不支持的工作项状态")
+    completed = status == "done"
+    timestamp = utcnow()
+    item = WorkItem(user_id=user.id, project_id=payload.project_id, kind=kind,
+                    title=title, description=payload.description, status=status,
+                    start_at=payload.start_at, due_at=payload.due_at, completed_at=timestamp if completed else None,
+                    created_at=timestamp, updated_at=timestamp)
+    db.add(item); db.commit(); db.refresh(item)
+    return _work_item_payload(item, project_name)
+
+
+@app.patch("/api/v1/workboard/{item_id}", dependencies=[Depends(csrf)])
+def update_work_item(item_id: int, payload: WorkItemUpdate, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    item = db.scalar(select(WorkItem).where(WorkItem.id == item_id, WorkItem.user_id == user.id))
+    if not item:
+        raise HTTPException(404, "工作项不存在")
+    values = payload.model_dump(exclude_unset=True)
+    if "title" in values:
+        values["title"] = values["title"].strip()
+        if not values["title"]:
+            raise HTTPException(422, "任务标题不能为空")
+    for key in ("kind", "status"):
+        if key in values and isinstance(values[key], str):
+            values[key] = values[key].strip()
+            if not values[key]:
+                raise HTTPException(422, "字段不能为空")
+            if key == "kind" and values[key] not in {"requirement", "tested_requirement", "task", "test_plan", "other"}:
+                raise HTTPException(422, "不支持的工作项类型")
+            if key == "status" and values[key] not in {"todo", "in_progress", "done"}:
+                raise HTTPException(422, "不支持的工作项状态")
+    project_name = None
+    if "project_id" in values:
+        if values["project_id"] is not None:
+            project_name = project_access(values["project_id"], user, db).name
+    elif item.project_id is not None:
+        project_name = project_access(item.project_id, user, db).name
+    for key, value in values.items():
+        setattr(item, key, value)
+    if "status" in values:
+        item.completed_at = utcnow() if values["status"] == "done" else None
+    item.updated_at = utcnow()
+    db.commit(); db.refresh(item)
+    return _work_item_payload(item, project_name)
+
+
+@app.delete("/api/v1/workboard/{item_id}", dependencies=[Depends(csrf)])
+def delete_work_item(item_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    item = db.scalar(select(WorkItem).where(WorkItem.id == item_id, WorkItem.user_id == user.id))
+    if not item:
+        raise HTTPException(404, "工作项不存在")
+    db.delete(item); db.commit()
+    return {"ok": True, "id": item_id}
 
 
 @app.get("/api/v1/projects")
@@ -1628,9 +1783,12 @@ def confirm(project_id: int, batch_id: int, user: User = Depends(current_user), 
     def field(row, name):
         return row[headers.index(name)] or "" if name in headers else ""
     for row in batch.rows:
+        source = dict(zip(headers, row))
+        created_at, updated_at = source_case_timestamps(source, batch.created_at)
         db.add(Case(project_id=project_id, import_id=batch.id, original_id=field(row, "测试用例ID"),
                     title=field(row, "用例名称"), directory=field(row, "用例目录"),
-                    level=field(row, "用例等级"), smoke=field(row, "是否冒烟用例"), original=row))
+                    level=field(row, "用例等级"), smoke=field(row, "是否冒烟用例"), original=row,
+                    created_at=created_at, updated_at=updated_at))
     batch.status = "done"
     db.commit()
     logger.info("import.confirmed", extra={
@@ -1647,6 +1805,30 @@ def imports(project_id: int, user: User = Depends(current_user), db: Session = D
             for item in db.scalars(select(ImportBatch).where(ImportBatch.project_id == project_id).order_by(ImportBatch.id.desc()))]
 
 
+@app.delete("/api/v1/projects/{project_id}/imports/{batch_id}", dependencies=[Depends(csrf)])
+def delete_import(project_id: int, batch_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Delete an import record together with the cases it created."""
+    writable(user, project_id, db)
+    batch = db.get(ImportBatch, batch_id)
+    if not batch or batch.project_id != project_id:
+        raise HTTPException(404, "导入记录不存在")
+    case_ids = db.scalars(select(Case.id).where(Case.project_id == project_id, Case.import_id == batch_id)).all()
+    # Governance snapshots point at the batch and must not survive its removal.
+    group_ids = db.scalars(select(GovernanceDuplicateGroup.id).where(
+        GovernanceDuplicateGroup.project_id == project_id, GovernanceDuplicateGroup.batch_id == batch_id)).all()
+    if group_ids:
+        db.execute(delete(GovernanceDuplicateMember).where(GovernanceDuplicateMember.group_id.in_(group_ids)))
+        db.execute(delete(GovernanceDuplicateGroup).where(GovernanceDuplicateGroup.id.in_(group_ids)))
+    db.execute(delete(GovernanceMetricSnapshot).where(
+        GovernanceMetricSnapshot.project_id == project_id, GovernanceMetricSnapshot.batch_id == batch_id))
+    delete_case_rows(case_ids, db)
+    # A later governance snapshot may refer to this batch as its parent.
+    db.execute(update(ImportBatch).where(ImportBatch.parent_batch_id == batch_id).values(parent_batch_id=None))
+    db.delete(batch)
+    db.commit()
+    return {"id": batch_id, "deleted": 1, "cases_deleted": len(case_ids)}
+
+
 def case_dict(item: Case, assignee: str | None = None, pending_suggestion_count: int = 0):
     return {"id": item.id, "original_id": item.original_id, "title": item.title, "directory": item.directory,
             "level": item.level, "smoke": item.smoke, "original": item.original, "final_level": item.final_level,
@@ -1655,7 +1837,10 @@ def case_dict(item: Case, assignee: str | None = None, pending_suggestion_count:
             "assignee_id": item.assignee_id, "assignee": assignee,
             "final_categories": item.final_categories or {},
             "final_taxonomy_version_id": item.final_taxonomy_version_id,
-            "pending_suggestion_count": pending_suggestion_count}
+            "governance_status": item.governance_status,
+            "merged_into": item.merged_into,
+            "pending_suggestion_count": pending_suggestion_count,
+            "created_at": item.created_at, "updated_at": item.updated_at}
 
 
 def case_assignee(item: Case, db: Session) -> str | None:
@@ -1683,7 +1868,8 @@ def apply_review(project_id: int, item_id: int, version: int, level: str, smoke:
     changed_at = utcnow()
     result = db.execute(update(Case).where(Case.id == item_id, Case.project_id == project_id, Case.version == version)
                         .values(final_level=level, final_smoke=smoke, review_status="reviewed",
-                                version=Case.version + 1, reviewer=user.username, reviewed_at=changed_at)
+                                version=Case.version + 1, reviewer=user.username, reviewed_at=changed_at,
+                                updated_at=changed_at)
                         .execution_options(synchronize_session=False))
     if result.rowcount != 1:
         db.rollback()
@@ -1736,6 +1922,7 @@ def delete_case_rows(case_ids: list[int], db: Session) -> None:
     db.execute(delete(CaseComment).where(CaseComment.case_id.in_(case_ids)))
     db.execute(delete(ReviewEvent).where(ReviewEvent.case_id.in_(case_ids)))
     db.execute(delete(CaseDraft).where(CaseDraft.case_id.in_(case_ids)))
+    db.execute(delete(GovernanceDuplicateMember).where(GovernanceDuplicateMember.case_id.in_(case_ids)))
     db.execute(delete(Case).where(Case.id.in_(case_ids)))
 
 
@@ -1759,6 +1946,19 @@ def batch_delete_cases(project_id: int, payload: BatchDelete, user: User = Depen
     delete_case_rows(deletable, db)
     db.commit()
     return {"results": results, "deleted": len(deletable)}
+
+
+@app.delete("/api/v1/projects/{project_id}/cases/all", dependencies=[Depends(csrf)])
+@app.delete("/api/v1/projects/{project_id}/cases/delete-all", dependencies=[Depends(csrf)])
+def delete_all_cases(project_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Delete every case in the current project and its dependent review data."""
+    writable(user, project_id, db)
+    case_ids = db.scalars(select(Case.id).where(Case.project_id == project_id)).all()
+    db.execute(delete(GovernanceMetricSnapshot).where(GovernanceMetricSnapshot.project_id == project_id))
+    db.execute(delete(GovernanceDuplicateGroup).where(GovernanceDuplicateGroup.project_id == project_id))
+    delete_case_rows(case_ids, db)
+    db.commit()
+    return {"deleted": len(case_ids)}
 
 
 @app.delete("/api/v1/projects/{project_id}/cases/{case_id}", dependencies=[Depends(csrf)])
@@ -1824,7 +2024,7 @@ def assign_case(project_id: int, case_id: int, payload: Assignment,
         return case_dict(item, case_assignee(item, db))
     before_id = item.assignee_id
     changed = db.execute(update(Case).where(Case.id == case_id, Case.project_id == project_id, Case.version == payload.version)
-                         .values(assignee_id=payload.assignee_id, version=Case.version + 1)
+                         .values(assignee_id=payload.assignee_id, version=Case.version + 1, updated_at=utcnow())
                          .execution_options(synchronize_session=False))
     if changed.rowcount != 1:
         db.rollback()
@@ -1901,7 +2101,7 @@ def export(project_id: int, user: User = Depends(current_user), db: Session = De
             if name not in headers:
                 headers.append(name)
     appended = ["最终等级", "最终冒烟", "审核状态", "审核人", "审核时间", "负责人",
-                "建议来源", "建议等级", "建议冒烟", "建议依据", "最终业务模块", "最终业务场景", "最终测试维度", "最终端类型"]
+                "建议来源", "建议等级", "建议冒烟", "建议依据", "最终业务模块", "最终业务场景", "最终测试维度", "最终端类型", "创建时间", "最后修改时间"]
     sheet.append(headers + appended)
     def safe(value):
         if value is None:
@@ -1928,7 +2128,8 @@ def export(project_id: int, user: User = Depends(current_user), db: Session = De
             "已审核" if item.review_status == "reviewed" else "待审核", item.reviewer, item.reviewed_at, case_assignee(item, db),
             proposal.source if proposal else None, proposal.level if proposal else None, proposal.smoke if proposal else None,
             safe(proposal.rationale) if proposal else None,
-            *(safe(category_label(key)) for key in ("business_module", "business_scenario", "test_dimension", "endpoint_type"))])
+            *(safe(category_label(key)) for key in ("business_module", "business_scenario", "test_dimension", "endpoint_type")),
+            item.created_at, item.updated_at])
     stats = book.create_sheet("统计")
     stats.append(["指标", "数量"])
     stats.append(["用例总数", len(items)])
@@ -1947,9 +2148,11 @@ from .conversion_routes import build_router  # noqa: E402
 from .ai_routes import build_router as build_ai_router  # noqa: E402
 from .suggestion_routes import build_router as build_suggestion_router  # noqa: E402
 from .smoke_routes import build_router as build_smoke_router  # noqa: E402
+from .governance_routes import build_router as build_governance_router  # noqa: E402
 
 app.include_router(build_router(get_db, current_user, csrf, project_access, writable))
 app.include_router(build_ai_router(get_db, current_user, csrf, project_access, writable))
 app.include_router(build_suggestion_router(get_db, current_user, csrf, project_access, writable,
                                            project_manager, project_role, case_dict, case_assignee))
 app.include_router(build_smoke_router(get_db, current_user, csrf, project_access, writable))
+app.include_router(build_governance_router(get_db, current_user, csrf, project_access, writable, project_role))

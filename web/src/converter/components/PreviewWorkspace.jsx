@@ -1,7 +1,7 @@
 import { Columns2, Download, FileSearch, Search, Table2 } from "lucide-react";
-import { useDeferredValue, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useState } from "react";
 import DataTable from "./DataTable";
-import TreePreview from "./TreePreview";
+import MindMapCanvas from "./MindMapCanvas";
 
 const MODES = [
   ["converted", "转换后", Table2],
@@ -24,7 +24,7 @@ function filterTree(node, keyword) {
 }
 
 function PreviewSurface({ kind, headers, rows, tree, compact, keyword }) {
-  if (kind === "tree") return <TreePreview tree={tree} forceOpen={Boolean(keyword.trim())} />;
+  if (kind === "tree") return <MindMapCanvas tree={tree} />;
   return <DataTable headers={headers || []} rows={rows || []} compact={compact} />;
 }
 
@@ -45,6 +45,11 @@ export default function PreviewWorkspace({ preview, busy, stale, error, historyR
   const [mode, setMode] = useState("converted");
   const [keyword, setKeyword] = useState("");
   const deferredKeyword = useDeferredValue(keyword);
+
+  useEffect(() => {
+    setMode("converted");
+    setKeyword("");
+  }, [preview]);
 
   const sourceRows = useMemo(
     () => filterRows(preview?.source_rows || [], deferredKeyword),
@@ -83,6 +88,8 @@ export default function PreviewWorkspace({ preview, busy, stale, error, historyR
   const subtitle = historyRecord
     ? `历史记录 · ${formatHistoryDate(historyRecord.created_at)} · ${historyRecord.output_filename}`
     : `${preview.filename} · ${preview.sheet_name}`;
+  const targetLabel = preview.target_kind === "tree" ? "XMind 结构" : "转换后";
+  const sourceLabel = preview.source_kind === "tree" ? "XMind 源节点" : "转换前";
 
   return (
     <section className="preview-workspace">
@@ -91,6 +98,7 @@ export default function PreviewWorkspace({ preview, busy, stale, error, historyR
           <div className="preview-title-line">
             <h2>用例预览</h2>
             <span className="count-badge">{preview.row_count} 条</span>
+            {preview.target_kind === "tree" ? <span className="preview-kind-badge">XMind 结构预览</span> : null}
             {historyRecord ? <span className="history-badge">历史</span> : null}
             {stale ? <span className="stale-badge">配置已变更</span> : null}
           </div>
@@ -114,7 +122,7 @@ export default function PreviewWorkspace({ preview, busy, stale, error, historyR
               key={value}
             >
               <Icon size={15} />
-              {label}
+              {value === "converted" ? targetLabel : value === "original" ? sourceLabel : label}
             </button>
           ))}
         </div>

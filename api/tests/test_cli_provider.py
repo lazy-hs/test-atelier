@@ -33,6 +33,23 @@ def test_cli_provider_uses_argv_and_parses_jsonl(monkeypatch):
     assert calls["kwargs"]["shell"] is not True
 
 
+def test_cli_output_parses_array_schema(monkeypatch):
+    """Array schemas must match as a whole; the governance prompt relies on it."""
+    schema = {"type": "array", "items": {"type": "object", "required": ["case_id", "decision", "reason"],
+                                         "properties": {"case_id": {"type": "integer"}}}}
+    stdout = json.dumps([{"case_id": 1, "decision": "keep", "reason": "newer"}])
+    assert ai_engine._json_from_cli_output(stdout, schema) == [
+        {"case_id": 1, "decision": "keep", "reason": "newer"}]
+
+    wrapped = json.dumps({"type": "item.completed", "item": {"text": stdout}})
+    assert ai_engine._json_from_cli_output(wrapped, schema) == [
+        {"case_id": 1, "decision": "keep", "reason": "newer"}]
+
+    incomplete = json.dumps([{"case_id": 1, "decision": "keep"}])
+    with pytest.raises(ai_engine.StructuredOutputError):
+        ai_engine._json_from_cli_output(incomplete, schema)
+
+
 def test_cli_provider_rejects_shell_syntax():
     schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
     with pytest.raises(RuntimeError, match="单个可执行"):

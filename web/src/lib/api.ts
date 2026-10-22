@@ -1,5 +1,18 @@
 export type User = { id: number; username: string; role: 'admin' | 'reviewer' | 'reader' }
 export type Project = { id: number; name: string; role: 'admin' | 'manager' | 'reviewer' | 'reader'; created_at?: string; archived?: boolean; archived_at?: string | null }
+export type WorkItemKind = 'requirement' | 'tested_requirement' | 'task' | 'test_plan' | 'other'
+export type WorkItemStatus = 'todo' | 'in_progress' | 'done'
+export type WorkItem = {
+  id: number; user_id: number; project_id: number | null; project_name: string | null
+  kind: WorkItemKind; title: string; description: string; status: WorkItemStatus
+  start_at: string | null; due_at: string | null; completed_at: string | null; created_at: string; updated_at: string
+}
+export type WorkboardSummary = {
+  total: number; active: number; completed: number; overdue: number
+  followed_requirements: number; tested_requirements: number; test_plans: number
+  test_case_outputs: number; project_count: number
+}
+export type WorkboardResponse = { summary: WorkboardSummary; items: WorkItem[] }
 export type ProjectSkill = { skill_id: string; name: string; label: string; source_path: string; description: string; enabled: boolean; updated_at: string }
 export type AiConfig = {
   local_url: string; local_model: string; local_enabled?: boolean; remote_enabled: boolean; remote_url: string; remote_model: string
@@ -13,6 +26,14 @@ export type AiConfig = {
   /** Installed AI tools are kept separate from model connections. */
   tools?: { id: 'codex_cli' | 'claude_code' | string; name: string; enabled: boolean; command: string; model: string; detail?: string }[]
 }
+export function formatDateTime(value: string | null | undefined): string {
+  if (!value) return '未知'
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return value.replace('T', ' ').slice(0, 19)
+  const pad = (part: number) => String(part).padStart(2, '0')
+  return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`
+}
+
 export type Case = {
   id: number; original_id: string; title: string; directory: string; level: string; smoke: string
   original: (string | null)[]; final_level: string | null; final_smoke: string | null
@@ -20,7 +41,9 @@ export type Case = {
   assignee_id: number | null; assignee: string | null
   final_categories: Record<DimensionKey, string | null> | Record<string, never>
   final_taxonomy_version_id: number | null
-  pending_suggestion_count: number
+  governance_status: 'active' | 'retired' | string
+  merged_into: number | null
+  pending_suggestion_count: number; created_at: string; updated_at: string
 }
 export type CaseDetail = Case & { headers: string[] }
 export type CaseActivity = {
@@ -94,7 +117,11 @@ export async function rawApi(path: string, init: RequestInit = {}): Promise<Resp
   const response = await fetch(`/api/v1${path}`, { ...init, headers, credentials: 'same-origin' })
   if (!response.ok) {
     const data = await response.json().catch(() => ({}))
-    const message = typeof data.detail === 'string' ? data.detail : `请求失败 (${response.status})`
+    const message = typeof data.detail === 'string'
+      ? data.detail
+      : typeof data.detail?.message === 'string'
+        ? data.detail.message
+        : `请求失败 (${response.status})`
     const requestId = response.headers.get('x-request-id')
     throw new Error(requestId ? `${message}（请求编号 ${requestId}）` : message)
   }

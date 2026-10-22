@@ -137,7 +137,7 @@ Web 镜像直接以前台 Nginx 进程启动，避免官方 shell entrypoint 的
 
 ## 用例转换和历史
 
-“用例转换”保留原转换工程的四种模式：Excel/CSV → Excel、XMind → Excel（7 列或 15 列）、Excel → XMind。页面支持配置、预览、表格/树形/并排查看、全文搜索、导出以及项目级历史。
+“用例转换”保留原转换工程的四种模式：Excel/CSV → Excel、XMind → Excel（7 列或 15 列）、Excel → XMind。页面支持配置、预览、表格/XMind 结构画布/并排查看、全文搜索、导出以及项目级历史；Excel → XMind 会在导出前展示可缩放、平移的思维导图预览。
 
 转换结果先写临时文件，再原子替换到 `AI_STUDIO_DATA_DIR`；数据库只保存预览和元数据。历史按项目保留 30、60 或 180 天，清理后文件不可恢复。
 

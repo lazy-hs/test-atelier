@@ -1,12 +1,14 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type CSSProperties, type FormEvent } from 'react'
 import { AnimatePresence, motion, MotionConfig } from 'motion/react'
-import { Archive, BookOpen, Download, FileSpreadsheet, FileText, FolderCog, FolderPlus, Home, Layers3, LogOut, Plus, RefreshCw, Settings2, Terminal, Trash2, Upload, UsersRound, WandSparkles, X } from 'lucide-react'
+import { Archive, BookOpen, BriefcaseBusiness, Download, FileSpreadsheet, FileText, FolderCog, FolderPlus, Home, Layers3, LogOut, Plus, RefreshCw, Settings2, ShieldCheck, Terminal, Trash2, Upload, UsersRound, WandSparkles, X } from 'lucide-react'
 import { BrowserRouter, useLocation, useNavigate } from 'react-router'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import type { Overview } from '@/components/HomePage'
+import { WorkboardPage } from '@/components/WorkboardPage'
+import { GovernancePage } from '@/components/GovernancePage'
 import { api, login, refreshCsrf, upload, type BatchReviewResult, type Case, type CaseDetail, type ImportRecord, type Preview, type Project, type SuggestionJob, type User } from '@/lib/api'
 import { ProjectManagerDialog } from '@/components/ProjectManagerDialog'
 import './App.css'
@@ -73,7 +75,7 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
 function Workspace({ user, onLogout }: { user: User; onLogout: () => Promise<boolean> }) {
   const location = useLocation()
   const navigate = useNavigate()
-  const route = location.pathname.match(/^\/projects\/(\d+)\/(home|cases|imports|conversion|requirements|authoring|taxonomy|team|skills|model-settings|codex)$/)
+  const route = location.pathname.match(/^\/projects\/(\d+)\/(home|cases|imports|governance|conversion|requirements|authoring|taxonomy|team|skills|model-settings|codex|workboard)$/)
   const view = route?.[2] ?? 'home'
   const filterParams = new URLSearchParams(location.search)
   const assigneeFilter = ['all', 'me', 'unassigned'].includes(filterParams.get('assignee') ?? '') ? filterParams.get('assignee')! : 'all'
@@ -93,6 +95,8 @@ function Workspace({ user, onLogout }: { user: User; onLogout: () => Promise<boo
   const [checked, setChecked] = useState<number[]>([])
   const [batchOpen, setBatchOpen] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<number[] | null>(null)
+  const [deleteAllTarget, setDeleteAllTarget] = useState(false)
+  const [importDeleteTarget, setImportDeleteTarget] = useState<ImportRecord | null>(null)
   const [suggestionJob, setSuggestionJob] = useState<SuggestionJob | null>(null)
   const [suggestionBusy, setSuggestionBusy] = useState(false)
   const [suggestionRevision, setSuggestionRevision] = useState(0)
@@ -179,18 +183,32 @@ function Workspace({ user, onLogout }: { user: User; onLogout: () => Promise<boo
     return () => { active = false }
   }, [projectId, selected])
   function selectCase(id: number | null) { setDetail(null); setSelected(id) }
-  function requestDelete(ids: number[]) { if (ids.length > 0) setDeleteTarget(ids) }
-  async function confirmDelete() {
-    if (!projectId || !deleteTarget?.length) return
+  function requestDelete(ids: number[]) { if (ids.length > 0) { setDeleteAllTarget(false); setDeleteTarget(ids) } }
+  function requestDeleteAll() { setDeleteTarget(null); setDeleteAllTarget(true) }
+  async function confirmImportDelete() {
+    if (!projectId || !importDeleteTarget) return
     setWorking(true); setError('')
     try {
-      const result = deleteTarget.length === 1
-        ? await api<{ deleted: number }>(`/projects/${projectId}/cases/${deleteTarget[0]}`, { method: 'DELETE' })
-        : await api<{ deleted: number }>(`/projects/${projectId}/cases/batch-delete`, { method: 'DELETE', body: JSON.stringify({ case_ids: deleteTarget }) })
+      const result = await api<{ deleted: number; cases_deleted: number }>(`/projects/${projectId}/imports/${importDeleteTarget.id}`, { method: 'DELETE' })
+      setImportDeleteTarget(null)
+      setNotice(`已删除导入记录，移除 ${result.cases_deleted} 条用例`)
+      await reload()
+    } catch (cause) { setError((cause as Error).message) } finally { setWorking(false) }
+  }
+  async function confirmDelete() {
+    if (!projectId || (!deleteTarget?.length && !deleteAllTarget)) return
+    setWorking(true); setError('')
+    try {
+      const result = deleteAllTarget
+        ? await api<{ deleted: number }>(`/projects/${projectId}/cases/delete-all`, { method: 'DELETE' })
+        : deleteTarget!.length === 1
+          ? await api<{ deleted: number }>(`/projects/${projectId}/cases/${deleteTarget![0]}`, { method: 'DELETE' })
+          : await api<{ deleted: number }>(`/projects/${projectId}/cases/batch-delete`, { method: 'DELETE', body: JSON.stringify({ case_ids: deleteTarget }) })
       const count = result.deleted
-      if (selected !== null && deleteTarget.includes(selected)) selectCase(null)
-      setChecked(previous => previous.filter(id => !deleteTarget.includes(id)))
-      setDeleteTarget(null); setNotice(`已删除 ${count} 条用例`); await reload()
+      if (deleteAllTarget || (selected !== null && deleteTarget?.includes(selected))) selectCase(null)
+      if (deleteAllTarget) setChecked([])
+      else setChecked(previous => previous.filter(id => !deleteTarget!.includes(id)))
+      setDeleteTarget(null); setDeleteAllTarget(false); setNotice(`已删除 ${count} 条用例`); await reload()
     } catch (cause) { setError((cause as Error).message) } finally { setWorking(false) }
   }
   async function createProject(event: FormEvent) {
@@ -293,6 +311,7 @@ function Workspace({ user, onLogout }: { user: User; onLogout: () => Promise<boo
     <aside className="sidebar"><div className="sidebar-brand"><span className="brand-symbol">T</span><span>Test Atelier</span></div>
       <div className="sidebar-section">工作区</div>
       <button className={`nav-item ${view === 'home' ? 'active' : ''}`} onClick={() => go('home')}>{view === 'home' && <motion.span layoutId="active-nav" className="nav-active-bg" />}<Home size={17} />首页</button>
+      <button className={`nav-item ${view === 'workboard' ? 'active' : ''}`} onClick={() => go('workboard')}>{view === 'workboard' && <motion.span layoutId="active-nav" className="nav-active-bg" />}<BriefcaseBusiness size={17} />我的看板</button>
       <div className="sidebar-section nav-group">AI 工具</div>
       <button className={`nav-item ${view === 'requirements' ? 'active' : ''}`} onClick={() => go('requirements')}>{view === 'requirements' && <motion.span layoutId="active-nav" className="nav-active-bg" />}<FileText size={17} />需求分析</button>
       <button className={`nav-item ${view === 'authoring' ? 'active' : ''}`} onClick={() => go('authoring')}>{view === 'authoring' && <motion.span layoutId="active-nav" className="nav-active-bg" />}<WandSparkles size={17} />用例编写</button>
@@ -301,6 +320,7 @@ function Workspace({ user, onLogout }: { user: User; onLogout: () => Promise<boo
       <button className={`nav-item ${view === 'conversion' ? 'active' : ''}`} onClick={() => go('conversion')}>{view === 'conversion' && <motion.span layoutId="active-nav" className="nav-active-bg" />}<RefreshCw size={17} />用例转换</button>
       <div className="sidebar-section nav-group">用例管理</div>
       <button className={`nav-item ${view === 'cases' ? 'active' : ''}`} onClick={() => go('cases')}>{view === 'cases' && <motion.span layoutId="active-nav" className="nav-active-bg" />}<FileSpreadsheet size={17} />用例库</button>
+      <button className={`nav-item ${view === 'governance' ? 'active' : ''}`} onClick={() => go('governance')}>{view === 'governance' && <motion.span layoutId="active-nav" className="nav-active-bg" />}<ShieldCheck size={17} />用例治理</button>
       <button className={`nav-item ${view === 'imports' ? 'active' : ''}`} onClick={() => go('imports')}>{view === 'imports' && <motion.span layoutId="active-nav" className="nav-active-bg" />}<Archive size={17} />导入记录</button>
       <button className={`nav-item ${view === 'taxonomy' ? 'active' : ''}`} onClick={() => go('taxonomy')}>{view === 'taxonomy' && <motion.span layoutId="active-nav" className="nav-active-bg" />}<Layers3 size={17} />分类规则</button>
       <div className="sidebar-section nav-group">团队协作</div>
@@ -312,30 +332,37 @@ function Workspace({ user, onLogout }: { user: User; onLogout: () => Promise<boo
       <header className="topbar"><div className="project-selector"><span>当前项目</span>{projects.length ? <Select value={String(projectId ?? '')} onValueChange={value => { const project = projects.find(item => item.id === Number(value)); if (project) selectProject(project) }}><SelectTrigger aria-label="选择项目"><SelectValue /></SelectTrigger><SelectContent><SelectGroup>{projects.map(project => <SelectItem key={project.id} value={String(project.id)}>{project.name}</SelectItem>)}</SelectGroup></SelectContent></Select> : <strong>暂无项目</strong>}<Button variant="ghost" size="icon-sm" aria-label="管理项目" title="管理项目" onClick={() => setProjectManageOpen(true)}><FolderCog /></Button><Button variant="ghost" size="icon-sm" aria-label="新建项目" title="新建项目" onClick={() => setProjectOpen(true)}><FolderPlus /></Button></div>
         <div className="top-actions">{projectId && (view === 'cases' || view === 'imports') && <><Button variant="outline" onClick={() => window.location.assign(`/api/v1/projects/${projectId}/export`)}><Download data-icon="inline-start" />导出 Excel</Button>{activeRole !== 'reader' && <Button onClick={() => { setPreview(null); setImportOpen(true) }}><Upload data-icon="inline-start" />导入用例</Button>}</>}</div></header>
       <div className={`workspace ${view === 'conversion' ? 'converter-workspace' : ''}`}><AnimatePresence mode="wait"><motion.div key={view} className="workspace-screen" initial={{ opacity: 0, y: 7 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -7 }} transition={{ duration: .2 }}>
-        {view !== 'conversion' && <div className="workspace-title"><h1>{({ home: '工作台', cases: '用例审核', imports: '导入记录', requirements: '需求分析', authoring: '用例编写', skills: '项目技能', codex: 'Codex 工作台', taxonomy: '分类规则', team: '项目成员', 'model-settings': '模型配置' } as Record<string, string>)[view]}</h1><p>{({ home: '项目概览与最近工作', cases: '原值与审核结论独立保存', imports: '追踪文件预览与入库状态', requirements: '从需求材料提取规则与待确认项', authoring: '从分析结论编写可执行用例', skills: '管理当前项目启用的 qa-doc-skills', codex: '嵌入 Codex CLI 在独立会话中执行任务', taxonomy: '项目分类版本与正式选项', team: '成员与项目权限', 'model-settings': '配置本地与远程 AI 服务' } as Record<string, string>)[view]}</p></div>}
+        {view !== 'conversion' && <div className="workspace-title"><h1>{({ home: '工作台', workboard: '我的看板', cases: '用例审核', imports: '导入记录', governance: '用例治理', requirements: '需求分析', authoring: '用例编写', skills: '项目技能', codex: 'Codex 工作台', taxonomy: '分类规则', team: '项目成员', 'model-settings': '模型配置' } as Record<string, string>)[view]}</h1><p>{({ home: '项目概览与最近工作', workboard: '跟进需求 任务与测试产出', cases: '原值与审核结论独立保存', imports: '追踪文件预览与入库状态', governance: '导入体检 重复治理与入库质量门', requirements: '从需求材料提取规则与待确认项', authoring: '从分析结论编写可执行用例', skills: '管理当前项目启用的 qa-doc-skills', codex: '嵌入 Codex CLI 在独立会话中执行任务', taxonomy: '项目分类版本与正式选项', team: '成员与项目权限', 'model-settings': '配置本地与远程 AI 服务' } as Record<string, string>)[view]}</p></div>}
         {error && <div role="alert" className="feedback error"><span>{error}</span><button onClick={() => setError('')} aria-label="关闭错误"><X size={16} /></button></div>}
         {notice && <div role="status" className="feedback success"><span>{notice}</span><button onClick={() => setNotice('')} aria-label="关闭提示"><X size={16} /></button></div>}
         {view === 'cases' && suggestionJob?.project_id === projectId && <div className={`suggestion-job-banner ${['failed', 'partial'].includes(suggestionJob.status) ? 'is-error' : ''}`} role="status"><span>{suggestionJob.status === 'failed' ? 'AI 建议失败' : suggestionJob.status === 'partial' ? 'AI 建议部分失败' : `AI 建议 ${suggestionJob.completed}/${suggestionJob.total}`} {suggestionJob.errors.slice(0, 2).map(item => ` · ${item.case_id === null ? '任务' : `用例 ${item.case_id}`}: ${item.message}`)}</span>{['failed', 'partial'].includes(suggestionJob.status) && <Button variant="outline" size="sm" disabled={suggestionBusy} onClick={() => void retrySuggestionJob()}><RefreshCw data-icon="inline-start" />重试</Button>}<Button variant="ghost" size="icon-sm" aria-label="关闭建议任务提示" onClick={() => setSuggestionJob(null)}><X /></Button></div>}
-        {!projectId ? <div className="empty-workspace"><FileSpreadsheet size={30} /><h2>还没有项目</h2><p>创建项目后即可开始</p><Button onClick={() => setProjectOpen(true)}><Plus data-icon="inline-start" />新建项目</Button></div> : <Suspense fallback={<div className="boot-state" role="status">正在打开工作区模块…</div>}>{view === 'home' ? <HomePage overview={overview?.project.id === projectId ? overview : null} readonly={activeRole === 'reader'} onNavigate={go} onMyReviews={() => { setChecked([]); setPage(1); navigate(`/projects/${projectId}/cases?assignee=me&status=pending`) }} onPendingSuggestions={() => { setChecked([]); setPage(1); navigate(`/projects/${projectId}/cases?suggestion=pending`) }} onImport={() => { setPreview(null); setImportOpen(true) }} /> : view === 'conversion' ? <Suspense fallback={<div className="boot-state" role="status">正在打开用例转换…</div>}><ConverterHost key={projectId} projectId={projectId} readonly={activeRole === 'reader'} /></Suspense> : view === 'requirements' ? <RequirementsPage key={projectId} projectId={projectId} readonly={activeRole === 'reader'} onOpenAuthoring={() => go('authoring')} /> : view === 'authoring' ? <AuthoringPage key={projectId} projectId={projectId} readonly={activeRole === 'reader'} onOpenCases={() => go('cases')} /> : view === 'skills' ? <SkillsPage key={projectId} projectId={projectId} readonly={activeRole === 'reader'} /> : view === 'codex' ? <CodexPage key={projectId} projectId={projectId} readonly={activeRole === 'reader'} /> : view === 'taxonomy' ? <TaxonomyPage key={projectId} projectId={projectId} role={activeRole} /> : view === 'team' ? <TeamPage key={projectId} projectId={projectId} role={activeRole} userId={user.id} /> : view === 'model-settings' ? <ModelSettingsPage key={projectId} projectId={projectId} /> : view === 'cases' ? <div className={`work-layout ${detail ? 'has-detail' : ''}`}>
+        {!projectId ? <div className="empty-workspace"><FileSpreadsheet size={30} /><h2>还没有项目</h2><p>创建项目后即可开始</p><Button onClick={() => setProjectOpen(true)}><Plus data-icon="inline-start" />新建项目</Button></div> : <Suspense fallback={<div className="boot-state" role="status">正在打开工作区模块…</div>}>{view === 'home' ? <HomePage overview={overview?.project.id === projectId ? overview : null} readonly={activeRole === 'reader'} onNavigate={go} onMyReviews={() => { setChecked([]); setPage(1); navigate(`/projects/${projectId}/cases?assignee=me&status=pending`) }} onPendingSuggestions={() => { setChecked([]); setPage(1); navigate(`/projects/${projectId}/cases?suggestion=pending`) }} onImport={() => { setPreview(null); setImportOpen(true) }} /> : view === 'workboard' ? <WorkboardPage projects={projects} /> : view === 'governance' ? <GovernancePage key={projectId} projectId={projectId} readonly={activeRole === 'reader'} role={activeRole} /> : view === 'conversion' ? <Suspense fallback={<div className="boot-state" role="status">正在打开用例转换…</div>}><ConverterHost key={projectId} projectId={projectId} readonly={activeRole === 'reader'} /></Suspense> : view === 'requirements' ? <RequirementsPage key={projectId} projectId={projectId} readonly={activeRole === 'reader'} onOpenAuthoring={() => go('authoring')} /> : view === 'authoring' ? <AuthoringPage key={projectId} projectId={projectId} readonly={activeRole === 'reader'} onOpenCases={() => go('cases')} /> : view === 'skills' ? <SkillsPage key={projectId} projectId={projectId} readonly={activeRole === 'reader'} /> : view === 'codex' ? <CodexPage key={projectId} projectId={projectId} readonly={activeRole === 'reader'} /> : view === 'taxonomy' ? <TaxonomyPage key={projectId} projectId={projectId} role={activeRole} /> : view === 'team' ? <TeamPage key={projectId} projectId={projectId} role={activeRole} userId={user.id} /> : view === 'model-settings' ? <ModelSettingsPage key={projectId} projectId={projectId} /> : view === 'cases' ? <div className={`work-layout ${detail ? 'has-detail' : ''}`}>
           <CaseTable items={items} total={total} page={page} selected={selected} loading={loading} query={query} readonly={activeRole === 'reader'} checked={checked}
             assigneeFilter={assigneeFilter} statusFilter={statusFilter} suggestionFilter={suggestionFilter} onAssigneeFilter={value => changeCaseFilter('assignee', value)} onStatusFilter={value => changeCaseFilter('status', value)} onSuggestionFilter={value => changeCaseFilter('suggestion', value)}
             onQuery={value => { setQuery(value); setPage(1); setChecked([]) }} onPage={value => { setPage(value); setChecked([]) }} onSelect={selectCase}
             onCheck={(id, value) => setChecked(previous => value ? [...new Set([...previous, id])] : previous.filter(item => item !== id))}
             onCheckPage={value => setChecked(previous => value ? [...new Set([...previous, ...items.map(item => item.id)])] : previous.filter(id => !items.some(item => item.id === id)))}
-            onBatchOpen={() => setBatchOpen(true)} onDeleteBatch={() => requestDelete(checked)} onDelete={id => requestDelete([id])} suggestionBusy={suggestionBusy} onRules={() => void generateRules()} onModel={() => void generateModel()} />
+            onBatchOpen={() => setBatchOpen(true)} onDeleteBatch={() => requestDelete(checked)} onDeleteAll={requestDeleteAll} onDelete={id => requestDelete([id])} suggestionBusy={suggestionBusy} onRules={() => void generateRules()} onModel={() => void generateModel()} />
           <AnimatePresence mode="wait">{detail && <motion.div key={detail.id} className="detail-motion" initial={{ x: 20 }} animate={{ x: 0 }} exit={{ x: 20 }} transition={{ duration: .22 }}><ReviewPane key={`${detail.id}-${detail.version}`} projectId={projectId} userId={user.id} role={activeRole} item={detail} readonly={activeRole === 'reader'} saving={working} onClose={() => selectCase(null)} onSave={saveReview} onAssign={assignCase} onDelete={() => requestDelete([detail.id])} onSuggestionDecided={afterSuggestion} suggestionRevision={suggestionRevision} /></motion.div>}</AnimatePresence>
-        </div> : <div className="imports-list">{imports.map(record => <div key={record.id} className="import-line"><FileSpreadsheet size={18} /><div><strong>{record.filename}</strong><span>{record.created_at.replace('T', ' ').slice(0, 19)}</span></div><span>{record.count} 条</span><span className={record.status === 'done' ? 'reviewed-text' : 'pending-text'}>{record.status === 'done' ? '已入库' : '待确认'}</span></div>)}{imports.length === 0 && <div className="empty-list">尚无导入记录</div>}</div>}</Suspense>}
+        </div> : <div className="imports-list">{imports.map(record => <div key={record.id} className="import-line"><FileSpreadsheet size={18} /><div><strong>{record.filename}</strong><span>{record.created_at.replace('T', ' ').slice(0, 19)}</span></div><span>{record.count} 条</span><span className={record.status === 'done' ? 'reviewed-text' : 'pending-text'}>{record.status === 'done' ? '已入库' : '待确认'}</span>{activeRole !== 'reader' && <Button variant="ghost" size="icon-sm" aria-label="删除导入记录" title="删除导入记录" onClick={() => setImportDeleteTarget(record)}><Trash2 size={15} /></Button>}</div>)}{imports.length === 0 && <div className="empty-list">尚无导入记录</div>}</div>}</Suspense>}
       </motion.div></AnimatePresence></div>
     </main>
     <Dialog open={projectOpen} onOpenChange={setProjectOpen}><DialogContent><DialogHeader><DialogTitle>新建项目</DialogTitle><DialogDescription>同一项目内的用例 ID 不可重复</DialogDescription></DialogHeader><form onSubmit={createProject} className="project-form"><label>项目名称<Input value={projectName} onChange={event => setProjectName(event.target.value)} maxLength={120} required autoFocus /></label><DialogFooter><Button type="submit">创建项目</Button></DialogFooter></form></DialogContent></Dialog>
     <ProjectManagerDialog open={projectManageOpen} onOpenChange={setProjectManageOpen} projects={projects} currentId={projectId} canManage={activeRole === 'admin' || activeRole === 'manager'} onSelect={selectProject} onProjectsChange={onProjectsChange} onCreate={() => setProjectOpen(true)} onNotice={setNotice} onError={setError} />
     {importOpen && <Suspense fallback={null}><ImportDialog open preview={preview} working={working} onOpenChange={setImportOpen} onFile={onFile} onConfirm={confirmImport} /></Suspense>}
     {projectId && batchOpen && <Suspense fallback={null}><BatchReviewDialog projectId={projectId} open items={items.filter(item => checked.includes(item.id))} onOpenChange={setBatchOpen} onFinished={afterBatch} /></Suspense>}
-    <Dialog open={deleteTarget !== null} onOpenChange={open => { if (!open && !working) setDeleteTarget(null) }}>
+    <Dialog open={importDeleteTarget !== null} onOpenChange={open => { if (!open && !working) setImportDeleteTarget(null) }}>
       <DialogContent>
-        <DialogHeader><DialogTitle>确认删除用例</DialogTitle><DialogDescription>删除后原始信息、审核记录、建议与冒烟关联都会移除 此操作无法撤销</DialogDescription></DialogHeader>
-        <p className="delete-confirm-copy">将删除 {deleteTarget?.length ?? 0} 条用例</p>
-        <DialogFooter><Button variant="outline" disabled={working} onClick={() => setDeleteTarget(null)}>取消</Button><Button variant="destructive" disabled={working} onClick={() => void confirmDelete()}><Trash2 data-icon="inline-start" />{working ? '删除中…' : '确认删除'}</Button></DialogFooter>
+        <DialogHeader><DialogTitle>确认删除导入记录</DialogTitle><DialogDescription>删除导入记录后，该批次创建的用例及关联治理快照也会移除 此操作无法撤销</DialogDescription></DialogHeader>
+        <p className="delete-confirm-copy">{importDeleteTarget ? `${importDeleteTarget.filename} · ${importDeleteTarget.count} 条用例` : ''}</p>
+        <DialogFooter><Button variant="outline" disabled={working} onClick={() => setImportDeleteTarget(null)}>取消</Button><Button variant="destructive" disabled={working} onClick={() => void confirmImportDelete()}><Trash2 data-icon="inline-start" />{working ? '删除中…' : '确认删除'}</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
+    <Dialog open={deleteTarget !== null || deleteAllTarget} onOpenChange={open => { if (!open && !working) { setDeleteTarget(null); setDeleteAllTarget(false) } }}>
+      <DialogContent>
+        <DialogHeader><DialogTitle>{deleteAllTarget ? '确认删除全部用例' : '确认删除用例'}</DialogTitle><DialogDescription>删除后原始信息、审核记录、建议与冒烟关联都会移除 此操作无法撤销</DialogDescription></DialogHeader>
+        <p className="delete-confirm-copy">{deleteAllTarget ? '将删除当前项目全部用例' : `将删除 ${deleteTarget?.length ?? 0} 条用例`}</p>
+        <DialogFooter><Button variant="outline" disabled={working} onClick={() => { setDeleteTarget(null); setDeleteAllTarget(false) }}>取消</Button><Button variant="destructive" disabled={working} onClick={() => void confirmDelete()}><Trash2 data-icon="inline-start" />{working ? '删除中…' : '确认删除'}</Button></DialogFooter>
       </DialogContent>
     </Dialog>
   </div>

@@ -64,8 +64,12 @@ def test_conversion_modes_and_history(context, mode, output, filename, content, 
     assert client.post(url + "/preview", **{**args, "headers": {}}).status_code == 403
     result = client.post(url + "/preview", **args)
     assert result.status_code == 200, result.text
-    assert result.json()["target_kind"] == target_kind
-    assert len(result.json()["target_headers"]) == columns
+    payload = result.json()
+    assert payload["target_kind"] == target_kind
+    assert len(payload["target_headers"]) == columns
+    if target_kind == "tree":
+        assert payload["target_tree"]["node_type"] == "root"
+        assert payload["target_tree"]["children"][0]["node_type"] == "directory"
     response = client.post(url + "/export", **args)
     assert response.status_code == 200, response.text
     if target_kind == "tree":

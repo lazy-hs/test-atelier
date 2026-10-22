@@ -9,6 +9,7 @@
 ## 文档导航
 
 - [完整使用说明](docs/USAGE.md)：首次登录、推荐工作流、角色权限、导入导出和故障排查
+- [架构与工程手册](docs/ARCHITECTURE.md)：路由与模块职责、数据模型、权限、任务队列和开发约定
 - [可观测性与故障处理](docs/OBSERVABILITY.md)：日志契约、Prometheus 告警和生产排障顺序
 - [安全策略](SECURITY.md)：生产安全基线、敏感数据边界和漏洞响应
 - [路线图与验收状态](docs/ROADMAP.md)
@@ -23,6 +24,7 @@
 | 工作台 | 项目概览、待审核、分析、草稿和转换 | 数据按项目隔离 |
 | 团队协作 | 项目管理员、评审员、只读成员；成员变更记录 | 全局管理员可救援；只读成员不能写入 |
 | 用例库 | `.xls`、`.xlsx`、`.xmind` 预览导入、审核、分派、评论、审计、Excel 导出 | 原值、建议和最终值分开保存；并发修改返回冲突；XMind 导入限制压缩比、节点数量和层级 |
+| 用例治理 | 监控中心快照导入、体检指标、A/B/C 同名用例组、内容相同用例组、可撤销治理、入库校验、回归清单和 `Tcase_list` 导出 | 治理规则从 `TEST_ATELIER_CASE_RULES_ROOT` 只读加载；废弃采用软状态和合并指针 |
 | 智能梳理 | 分类版本、规则候选、AI 候选、逐条接受/修改/驳回 | AI 结果永远是候选，关键歧义需人工确认 |
 | 需求分析 | Markdown、文本、图片、PDF、`.doc`、`.docx` 提取、报告编辑和追溯 | 图片/扫描 PDF 依赖 Tesseract；`.doc` 依赖 LibreOffice；`.docx` 解析前检查压缩包安全边界 |
 | 用例编写 | 从已确认分析生成草稿，编辑后发布或导出 XMind/Excel | 未确认的关键歧义会阻断生成；导出不等于发布 |
@@ -138,7 +140,7 @@ export TEST_ATELIER_SKILL_ROOT=/Users/lazy/huangsheng/project/qa-doc-skills
 | `AI_STUDIO_BACKUP_TIMEOUT` | `120` | PostgreSQL `pg_dump`/`pg_restore` 超时秒数 |
 | `AI_STUDIO_BACKUP_MAX_UNCOMPRESSED_BYTES` | `8589934592` | 备份归档解压后的总大小上限，防止压缩炸弹 |
 | `AI_STUDIO_DATA_DIR` | `./data` | 原始文档和转换结果目录 |
-| `AI_STUDIO_REQUIRE_MIGRATIONS` / `AI_STUDIO_MIGRATION_HEAD` / `AI_STUDIO_MIGRATION_TIMEOUT` | 开发 `0`、生产 `1` / `20261028_codex_sessions` / `120` | 启动时执行并校验数据库迁移版本；生产前置检查强制保持 `1`，迁移超时后以结构化错误退出 |
+| `AI_STUDIO_REQUIRE_MIGRATIONS` / `AI_STUDIO_MIGRATION_HEAD` / `AI_STUDIO_MIGRATION_TIMEOUT` | 开发 `0`、生产 `1` / `20261032_case_timestamps` / `120` | 启动时执行并校验数据库迁移版本；生产前置检查强制保持 `1`，迁移超时后以结构化错误退出 |
 | `AI_STUDIO_OLLAMA_URL` | `http://127.0.0.1:11434` | 本地 Ollama 地址 |
 | `AI_STUDIO_OLLAMA_MODEL` | `qwen3:8b` | 本地模型名称，需自行下载 |
 | `AI_STUDIO_REMOTE_ENABLED` | `0` | 是否允许管理员使用远程 OpenAI 兼容接口 |
@@ -244,7 +246,7 @@ AI_STUDIO_E2E_PASSWORD='管理员密码' npm run test:e2e
 
 ## 数据库迁移与历史导入
 
-升级数据库（当前 head 为 `20261028_codex_sessions`）：
+升级数据库（当前 head 为 `20261032_case_timestamps`）：
 
 ```bash
 python -m alembic upgrade head

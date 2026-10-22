@@ -133,7 +133,7 @@ def _load_ai_config(*, log_availability: bool = True) -> None:
 
 
 def _check_migrations() -> None:
-    expected = os.getenv("AI_STUDIO_MIGRATION_HEAD", "20261028_codex_sessions")
+    expected = os.getenv("AI_STUDIO_MIGRATION_HEAD", "20261032_case_timestamps")
     with SessionLocal() as db:
         actual = db.execute(text("SELECT version_num FROM alembic_version")).scalar()
     if actual != expected:

@@ -53,7 +53,13 @@ def _xls(data):
                 raise ImportErrorDetail(f"第 {row + 1} 行第 {col + 1} 列含错误单元格")
             pattern = book.xf_list[cell.xf_index].format_key
             fmt = book.format_map[pattern].format_str if pattern is not None else ""
-            values.append(_clean(cell.value, fmt))
+            # xlrd exposes Excel date cells as serial numbers unless they are
+            # converted explicitly; preserve source timestamps as readable
+            # values before the governance layer stores them.
+            value = cell.value
+            if cell.ctype == xlrd.XL_CELL_DATE:
+                value = xlrd.xldate_as_datetime(cell.value, book.datemode)
+            values.append(_clean(value, fmt))
         grid.append(values)
     return grid, warnings
 

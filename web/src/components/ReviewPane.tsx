@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import { api, type CaseActivity, type CaseDetail } from '@/lib/api'
+import { api, formatDateTime, type CaseActivity, type CaseDetail } from '@/lib/api'
 import { SuggestionPanel } from '@/components/SuggestionPanel'
 import type { DimensionKey, TaxonomyVersion } from '@/lib/api'
 
@@ -17,10 +17,7 @@ type Props = {
   onSuggestionDecided: (value: CaseDetail) => Promise<void>; suggestionRevision: number
 }
 
-function time(value: string) {
-  const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime()) ? value.replace('T', ' ').slice(0, 16) : parsed.toLocaleString('zh-CN')
-}
+function time(value: string) { return formatDateTime(value) }
 
 export function ReviewPane({ projectId, userId, role, item, readonly, saving, onClose, onSave, onAssign,
   onDelete, onSuggestionDecided, suggestionRevision }: Props) {
@@ -84,6 +81,7 @@ export function ReviewPane({ projectId, userId, role, item, readonly, saving, on
       <Tabs value={tab} onValueChange={setTab} className="review-tabs"><TabsList variant="line" aria-label="详情视图"><TabsTrigger value="review">审核</TabsTrigger><TabsTrigger value="suggestions">建议</TabsTrigger><TabsTrigger value="activity">讨论与记录</TabsTrigger></TabsList>
         <TabsContent value="review">
           <div className="section-caption">原始信息 <span>导入内容不可修改</span></div>
+          <div className="review-meta case-timestamps"><span>创建时间 {item.created_at ? time(item.created_at) : '未知'}</span><span>最后修改 {item.updated_at ? time(item.updated_at) : '未知'}</span></div>
           <dl className="original-fields">{item.headers.map((header, index) => <div key={`${header}-${index}`}><dt>{header}</dt><dd>{item.original[index] || <span className="empty-value">空值</span>}</dd></div>)}</dl>
           <div className="section-caption review-caption">人工审核 <span>与原始字段分开保存</span></div>
           <div className="review-controls">

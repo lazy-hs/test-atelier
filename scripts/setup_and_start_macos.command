@@ -85,7 +85,7 @@ if [[ "$SKIP_CONFIG" != "1" && ! -s "$SECRET_FILE" ]]; then
 fi
 export AI_STUDIO_SESSION_SECRET="$(cat "$SECRET_FILE")"
 export AI_STUDIO_REQUIRE_MIGRATIONS=1
-export AI_STUDIO_MIGRATION_HEAD="20261028_codex_sessions"
+export AI_STUDIO_MIGRATION_HEAD="20261032_case_timestamps"
 # This launcher starts only the API and Vite. Never inherit production's
 # external-worker flag from the shell or queued AI jobs would have no consumer.
 export AI_STUDIO_EXTERNAL_WORKER=0

@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { CheckCircle2, Circle, FileText, Folder, GitBranch, ListChecks } from "lucide-react";
+import { CheckCircle2, ChevronRight, Circle, FileText, Folder, GitBranch, ListChecks } from "lucide-react";
 
 const NODE_META = {
   root: { label: "主节点", Icon: GitBranch },
@@ -24,15 +24,24 @@ function TreeNode({ node, depth, forceOpen }) {
   );
 
   return (
-    <li className={`tree-node depth-${Math.min(depth, 4)}`}>
+    <li
+      className={`tree-node depth-${Math.min(depth, 4)}`}
+      style={{ "--tree-delay": `${Math.min(depth, 6) * 35}ms` }}
+    >
       {children.length ? (
         <details open={forceOpen || depth < 2}>
-          <summary>{content}</summary>
+          <summary>
+            <ChevronRight className="tree-chevron" size={14} aria-hidden="true" />
+            {content}
+          </summary>
           {node.notes ? <div className="tree-note"><strong>前置条件</strong><span>{node.notes}</span></div> : null}
           <ul>{children.map((child, index) => <TreeNode node={child} depth={depth + 1} forceOpen={forceOpen} key={`${child.title}-${index}`} />)}</ul>
         </details>
       ) : (
-        <div className="tree-leaf">{content}</div>
+        <div className="tree-leaf">
+          <span className="tree-chevron-placeholder" aria-hidden="true" />
+          {content}
+        </div>
       )}
       {!children.length && node.notes ? <div className="tree-note"><strong>前置条件</strong><span>{node.notes}</span></div> : null}
     </li>
