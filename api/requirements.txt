@@ -11,7 +11,7 @@ argon2-cffi>=23,<26
 pypdf>=5,<7
 pypdfium2>=4,<6
 python-docx>=1,<2
-pillow>=11,<13
+pillow>=12.3.0,<13
 httpx>=0.27,<1
 # Linux production images and Apple Silicon development use the patched wheel
 # series (50.x includes the PKCS#7 fixes in addition to the 49.x certificate
