@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { AlertCircle, ArrowRight, Eye, FileText, PencilLine, Plus, RefreshCw, Save, Upload } from 'lucide-react'
+import { AlertCircle, ArrowRight, Check, Eye, FileText, PencilLine, Plus, RefreshCw, Save, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -135,6 +135,24 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
   }
   const currentDoc = documents.find(doc => doc.id === documentId)
   const currentJob = jobs.find(job => job.kind === 'analysis')
+  const requirementCount = analysis?.result.requirements?.length ?? 0
+  const ambiguityCount = analysis?.result.ambiguities?.length ?? 0
+  const unresolvedCritical = analysis?.result.ambiguities?.filter(item => item.critical && !item.decision?.trim()).length ?? 0
+  const mappedSourceCount = analysis ? new Set((analysis.result.requirements ?? []).flatMap(item => item.source_ids)).size : 0
+  const providerLabel = analysis?.provider === 'codex' || analysis?.provider === 'codex_cli'
+    ? 'Codex CLI 本机'
+    : analysis?.provider === 'claude' || analysis?.provider === 'claude_code'
+      ? 'Claude Code 本机'
+      : analysis?.provider === 'remote' ? '远程模型' : '本地模型'
+  // Keep the checkpoint language aligned with the requirement-analysis skill.
+  // These are UI checkpoints only; the worker remains the source of truth.
+  const workflow = [
+    { label: '读取材料', done: documents.length > 0 },
+    { label: 'Phase 2 解析', done: Boolean(analysis) },
+    { label: 'Phase 2.5 解析确认', done: analysis?.status === 'ready' },
+    { label: 'Phase 2.6 歧义处理', done: analysis?.status === 'ready' && unresolvedCritical === 0 },
+    { label: 'Phase 2.8 分析预审', done: analysis?.status === 'ready' },
+  ]
   return <div className="ai-workspace">
     {error && <div className="ai-alert error" role="alert"><AlertCircle size={16} />{error}</div>}
     {notice && <div className="ai-alert" role="status">{notice}</div>}
@@ -170,6 +188,13 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
         <AnimatePresence mode="wait">{analysis ? <motion.div key={analysis.id} initial={{ opacity: 0, y: 7 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -7 }} className="ai-report">
           <div className="ai-section-heading"><div><h2>分析报告</h2><p>{analysis.source_ids.length} 份材料 · {analysis.result.requirements?.length ?? 0} 条需求</p></div>
             <div className="ai-heading-actions">{currentJob && <Button variant="outline" size="sm" onClick={() => setPromptOpen(true)}><Eye data-icon="inline-start" />查看提示词</Button>}{analysis.status === 'ready' && <Button variant="outline" size="sm" onClick={onOpenAuthoring}>进入用例编写<ArrowRight data-icon="inline-end" /></Button>}</div></div>
+          <motion.div className="analysis-flow" aria-label="需求分析流程" initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -5 }} transition={{ delay: .06, duration: .22 }}>
+            <div className="analysis-flow-head"><span>{providerLabel === 'Codex CLI 本机' ? 'Codex 需求分析流程' : '需求分析流程'}</span><Badge variant="secondary">{providerLabel}</Badge></div>
+            <div className="analysis-flow-steps">{workflow.map((step, index) => <motion.div className={`analysis-flow-step ${step.done ? 'is-done' : ''} ${analysis.status !== 'ready' && index === 1 ? 'is-active' : ''}`} key={step.label} initial={{ opacity: 0, x: -5 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -5 }} transition={{ delay: .08 + index * .035, duration: .18 }}><span className="analysis-flow-dot" aria-hidden="true">{step.done ? <Check size={11} strokeWidth={2.5} /> : index + 1}</span><span>{step.label}</span>{index < workflow.length - 1 && <span className="analysis-flow-line" aria-hidden="true" />}</motion.div>)}</div>
+          </motion.div>
+          {analysis.status === 'ready' && <motion.div className="analysis-metrics" initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -5 }} transition={{ delay: .12, duration: .22 }}>
+            <motion.div initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 4 }} transition={{ delay: .14, duration: .18 }}><strong>{requirementCount}</strong><span>条需求</span></motion.div><motion.div initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 4 }} transition={{ delay: .17, duration: .18 }}><strong>{mappedSourceCount}/{analysis.source_ids.length}</strong><span>来源已映射</span></motion.div><motion.div initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 4 }} transition={{ delay: .2, duration: .18 }}><strong>{ambiguityCount}</strong><span>待澄清</span></motion.div><motion.div className={unresolvedCritical ? 'is-warning' : ''} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 4 }} transition={{ delay: .23, duration: .18 }}><strong>{unresolvedCritical}</strong><span>关键未确认</span></motion.div>
+          </motion.div>}
           {analysis.status === 'failed' ? <div className="ai-alert error"><AlertCircle size={16} />{formatAiError(analysis.error)}{currentJob && !readonly && <Button variant="outline" size="sm" onClick={() => void retry(currentJob.id)} disabled={busy}><RefreshCw data-icon="inline-start" />重试</Button>}</div> : null}
           {analysis.status === 'queued' || analysis.status === 'running' ? <div className="ai-processing" role="status">正在处理需求材料，请稍候</div> : null}
           {analysis.status === 'ready' && <><div className="ai-section-heading"><h3>待澄清</h3><span>{analysis.result.ambiguities?.length ?? 0} 项</span></div>

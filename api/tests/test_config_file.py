@@ -47,3 +47,21 @@ def test_config_file_persists_models_and_skill_metadata(tmp_path, monkeypatch):
     }]
     assert "must not be persisted" not in target.read_text(encoding="utf-8")
     assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+
+def test_read_config_adds_validated_server_ports_for_legacy_files(tmp_path, monkeypatch):
+    target = tmp_path / "config" / "settings.json"
+    target.parent.mkdir()
+    target.write_text(json.dumps({"models": {}, "skills": [], "server": {"port": "8765", "web_port": 5174}}), encoding="utf-8")
+    monkeypatch.setenv("AI_STUDIO_CONFIG_FILE", str(target))
+
+    assert config_file.server_config() == {"port": 8765, "web_port": 5174}
+
+
+def test_server_ports_fall_back_when_invalid(tmp_path, monkeypatch):
+    target = tmp_path / "config" / "settings.json"
+    target.parent.mkdir()
+    target.write_text(json.dumps({"server": {"port": 0, "web_port": "not-a-port"}}), encoding="utf-8")
+    monkeypatch.setenv("AI_STUDIO_CONFIG_FILE", str(target))
+
+    assert config_file.server_config() == {"port": 8000, "web_port": 5173}

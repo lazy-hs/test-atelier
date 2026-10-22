@@ -23,7 +23,7 @@ npm run dev -- --host 127.0.0.1
 
 生产构建会把 React、Motion 和 Lucide 拆成独立 vendor chunk，页面功能模块继续按路由懒加载；这样首屏共享入口不会因为工作台全部依赖增长到不可控的单块体积。
 
-开发服务器默认将 `/api` 转发到 `http://127.0.0.1:8000`，API 端口变化时：
+开发服务器默认将 `/api` 转发到 `http://127.0.0.1:8000`。使用根目录平台启动脚本时，代理和 Vite 端口会读取 `data/config/settings.json` 的 `server.port` 与 `server.web_port`；手动启动且 API 端口变化时：
 
 ```bash
 AI_STUDIO_API_TARGET=http://127.0.0.1:8010 npm run dev -- --host 127.0.0.1

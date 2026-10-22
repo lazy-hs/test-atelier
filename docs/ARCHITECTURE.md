@@ -243,7 +243,7 @@ data/                   运行时数据：ai_studio.db、documents、conversions
 
 ### 5.1 构建
 
-- Vite dev 代理 `/api` → `http://127.0.0.1:8000`（可用 `AI_STUDIO_API_TARGET` 覆盖）；**未配 `ws: true`**，SSE 走普通 HTTP 流
+- Vite dev 代理 `/api` → `http://127.0.0.1:8000`（平台启动脚本从 `settings.json.server.port` 读取并通过 `AI_STUDIO_API_TARGET` 同步，手动启动可覆盖）；**未配 `ws: true`**，SSE 走普通 HTTP 流
 - 手动分包：`react-vendor` / `motion-vendor` / `icons-vendor`，避免共享入口超 500 kB
 - 路径别名 `@/* → ./src/*`；`allowJs: true`（为 converter 的 JSX 放行）
 

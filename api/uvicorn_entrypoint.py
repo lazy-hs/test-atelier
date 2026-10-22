@@ -13,6 +13,7 @@ import argparse
 import os
 
 from .entrypoint import _log
+from .config_file import server_config
 from .observability import env_float
 
 
@@ -43,9 +44,10 @@ def run_server(host: str, port: int) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configured = server_config()
     parser = _ArgumentParser(description=__doc__)
     parser.add_argument("--host", default=os.getenv("AI_STUDIO_HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=os.getenv("AI_STUDIO_PORT", "8000"))
+    parser.add_argument("--port", type=int, default=os.getenv("AI_STUDIO_PORT", str(configured["port"])))
     try:
         args = parser.parse_args(argv)
     except (argparse.ArgumentError, ValueError) as exc:

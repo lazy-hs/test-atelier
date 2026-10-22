@@ -98,3 +98,69 @@ def test_skill_script_cancellation_terminates_child_process(tmp_path, monkeypatc
     assert not thread.is_alive()
     assert len(error) == 1
     assert isinstance(error[0], ai_engine.CliCancelled)
+
+
+def test_codex_requirement_analysis_prompt_follows_skill_phases(monkeypatch):
+    captured: list[str] = []
+
+    def fake_context(_skill_id, references=()):
+        return "# skill context\n" + "\n".join(references)
+
+    def fake_model(prompt, _schema, _provider):
+        captured.append(prompt)
+        return {
+            "requirements": [{
+                "id": "REQ-1", "title": "登录", "summary": "账号登录",
+                "source_ids": ["doc-1"], "acceptance": ["正确账号进入首页"], "methods": ["EP"],
+            }],
+            "ambiguities": [], "risks": ["数据一致性"],
+        }
+
+    monkeypatch.setattr(skill_runner, "load_context", fake_context)
+    monkeypatch.setattr(skill_runner, "load_memory_context", lambda: "# .memory snapshots")
+    monkeypatch.setattr(skill_runner, "skill_root", lambda: Path("/skills"))
+
+    result = skill_runner.analyze([{"id": "doc-1", "filename": "login.md", "text": "# Login"}], "codex_cli", fake_model)
+
+    assert result["requirements"][0]["source_ids"] == ["doc-1"]
+    prompt = captured[0]
+    assert "Phase 0" in prompt and "Phase 2.8" in prompt and "Phase 4" in prompt
+    assert "NIELSEN-HEURISTICS.md" in prompt
+    assert ".memory snapshots" in prompt
+    assert "不得生成测试用例 JSON、XMind 或 tmp/cases_*.json" in prompt
+
+
+def test_codex_test_case_prompt_follows_skill_workflow(monkeypatch):
+    captured: list[str] = []
+
+    def fake_context(_skill_id, references=()):
+        return "# skill context\n" + "\n".join(references)
+
+    def fake_model(prompt, _schema, _provider):
+        captured.append(prompt)
+        return {"cases": [{
+            "module": ["风险点", "数据一致性"], "title": "登录结果与首页状态一致",
+            "priority": "P1", "precondition": "存在有效账号",
+            "steps": [{"action": "1. 输入有效账号", "expected": "1. 账号输入框显示对应内容"}],
+            "requirement_ids": ["REQ-1"], "method": "ST", "label": "Web",
+            "remark": "依据需求中的数据一致性风险", "smoke": "",
+        }]}
+
+    monkeypatch.setattr(skill_runner, "load_context", fake_context)
+    monkeypatch.setattr(skill_runner, "load_memory_context", lambda: "# .memory snapshots")
+    monkeypatch.setattr(skill_runner, "skill_root", lambda: Path("/skills"))
+
+    cases = skill_runner.generate_cases({
+        "requirements": [{"id": "REQ-1", "title": "登录", "summary": "账号登录",
+                          "source_ids": ["doc-1"], "acceptance": ["进入首页"], "methods": ["ST"]}],
+        "ambiguities": [], "risks": ["数据一致性"],
+        "report_markdown": "# 需求分析\n登录",
+    }, "codex_cli", fake_model)
+
+    assert cases[0]["module"][:2] == ["风险点", "数据一致性"]
+    prompt = captured[0]
+    assert "Phase 0" in prompt and "Phase 2.8" in prompt and "Phase 3" in prompt and "Phase 4" in prompt
+    assert "TEST-CASE-RULES.md" in prompt and "INTERACTION-PATTERNS.md" in prompt
+    assert ".memory snapshots" in prompt
+    assert "[风险点, 风险类别]" in prompt
+    assert "不输出解释、Markdown 围栏、XMind 或临时文件" in prompt

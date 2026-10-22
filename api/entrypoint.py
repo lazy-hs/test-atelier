@@ -107,8 +107,14 @@ def main() -> int:
          revision=os.getenv("AI_STUDIO_MIGRATION_HEAD", "head"),
          duration_ms=round((time.perf_counter() - started) * 1000, 2))
     try:
+        port = int(os.getenv("AI_STUDIO_PORT", "8000"))
+        if not 1 <= port <= 65535:
+            raise ValueError
         os.execv(sys.executable, [sys.executable, "-m", "api.uvicorn_entrypoint",
-                                  "--host", "0.0.0.0", "--port", "8000"])
+                                  "--host", "0.0.0.0", "--port", str(port)])
+    except (TypeError, ValueError):
+        _log("application.launch.failed", "ERROR", component="uvicorn", error_type="InvalidPort")
+        return 2
     except OSError as exc:
         _log("application.launch.failed", "ERROR", error_type="UvicornLaunchError",
              message=redact_sensitive_text(str(exc)))

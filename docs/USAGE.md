@@ -8,7 +8,7 @@ Python 依赖不限定虚拟环境工具：可以使用 `conda create -n test-at
 
 ### 核心配置文件
 
-启动后会自动生成 `data/config/settings.json`。模型设置保存后会立即同步 `models` 节点；技能仓根路径和注册表会同步到 `skills_root`、`skills` 节点，技能节点仅包含路径和基本元数据，不写入技能正文。文件采用私有权限和原子替换写入，适合随 `data/` 一起备份。若部署环境需要独立位置，可设置 `AI_STUDIO_CONFIG_FILE`；不要把包含加密密钥的运行时文件提交到版本库。结构参考 `config/settings.example.json`。
+启动后会自动生成 `data/config/settings.json`。`server.port` 和 `server.web_port` 分别控制 API 与 Vite 的本地端口，平台启动脚本会读取它们；修改端口后重启服务即可生效。模型设置保存后会立即同步 `models` 节点；技能仓根路径和注册表会同步到 `skills_root`、`skills` 节点，技能节点仅包含路径和基本元数据，不写入技能正文。文件采用私有权限和原子替换写入，适合随 `data/` 一起备份。若部署环境需要独立位置，可设置 `AI_STUDIO_CONFIG_FILE`；不要把包含加密密钥的运行时文件提交到版本库。结构参考 `config/settings.example.json`。
 
 本机环境配置与服务启动分开执行。先运行对应系统的 `configure_environment_*` 脚本创建 Conda 环境、按依赖指纹安装依赖、生成会话密钥并迁移数据库，再运行 `start_*` 脚本启动 API 与 Vite。启动脚本只校验已配置的 Conda 环境、前端依赖和会话密钥，不会安装依赖、创建密钥或执行迁移；缺少这些前置文件时会明确提示先完成配置。macOS 使用 `configure_environment_macos.command` + `start_macos.command`，Windows 使用 `configure_environment_windows.ps1` + `start_windows.ps1`，Linux 使用 `configure_environment_linux.sh` + `start_linux.sh`。启动脚本会明确关闭 `AI_STUDIO_EXTERNAL_WORKER`，避免继承生产环境变量后任务进入无人消费的持久队列。原有 `setup_and_start_*` 文件保留兼容，但新部署建议使用分离脚本。Compose 部署时必须额外挂载完整的 `qa-doc-skills` 源目录并设置 `TEST_ATELIER_SKILL_ROOT`。
 
@@ -215,7 +215,7 @@ smoke 会检查 live、ready、metrics、worker（启用时）、`X-Request-ID`�
 | --- | --- |
 | 启动提示 `AI_STUDIO_SESSION_SECRET` 无效 | 设置至少 32 个字符，并在后续启动中保持不变 |
 | 首次启动提示管理员密码 | 首次创建运行环境时可输入至少 6 个字符；直接回车使用默认密码 123456。已有环境会跳过密码配置；生产环境仍建议使用密码管理器生成并轮换强密码 |
-| 页面提示无法连接 API | 检查 API 是否监听 8000；前端端口变化时设置 `AI_STUDIO_API_TARGET` |
+| 页面提示无法连接 API | 检查 `data/config/settings.json` 的 `server.port`，并确认前端使用同一 API 端口；手动启动前端时设置 `AI_STUDIO_API_TARGET` |
 | 分析任务失败 | 检查 Ollama 地址、模型是否已下载；修复后在页面重试 |
 | 测试 Codex CLI 提示远程模型缺少 API Key | 远程模型的密钥已保存时页面不会回显原文；不需要重新输入，更新到包含 CLI provider 修复的 API 后重新加载页面再测试 |
 | Codex CLI 测试失败 | 在运行 API 的同一用户环境执行 `codex --version` 和一次最小结构化请求；确认 `PATH`、Codex 登录状态和页面中的命令路径一致 |

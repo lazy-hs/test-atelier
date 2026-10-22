@@ -82,7 +82,7 @@ python -m alembic upgrade head
 终端一：
 
 ```bash
-python -m api.uvicorn_entrypoint --host 127.0.0.1 --port 8000
+python -m api.uvicorn_entrypoint --host 127.0.0.1
 ```
 
 终端二：
@@ -92,7 +92,7 @@ cd web
 npm run dev -- --host 127.0.0.1
 ```
 
-打开 Vite 输出的地址，使用 `admin` 和初始化密码登录。前端开发服务器默认把 `/api` 代理到 `http://127.0.0.1:8000`；API 端口变化时设置 `AI_STUDIO_API_TARGET`。
+打开 Vite 输出的地址，使用 `admin` 和初始化密码登录。运行端口保存在 `data/config/settings.json` 的 `server.port`（API，默认 `8000`）和 `server.web_port`（Vite，默认 `5173`）中；平台启动脚本会读取这两个值并同步配置前端代理，修改后重启服务即可生效。手动启动前端且 API 端口变化时设置 `AI_STUDIO_API_TARGET`。
 
 ```bash
 AI_STUDIO_API_TARGET=http://127.0.0.1:8010 npm run dev -- --host 127.0.0.1 --port 5173

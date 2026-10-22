@@ -60,3 +60,14 @@ def test_wrapper_reports_invalid_port_without_plaintext(capsys):
     assert uvicorn_entrypoint.main(["--port", "not-a-port"]) == 2
     payload = json.loads(capsys.readouterr().out)
     assert payload["error_type"] == "InvalidArguments"
+
+
+def test_wrapper_uses_server_port_from_settings_when_not_overridden(tmp_path, monkeypatch):
+    target = tmp_path / "config" / "settings.json"
+    target.parent.mkdir()
+    target.write_text('{"server": {"port": 8765, "web_port": 5173}}', encoding="utf-8")
+    monkeypatch.setenv("AI_STUDIO_CONFIG_FILE", str(target))
+    monkeypatch.delenv("AI_STUDIO_PORT", raising=False)
+    monkeypatch.setattr(uvicorn_entrypoint, "run_server", lambda host, port: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+    assert uvicorn_entrypoint.main(["--host", "127.0.0.1"]) == 130

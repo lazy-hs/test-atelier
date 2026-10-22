@@ -24,6 +24,7 @@ from .storage import ensure_private_directory, _fsync_directory
 logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 1
 DEFAULT_FILENAME = "settings.json"
+DEFAULT_SERVER_CONFIG = {"port": 8000, "web_port": 5173}
 
 
 @contextmanager
@@ -66,7 +67,25 @@ def config_path() -> Path:
 
 
 def _empty_config() -> dict[str, Any]:
-    return {"schema_version": SCHEMA_VERSION, "models": {}, "skills": []}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "server": dict(DEFAULT_SERVER_CONFIG),
+        "models": {},
+        "skills": [],
+    }
+
+
+def _normalize_server_config(value: Any) -> dict[str, int]:
+    server = value if isinstance(value, Mapping) else {}
+    normalized = dict(DEFAULT_SERVER_CONFIG)
+    normalized.update(server)
+    for key in ("port", "web_port"):
+        try:
+            port = int(normalized[key])
+        except (TypeError, ValueError):
+            port = DEFAULT_SERVER_CONFIG[key]
+        normalized[key] = port if 1 <= port <= 65535 else DEFAULT_SERVER_CONFIG[key]
+    return normalized
 
 
 def read_config() -> dict[str, Any]:
@@ -94,7 +113,19 @@ def read_config() -> dict[str, Any]:
         result["models"] = {}
     if not isinstance(result.get("skills"), list):
         result["skills"] = []
+    # Keep the runtime ports in the durable settings file while accepting
+    # older files that predate the server section.
+    result["server"] = _normalize_server_config(result.get("server"))
     return result
+
+
+def server_config() -> dict[str, int]:
+    """Return validated API and web development server ports."""
+    server = read_config().get("server", DEFAULT_SERVER_CONFIG)
+    return {
+        "port": int(server.get("port", DEFAULT_SERVER_CONFIG["port"])),
+        "web_port": int(server.get("web_port", DEFAULT_SERVER_CONFIG["web_port"])),
+    }
 
 
 def write_config(payload: Mapping[str, Any]) -> None:
@@ -104,6 +135,7 @@ def write_config(payload: Mapping[str, Any]) -> None:
     ensure_private_directory(parent)
     document = dict(payload)
     document["schema_version"] = SCHEMA_VERSION
+    document["server"] = _normalize_server_config(document.get("server"))
     encoded = json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     descriptor: int | None = None
     temporary_name: str | None = None

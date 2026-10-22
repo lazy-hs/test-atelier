@@ -24,6 +24,16 @@ def test_local_launchers_use_structured_uvicorn_wrapper():
     assert "python -m api.uvicorn_entrypoint" in linux
 
 
+def test_local_launchers_read_ports_from_settings():
+    macos = (ROOT / "scripts" / "setup_and_start_macos.command").read_text(encoding="utf-8")
+    windows = (ROOT / "scripts" / "setup_and_start_windows.ps1").read_text(encoding="utf-8")
+    linux = (ROOT / "scripts" / "setup_and_start_linux.sh").read_text(encoding="utf-8")
+
+    assert "read_server_ports.py" in macos and '"$API_PORT"' in macos
+    assert "read_server_ports.py" in linux and '"$API_PORT"' in linux
+    assert "read_server_ports.py" in windows and "$ApiPort" in windows
+
+
 def test_linux_launcher_uses_linux_shell_tools_and_is_executable():
     launcher = ROOT / "scripts" / "setup_and_start_linux.sh"
     content = launcher.read_text(encoding="utf-8")

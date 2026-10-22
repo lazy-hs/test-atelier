@@ -114,6 +114,12 @@ if [[ "$CONFIG_ONLY" == "1" ]]; then
   exit 0
 fi
 
+PORTS="$(cd "$ROOT_DIR" && "$CONDA_EXE" run --no-capture-output -n "$ENV_NAME" \
+  python "$ROOT_DIR/scripts/read_server_ports.py" | tail -n 1)"
+read -r API_PORT WEB_PORT <<< "$PORTS"
+[[ "$API_PORT" == <-> && "$WEB_PORT" == <-> ]] || die "settings.json 中的端口配置无效"
+export AI_STUDIO_API_TARGET="${AI_STUDIO_API_TARGET:-http://127.0.0.1:$API_PORT}"
+
 print "启动 API（日志：$LOG_DIR/api.log）..."
 if [[ -f "$LOG_DIR/api.log" ]]; then
   LOG_BYTES="$(stat -f%z "$LOG_DIR/api.log" 2>/dev/null || print 0)"
@@ -121,18 +127,18 @@ if [[ -f "$LOG_DIR/api.log" ]]; then
     mv "$LOG_DIR/api.log" "$LOG_DIR/api.log.1"
   fi
 fi
-(cd "$ROOT_DIR" && "$CONDA_EXE" run --no-capture-output -n "$ENV_NAME" python -m api.uvicorn_entrypoint --host 127.0.0.1 --port 8000 > "$LOG_DIR/api.log" 2>&1) &
+(cd "$ROOT_DIR" && "$CONDA_EXE" run --no-capture-output -n "$ENV_NAME" python -m api.uvicorn_entrypoint --host 127.0.0.1 --port "$API_PORT" > "$LOG_DIR/api.log" 2>&1) &
 API_PID=$!
 for _ in {1..20}; do
-  if curl -fsS http://127.0.0.1:8000/api/v1/health/ready >/dev/null 2>&1; then
+  if curl -fsS "http://127.0.0.1:$API_PORT/api/v1/health/ready" >/dev/null 2>&1; then
     break
   fi
   kill -0 "$API_PID" 2>/dev/null || die "API 启动失败，请查看 $LOG_DIR/api.log"
   sleep 1
 done
-curl -fsS http://127.0.0.1:8000/api/v1/health/ready >/dev/null 2>&1 || die "API 未在 20 秒内就绪，请查看 $LOG_DIR/api.log"
+curl -fsS "http://127.0.0.1:$API_PORT/api/v1/health/ready" >/dev/null 2>&1 || die "API 未在 20 秒内就绪，请查看 $LOG_DIR/api.log"
 touch "$BOOTSTRAP_MARKER"
 
-print "启动前端：http://127.0.0.1:5173"
+print "启动前端：http://127.0.0.1:$WEB_PORT"
 print "按 Ctrl+C 可同时停止 API 和前端"
-(cd "$ROOT_DIR/web" && npm run dev -- --host 127.0.0.1)
+(cd "$ROOT_DIR/web" && npm run dev -- --host 127.0.0.1 --port "$WEB_PORT")

@@ -119,6 +119,18 @@ if ($ConfigureOnly) {
     exit 0
 }
 
+$portsOutput = & $CondaExe run --no-capture-output -n $EnvName python (Join-Path $RootDir "scripts\read_server_ports.py")
+$ports = ($portsOutput | Select-Object -Last 1).Trim() -split '\s+'
+if ($ports.Count -ne 2 -or $ports[0] -notmatch '^[0-9]+$' -or $ports[1] -notmatch '^[0-9]+$') {
+    Fail "settings.json 中的端口配置无效"
+}
+$ApiPort = [int]$ports[0]
+$WebPort = [int]$ports[1]
+if ($ApiPort -lt 1 -or $ApiPort -gt 65535 -or $WebPort -lt 1 -or $WebPort -gt 65535) {
+    Fail "settings.json 中的端口配置无效"
+}
+if (-not $env:AI_STUDIO_API_TARGET) { $env:AI_STUDIO_API_TARGET = "http://127.0.0.1:$ApiPort" }
+
 $apiLog = Join-Path $LogDir "api.log"
 $apiErrorLog = Join-Path $LogDir "api-error.log"
 foreach ($logPath in @($apiLog, $apiErrorLog)) {
@@ -129,14 +141,14 @@ foreach ($logPath in @($apiLog, $apiErrorLog)) {
 Write-Host "启动 API（日志：$apiLog）..."
 $ApiProcess = Start-Process -FilePath $CondaExe -ArgumentList @(
     "run", "--no-capture-output", "-n", $EnvName, "python", "-m", "api.uvicorn_entrypoint",
-    "--host", "127.0.0.1", "--port", "8000"
+    "--host", "127.0.0.1", "--port", "$ApiPort"
 ) -WorkingDirectory $RootDir -RedirectStandardOutput $apiLog -RedirectStandardError $apiErrorLog -PassThru
 
 $apiReady = $false
 for ($i = 0; $i -lt 20; $i++) {
     if ($ApiProcess.HasExited) { break }
     try {
-        Invoke-WebRequest -Uri "http://127.0.0.1:8000/api/v1/health/ready" -UseBasicParsing -TimeoutSec 2 | Out-Null
+        Invoke-WebRequest -Uri "http://127.0.0.1:$ApiPort/api/v1/health/ready" -UseBasicParsing -TimeoutSec 2 | Out-Null
         $apiReady = $true
         break
     } catch {
@@ -151,10 +163,10 @@ if (-not $apiReady) {
 New-Item -ItemType File -Force -Path $BootstrapMarker | Out-Null
 
 try {
-    Write-Host "启动前端：http://127.0.0.1:5173"
+    Write-Host "启动前端：http://127.0.0.1:$WebPort"
     Write-Host "关闭此窗口可停止前端；API 进程会在脚本退出时停止"
     Push-Location (Join-Path $RootDir "web")
-    & npm run dev -- --host 127.0.0.1
+    & npm run dev -- --host 127.0.0.1 --port $WebPort
 }
 finally {
     Pop-Location

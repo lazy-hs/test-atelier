@@ -1,5 +1,9 @@
 {
   "schema_version": 1,
+  "server": {
+    "port": 8000,
+    "web_port": 5173
+  },
   "models": {
     "local": {
       "enabled": true,
