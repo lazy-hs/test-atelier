@@ -102,7 +102,9 @@ Web 镜像直接以前台 Nginx 进程启动，避免官方 shell entrypoint 的
 
 需求分析报告和用例编写工具栏都提供“查看提示词”，可查看本次任务实际发送给 AI 的完整提示词并复制；任务失败时也会保留已发送的提示词，便于排查。
 
-图片和扫描 PDF 需要 Tesseract 的 `chi_sim`、`eng` 语言包；`.doc` 需要 LibreOffice。文件上限为 20 MB，PDF 最多 100 页；`.docx` 会在解析前检查压缩包路径、条目数和解压后大小，拒绝疑似 ZIP 炸弹或路径穿越文件。OCR 和 LibreOffice 转换均有硬超时，超时会终止整个子进程组，避免解析器子进程残留；解析器子进程不会继承应用会话密钥、数据库地址、指标令牌或云服务凭据。AI 生成只提供候选，不替代人工审核；云端模型暂时不可用时可稍后重试，规则候选和手工审核不受影响。
+大文件策略参考 OpenAI Codex 开源实现（Apache-2.0）：Codex 将原文件留在工作目录，按需读取并对项目指令设置总预算，而不是把整个文件一次性放进 prompt。本项目在远程模型和技能适配层使用等价的有界窗口、来源偏移和分层聚合；技能上下文超预算时只截断注入内容，原始技能文件与上传材料仍保留在受控存储中。实现参考：[agents_md.rs](https://github.com/openai/codex/blob/main/codex-rs/core/src/agents_md.rs)、[history.rs](https://github.com/openai/codex/blob/main/codex-rs/core/src/context_manager/history.rs)。
+
+图片和扫描 PDF 需要 Tesseract 的 `chi_sim`、`eng` 语言包；`.doc` 需要 LibreOffice。需求材料单文件默认上限为 100 MiB，可用 `AI_STUDIO_MAX_DOCUMENT_BYTES` 调低或提高；multipart 请求上限由 `AI_STUDIO_MAX_DOCUMENT_REQUEST_BYTES`（默认 110 MiB）控制，边缘 Nginx 也必须同步放宽。Skill Runner 不把大文件全文塞入一次模型上下文，而是按 12000 字符窗口分段执行 requirement-analysis，再以 `AI_STUDIO_ANALYSIS_MERGE_BATCH_SIZE`（默认 16）和 `AI_STUDIO_ANALYSIS_MERGE_BATCH_CHARS`（默认 48000）做分层来源聚合；Hub、子 Skill 和 references 的共享总上下文受 `AI_STUDIO_SKILL_CONTEXT_MAX_CHARS`（默认 120000）限制，超预算文件会被标注截断。提取文本默认不截断（`AI_STUDIO_MAX_EXTRACTED_TEXT_CHARS=0`），可设置正数启用硬上限并返回截断警告；浏览器预览默认最多返回 200000 字符，可用 `AI_STUDIO_DOCUMENT_PREVIEW_CHARS` 调整，不影响完整提取文本或原始下载；`AI_STUDIO_MAX_ANALYSIS_CHUNKS`（默认 128）用于防止模型调用失控，超出时应拆分材料。PDF 最多 100 页；`.docx` 会在解析前检查压缩包路径、条目数和解压后大小，拒绝疑似 ZIP 炸弹或路径穿越文件。OCR 和 LibreOffice 转换均有硬超时，超时会终止整个子进程组，避免解析器子进程残留；解析器子进程不会继承应用会话密钥、数据库地址、指标令牌或云服务凭据。AI 生成只提供候选，不替代人工审核；云端模型暂时不可用时可稍后重试，规则候选和手工审核不受影响。
 
 ### 模型选择
 

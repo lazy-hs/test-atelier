@@ -117,3 +117,10 @@ def test_pdfium_renderer_is_closed_after_ocr_pages(monkeypatch):
     assert text == "[第 1 页]\n识别文本"
     assert any(item.startswith("第 1 页使用 OCR") for item in warnings)
     assert renderer.closed is True
+
+
+def test_large_text_is_bounded_with_warning(monkeypatch):
+    monkeypatch.setattr(document_extract, "MAX_EXTRACTED_TEXT_CHARS", 64)
+    text, warnings = document_extract.extract("requirements.md", b"x" * 100)
+    assert len(text) == 64
+    assert any("64" in item and "截取" in item for item in warnings)

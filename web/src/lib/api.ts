@@ -16,6 +16,8 @@ export type WorkboardResponse = { summary: WorkboardSummary; items: WorkItem[] }
 export type ProjectSkill = { skill_id: string; name: string; label: string; source_path: string; description: string; enabled: boolean; updated_at: string }
 export type AiConfig = {
   local_url: string; local_model: string; local_enabled?: boolean; remote_enabled: boolean; remote_url: string; remote_model: string
+  /** Server-enforced requirement document upload limit in bytes. */
+  max_document_bytes?: number
   remote_api_key_set: boolean; remote_api_key_mask: string
   codex_enabled: boolean; codex_command: string; codex_binary?: string; codex_model: string
   claude_enabled: boolean; claude_command: string; claude_model: string

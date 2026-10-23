@@ -208,12 +208,12 @@ def log_cli_availability(component: str = "ai-provider") -> None:
 
 
 class Requirement(BaseModel):
-    id: str
-    title: str
-    summary: str
-    source_ids: list[str]
-    acceptance: list[str]
-    methods: list[str]
+    id: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    summary: str = Field(min_length=1)
+    source_ids: list[str] = Field(min_length=1)
+    acceptance: list[str] = Field(min_length=1)
+    methods: list[str] = Field(min_length=1)
 
 
 class Ambiguity(BaseModel):
@@ -908,6 +908,11 @@ def validate_analysis(output: AnalysisOutput, source_ids: list[str]) -> dict:
     """Validate and normalize analysis output before persistence."""
     if not output.requirements:
         raise ValueError("模型未识别出需求，请核对文档或重新分析")
+    allowed_methods = {"EP", "BVA", "ST", "EG"}
+    if any(not item.acceptance or any(not value.strip() for value in item.acceptance)
+           or not set(item.methods).issubset(allowed_methods)
+           for item in output.requirements):
+        raise ValueError("模型返回了无效验收条件或设计方法")
     if any(not set(item.source_ids).issubset(source_ids) for item in output.requirements):
         raise ValueError("模型返回了不属于当前输入的来源 ID")
     mapped_sources = {source_id for item in output.requirements for source_id in item.source_ids}
@@ -942,11 +947,17 @@ def render_report(result: dict, documents: list[dict]) -> str:
 def validate_cases(cases: list[dict], result: dict) -> None:
     """Validate model or imported skill output before creating project drafts."""
     valid_ids = {item["id"] for item in result.get("requirements", [])}
+    allowed_platforms = {"Pc", "Web", "Android", "IOS"}
     for item in cases:
         if item["priority"] not in {"P0", "P1", "P2", "P3"} or item["smoke"] not in {"", "是", "否"}:
             raise ValueError("模型返回了无效等级或冒烟值")
         if item["method"] not in {"EP", "BVA", "ST", "EG"} or not set(item["requirement_ids"]).issubset(valid_ids):
             raise ValueError("模型返回了无效追溯或设计方法")
+        label = str(item.get("label") or "").strip()
+        if label:
+            tokens = {part.strip() for part in re.split(r"[+,/、|]", label) if part.strip()}
+            if not tokens or not tokens.issubset(allowed_platforms):
+                raise ValueError("模型返回了无效平台标签")
     if valid_ids - {rid for item in cases for rid in item["requirement_ids"]}:
         raise ValueError("生成结果未覆盖全部需求，请重试")
     quality = assess_cases(cases, result)

@@ -28,7 +28,7 @@ from .skill_runner import SkillRunnerError, discover_skills, generate_xmind as g
 from .db import (AiJob, AiModel, AiSettings, AiTool, AnalysisRun, Case, CaseDraft, CodexMessage,
                  CodexSession, ImportBatch, ProjectSkill, SessionLocal, SourceDocument, User, utcnow)
 from .document_extract import extract
-from .observability import monotonic, redact_sensitive_text, request_id as current_request_id
+from .observability import env_int, monotonic, redact_sensitive_text, request_id as current_request_id
 from .storage import open_private_regular_file, write_private_atomic
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,27 @@ def _prompt_texts(job: AiJob) -> list[str]:
     return normalized
 
 DOCUMENT_DIR = Path(os.getenv("AI_STUDIO_DATA_DIR", str(Path(__file__).resolve().parents[1] / "data"))) / "documents"
-MAX_FILE_BYTES = 20 * 1024 * 1024
+# Codex-style document handling keeps the raw upload on disk and feeds the
+# extracted text to the skill runner in bounded chunks.  Keep the limit
+# configurable so deployments can choose a lower ceiling, while allowing
+# requirement packs larger than the historical 20 MB UI limit.
+def _document_limit() -> int:
+    raw = os.getenv("AI_STUDIO_MAX_DOCUMENT_BYTES", str(100 * 1024 * 1024))
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 100 * 1024 * 1024
+
+
+MAX_FILE_BYTES = _document_limit()
+DOCUMENT_PREVIEW_CHARS = env_int("AI_STUDIO_DOCUMENT_PREVIEW_CHARS", 200_000, 1_000)
+
+
+def _document_preview(text: str) -> tuple[str, bool]:
+    """Bound browser/API previews without truncating stored analysis input."""
+    if len(text) <= DOCUMENT_PREVIEW_CHARS:
+        return text, False
+    return text[:DOCUMENT_PREVIEW_CHARS] + "\n\n[预览已截断，原文仍用于分析并可下载]\n", True
 
 # The database is authoritative for session history.  This process-local set
 # only prevents two requests from starting the same session concurrently.
@@ -607,6 +627,7 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
                 "remote_model": settings.remote_model if admin else "",
                 "remote_api_key_set": bool(settings.remote_api_key) if admin else False,
                 "remote_api_key_mask": "已配置" if settings.remote_api_key and admin else "",
+                "max_document_bytes": MAX_FILE_BYTES,
                 "codex_enabled": bool(codex_tool.get("enabled", settings.codex_enabled)),
                 "codex_command": codex_tool.get("command", settings.codex_command) if admin else "",
                 "codex_binary": codex_tool.get("command", settings.codex_command) if admin else "",
@@ -916,7 +937,8 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         filename = Path(file.filename or "").name
         data = await file.read(MAX_FILE_BYTES + 1)
         if len(data) > MAX_FILE_BYTES:
-            raise HTTPException(413, "文件超过 20 MB 限制")
+            limit_mb = max(1, (MAX_FILE_BYTES + 1024 * 1024 - 1) // (1024 * 1024))
+            raise HTTPException(413, f"文件超过 {limit_mb} MB 限制")
         extract_started = monotonic()
         try:
             text, warnings = extract(filename, data)
@@ -950,7 +972,9 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             "warning_count": len(warnings),
             "duration_ms": round((monotonic() - extract_started) * 1000, 2),
         })
-        return {"id": document.id, "filename": document.filename, "text": text, "warnings": warnings}
+        preview, truncated = _document_preview(text)
+        return {"id": document.id, "filename": document.filename, "text": preview,
+                "text_length": len(text), "text_truncated": truncated, "warnings": warnings}
 
     @router.get("/documents")
     def documents(project_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
@@ -965,7 +989,10 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         row = db.get(SourceDocument, document_id)
         if not row or row.project_id != project_id:
             raise HTTPException(404, "文档不存在")
-        return {"id": row.id, "filename": row.filename, "text": row.extracted_text, "warnings": row.warnings}
+        preview, truncated = _document_preview(row.extracted_text)
+        return {"id": row.id, "filename": row.filename, "text": preview,
+                "text_length": len(row.extracted_text), "text_truncated": truncated,
+                "warnings": row.warnings}
 
     @router.get("/documents/{document_id}/download")
     def document_download(project_id: int, document_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):

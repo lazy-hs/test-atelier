@@ -19,6 +19,12 @@ ALLOWED = {".md", ".markdown", ".txt", ".png", ".jpg", ".jpeg", ".webp", ".pdf",
 MAX_DOCX_ENTRIES = 4096
 MAX_DOCX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
 MAX_DOCX_MEMBER_BYTES = 64 * 1024 * 1024
+try:
+    MAX_EXTRACTED_TEXT_CHARS = max(
+        0, int(os.getenv("AI_STUDIO_MAX_EXTRACTED_TEXT_CHARS", "0"))
+    )
+except ValueError:
+    MAX_EXTRACTED_TEXT_CHARS = 0
 
 
 class DocumentExtractTimeout(ValueError):
@@ -212,6 +218,11 @@ def extract(filename: str, content: bytes) -> tuple[str, list[str]]:
             raise
         except Exception as exc:
             raise ValueError("PDF 损坏或无法读取") from exc
+    if MAX_EXTRACTED_TEXT_CHARS and len(text) > MAX_EXTRACTED_TEXT_CHARS:
+        text = text[:MAX_EXTRACTED_TEXT_CHARS]
+        warnings.append(
+            f"可分析文本超过 {MAX_EXTRACTED_TEXT_CHARS:,} 个字符，已按块截取前段内容；原始文件仍可下载"
+        )
     if not text.strip():
         warnings.append("未提取到可分析文字，不能启动 AI 分析")
-    return text[:400_000], warnings
+    return text, warnings

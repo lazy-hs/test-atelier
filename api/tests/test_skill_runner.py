@@ -72,6 +72,23 @@ def test_skill_file_reads_are_bounded(tmp_path):
     assert len(skill_runner._read(source, 128)) == 128
 
 
+def test_skill_context_has_one_total_budget(monkeypatch, tmp_path):
+    root = tmp_path / "skills"
+    (root / "skills" / "hub").mkdir(parents=True)
+    (root / "skills" / "requirement-analysis").mkdir(parents=True)
+    (root / "references").mkdir()
+    (root / "AGENTS.md").write_text("a" * 200, encoding="utf-8")
+    (root / "skills" / "hub" / "SKILL.md").write_text("h" * 200, encoding="utf-8")
+    (root / "skills" / "requirement-analysis" / "SKILL.md").write_text("s" * 200, encoding="utf-8")
+    (root / "references" / "RULES.md").write_text("r" * 200, encoding="utf-8")
+    monkeypatch.setenv("TEST_ATELIER_SKILL_ROOT", str(root))
+    monkeypatch.setattr(skill_runner, "registry_specs", lambda: [skill_runner.SkillSpec(
+        "requirement-analysis", "requirement-analysis", "分析", "skills/requirement-analysis/SKILL.md")])
+    context = skill_runner.load_context("requirement-analysis", ("RULES.md",), total_limit=300)
+    assert len(context) < 700
+    assert "context budget" in context
+
+
 def test_skill_script_cancellation_terminates_child_process(tmp_path, monkeypatch):
     script_root = tmp_path / "skills"
     script_root.mkdir()
@@ -130,6 +147,32 @@ def test_codex_requirement_analysis_prompt_follows_skill_phases(monkeypatch):
     assert "不得生成测试用例 JSON、XMind 或 tmp/cases_*.json" in prompt
 
 
+def test_remote_requirement_analysis_uses_full_skill_context(monkeypatch):
+    captured: list[str] = []
+
+    def fake_context(_skill_id, references=()):
+        return "# skill context\n" + "\n".join(references)
+
+    def fake_model(prompt, _schema, _provider):
+        captured.append(prompt)
+        return {
+            "requirements": [{"id": "REQ-1", "title": "登录", "summary": "账号登录",
+                              "source_ids": ["doc-1"], "acceptance": ["进入首页"], "methods": ["EP"]}],
+            "ambiguities": [], "risks": [],
+        }
+
+    monkeypatch.setattr(skill_runner, "load_context", fake_context)
+    monkeypatch.setattr(skill_runner, "load_memory_context", lambda: "# .memory snapshots")
+    monkeypatch.setattr(skill_runner, "skill_root", lambda: Path("/skills"))
+    skill_runner.analyze([{"id": "doc-1", "filename": "login.md", "text": "# Login"}], "remote", fake_model)
+
+    prompt = captured[0]
+    assert "TEST-DESIGN-METHODS.md" in prompt
+    assert "MEMORY-SCHEMA.md" in prompt
+    assert ".memory snapshots" in prompt
+    assert "不使用本地模型" in prompt
+
+
 def test_codex_test_case_prompt_follows_skill_workflow(monkeypatch):
     captured: list[str] = []
 
@@ -164,3 +207,35 @@ def test_codex_test_case_prompt_follows_skill_workflow(monkeypatch):
     assert ".memory snapshots" in prompt
     assert "[风险点, 风险类别]" in prompt
     assert "不输出解释、Markdown 围栏、XMind 或临时文件" in prompt
+    assert "需求覆盖率必须达到 100%" in prompt
+
+
+def test_requirement_analysis_accepts_more_than_32_bounded_chunks(monkeypatch):
+    """Large Codex-style documents are windowed instead of rejected at 32 chunks."""
+    monkeypatch.setenv("AI_STUDIO_MAX_ANALYSIS_CHUNKS", "64")
+    calls = []
+
+    def fake_model(prompt, _schema, _provider):
+        calls.append(prompt)
+        return {"requirements": [{"id": "REQ-1", "title": "内容", "summary": "分块内容",
+                                  "source_ids": ["doc-1"], "acceptance": ["可分析"], "methods": ["EP"]}],
+                "ambiguities": [], "risks": []}
+
+    text = "x" * (12_000 * 33)
+    result = skill_runner.analyze([{"id": "doc-1", "filename": "large.md", "text": text}], "remote", fake_model)
+    assert result["source_ids"] == ["doc-1"]
+    # 33 windows are reconciled through a bounded merge tree rather than one
+    # oversized prompt (three first-round batches plus the final merge).
+    assert len(calls) == 37
+
+
+def test_case_validation_rejects_unknown_platform_label():
+    result = {"requirements": [{"id": "REQ-1"}], "risks": []}
+    cases = [{
+        "module": ["登录"], "title": "有效登录", "priority": "P1",
+        "precondition": "有账号", "steps": [{"action": "输入账号", "expected": "进入首页"}],
+        "requirement_ids": ["REQ-1"], "method": "EP", "label": "Desktop",
+        "remark": "", "smoke": "",
+    }]
+    with pytest.raises(ValueError, match="平台标签"):
+        ai_engine.validate_cases(cases, result)

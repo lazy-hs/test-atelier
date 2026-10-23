@@ -59,6 +59,13 @@ LOGIN_FAILURE_LIMIT = env_int("AI_STUDIO_LOGIN_FAILURE_LIMIT", 8, 1)
 LOGIN_FAILURE_WINDOW_SECONDS = env_float("AI_STUDIO_LOGIN_FAILURE_WINDOW_SECONDS", 60, 1.0)
 _login_failures = FailureWindow(LOGIN_FAILURE_LIMIT, LOGIN_FAILURE_WINDOW_SECONDS)
 MAX_REQUEST_BYTES = env_int("AI_STUDIO_MAX_REQUEST_BYTES", 25 * 1024 * 1024, 1)
+# Multipart requirement uploads are intentionally allowed to exceed the
+# generic JSON request ceiling.  The document endpoint still enforces its own
+# bounded file limit and parser quotas; this only prevents the ASGI guard from
+# rejecting a 100 MB upload before FastAPI can inspect it.
+MAX_DOCUMENT_REQUEST_BYTES = env_int(
+    "AI_STUDIO_MAX_DOCUMENT_REQUEST_BYTES", 110 * 1024 * 1024, 1
+)
 SESSION_MAX_AGE = env_int("AI_STUDIO_SESSION_MAX_AGE", 28800, 300)
 _ready_for_traffic = False
 _readiness_log_lock = threading.Lock()
@@ -746,6 +753,12 @@ async def request_logging(request: Request, call_next):
         # the ASGI receive channel as a second line of defense so large
         # streamed JSON bodies cannot bypass the global request limit.
         original_receive = request._receive
+        # Keep the larger limit scoped to document uploads; all other routes
+        # retain the conservative global request ceiling.
+        request_limit = (MAX_DOCUMENT_REQUEST_BYTES
+                         if request.method in {"POST", "PUT", "PATCH"}
+                         and request.url.path.rstrip("/").endswith("/documents")
+                         else MAX_REQUEST_BYTES)
         received_bytes = 0
         declared_bytes = None
 
@@ -754,7 +767,7 @@ async def request_logging(request: Request, call_next):
             message = await original_receive()
             if message.get("type") == "http.request":
                 received_bytes += len(message.get("body") or b"")
-                if received_bytes > MAX_REQUEST_BYTES:
+                if received_bytes > request_limit:
                     raise RequestBodyTooLarge()
             return message
 
@@ -763,7 +776,7 @@ async def request_logging(request: Request, call_next):
         if content_length:
             try:
                 declared_bytes = int(content_length)
-                too_large = declared_bytes > MAX_REQUEST_BYTES
+                too_large = declared_bytes > request_limit
             except ValueError:
                 too_large = False
             if too_large:

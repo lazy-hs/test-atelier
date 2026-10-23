@@ -156,7 +156,14 @@ export TEST_ATELIER_SKILL_ROOT=/Users/lazy/huangsheng/project/qa-doc-skills
 | `AI_STUDIO_WORKER_LEASE_SECONDS` | `900` | 外部 worker 数据库租约时长；必须大于 CLI 和技能脚本超时，租约过期后存活 worker 会在轮询中恢复任务 |
 | `AI_STUDIO_WORKER_ERROR_LOG_INTERVAL_SECONDS` | `30` | worker 基础设施错误日志的限流窗口；同类数据库、心跳或租约错误在窗口内合并，避免故障时刷满日志 |
 | `AI_STUDIO_LOGIN_FAILURE_LIMIT` / `AI_STUDIO_LOGIN_FAILURE_WINDOW_SECONDS` | `8` / `60` | 单进程登录失败窗口；生产环境仍应在反向代理按客户端地址限流 |
-| `AI_STUDIO_MAX_REQUEST_BYTES` | `26214400` | API 请求体上限（同时检查 Content-Length 和分块流）；上传接口自身限制单文件 20 MB |
+| `AI_STUDIO_MAX_REQUEST_BYTES` | `26214400` | 普通 API 请求体上限（同时检查 Content-Length 和分块流） |
+| `AI_STUDIO_MAX_DOCUMENT_BYTES` | `104857600` | 需求材料单文件上限（默认 100 MiB）；上传接口以流式请求上限和解析器配额双重限制 |
+| `AI_STUDIO_MAX_DOCUMENT_REQUEST_BYTES` | `115343360` | 需求材料 multipart 请求体上限（默认 110 MiB，应略高于单文件上限） |
+| `AI_STUDIO_MAX_EXTRACTED_TEXT_CHARS` / `AI_STUDIO_MAX_ANALYSIS_CHUNKS` | `0` / `128` | 大文件提取文本和分析窗口配额；提取文本默认不截断以避免遗漏，设置为正数可启用硬上限；Skill Runner 按 12000 字符窗口逐段调用并分层聚合，超出分析窗口配额时提示拆分 |
+| `AI_STUDIO_DOCUMENT_PREVIEW_CHARS` | `200000` | 浏览器预览返回的字符上限；不影响数据库中的完整提取文本或原始文件下载 |
+| `AI_STUDIO_ANALYSIS_MERGE_BATCH_SIZE` | `16` | 大文档分析结果每轮聚合批量，避免把所有分片结果一次性塞入模型上下文 |
+| `AI_STUDIO_ANALYSIS_MERGE_BATCH_CHARS` | `48000` | 聚合批次 JSON 的字符预算；与批次数量上限同时生效 |
+| `AI_STUDIO_SKILL_CONTEXT_MAX_CHARS` | `120000` | Hub、子 Skill 和 references 的共享总上下文预算；超出时按文件顺序截断并在提示词中标注 |
 | `AI_STUDIO_TRUST_PROXY_HEADERS` | `0` | 仅受控反向代理部署设为 `1`，让登录失败防护使用 `X-Real-IP`；直连 API 必须保持 `0` |
 | `COOKIE_SECURE` | `0` | 仅 HTTPS 反向代理时设为 `1`；生产前置检查强制要求为 `1` |
 | `LOG_LEVEL` / `LOG_FORMAT` / `LOG_INCLUDE_TRACEBACK` | `INFO` / `json` / `0` | API 日志级别、输出格式和是否包含脱敏 traceback；生产默认不输出完整异常栈 |

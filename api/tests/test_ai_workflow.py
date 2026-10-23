@@ -478,3 +478,22 @@ def test_multidocument_dedup_and_quality_gate(monkeypatch):
     duplicate = [{"module": ["登录"], "title": "同名", "requirement_ids": ["REQ-1"], "method": "EP",
                   "steps": [{"action": "操作", "expected": "结果"}]}] * 2
     assert "存在重复的模块/用例标题" in ai_engine.assess_cases(duplicate, result)["errors"]
+
+
+def test_document_upload_accepts_requirement_pack_over_20mb(context, monkeypatch):
+    client, headers, root = context
+    # Keep this focused on the historical 20 MB boundary while using a tiny
+    # parser payload (the extractor caps model text separately).
+    monkeypatch.setattr(ai_routes, "MAX_FILE_BYTES", 21 * 1024 * 1024)
+    payload = b"# Requirement\n" + (b"x" * (20 * 1024 * 1024 + 1))
+    response = client.post(f"{root}/documents", files={"file": ("large.md", payload)}, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["filename"] == "large.md"
+
+
+def test_document_upload_reports_configured_limit(context, monkeypatch):
+    client, headers, root = context
+    monkeypatch.setattr(ai_routes, "MAX_FILE_BYTES", 1)
+    response = client.post(f"{root}/documents", files={"file": ("large.md", b"ab")}, headers=headers)
+    assert response.status_code == 413
+    assert "1 MB" in response.json()["detail"]

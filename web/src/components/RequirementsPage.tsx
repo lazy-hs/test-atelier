@@ -2,13 +2,15 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { AlertCircle, ArrowRight, Check, Eye, FileText, PencilLine, Plus, RefreshCw, Save, Upload } from 'lucide-react'
+import { AlertCircle, ArrowRight, Check, Eye, FileText, Loader2, PencilLine, Plus, RefreshCw, Save, Upload } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Badge } from '@/components/ui/badge'
 import { api, formatAiError, type AiConfig, type AiJob, type Analysis, type SourceDocument } from '@/lib/api'
 import { PromptViewerDialog } from '@/components/PromptViewerDialog'
+
+type UploadItem = { id: string; name: string; size: number; status: 'queued' | 'uploading' | 'done' | 'rejected' | 'failed' }
 
 export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { projectId: number; readonly: boolean; onOpenAuthoring: () => void }) {
   const [documents, setDocuments] = useState<SourceDocument[]>([])
@@ -19,7 +21,7 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
   const [analysisId, setAnalysisId] = useState('')
   const [analysis, setAnalysis] = useState<Analysis | null>(null)
   const [jobs, setJobs] = useState<AiJob[]>([])
-  const [model, setModel] = useState<Pick<AiConfig, 'remote_enabled' | 'codex_enabled' | 'claude_enabled'> | null>(null)
+  const [model, setModel] = useState<Pick<AiConfig, 'remote_enabled' | 'codex_enabled' | 'claude_enabled' | 'max_document_bytes'> | null>(null)
   const [provider, setProvider] = useState('remote')
   const [reportText, setReportText] = useState('')
   const [decisions, setDecisions] = useState<Record<string, string>>({})
@@ -28,6 +30,7 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
   const [notice, setNotice] = useState('')
   const [promptOpen, setPromptOpen] = useState(false)
   const [reportMode, setReportMode] = useState<'preview' | 'edit'>('preview')
+  const [uploadItems, setUploadItems] = useState<UploadItem[]>([])
   const reportRevision = useRef('')
   const input = useRef<HTMLInputElement>(null)
   const base = `/projects/${projectId}`
@@ -35,7 +38,7 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
   const refresh = useCallback(async () => {
     const [docs, runs, config] = await Promise.all([
       api<SourceDocument[]>(`${base}/documents`), api<Analysis[]>(`${base}/analyses`),
-      api<Pick<AiConfig, 'remote_enabled' | 'codex_enabled' | 'claude_enabled'>>(`${base}/ai/config`),
+      api<Pick<AiConfig, 'remote_enabled' | 'codex_enabled' | 'claude_enabled' | 'max_document_bytes'>>(`${base}/ai/config`),
     ])
     setDocuments(docs); setAnalyses(runs); setModel(config)
     setAnalysisId(previous => previous || runs[0]?.id || '')
@@ -80,20 +83,51 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
     return () => { active = false; window.clearInterval(interval) }
   }, [analysisId, base])
 
+  const updateUploadItem = (id: string, status: UploadItem['status']) => {
+    setUploadItems(previous => previous.map(item => item.id === id ? { ...item, status } : item))
+  }
+
   async function uploadFiles(files: FileList | null) {
     if (!files?.length) return
     setBusy(true); setError(''); setNotice('')
+    const selected = Array.from(files)
+    const maxDocumentBytes = model?.max_document_bytes ?? 100 * 1024 * 1024
+    const maxDocumentLabel = `${Math.round(maxDocumentBytes / 1024 / 1024)} MB`
+    const items: UploadItem[] = selected.map((file, index) => ({ id: `${Date.now()}-${index}`, name: file.name, size: file.size, status: file.size > maxDocumentBytes ? 'rejected' : 'queued' }))
+    setUploadItems(items)
+    const oversized = selected.filter(file => file.size > maxDocumentBytes)
+    const valid = selected.filter(file => file.size <= maxDocumentBytes)
+    if (oversized.length) setError(`${oversized.map(file => file.name).join('、')} 超过 ${maxDocumentLabel} 限制，已跳过上传`)
+    if (!valid.length) { setBusy(false); if (input.current) input.current.value = ''; return }
     try {
       const ids: string[] = []
-      for (const file of Array.from(files)) {
+      const failed: string[] = []
+      for (const [index, file] of selected.entries()) {
+        if (file.size > maxDocumentBytes) continue
+        const item = items[index]
+        if (item) updateUploadItem(item.id, 'uploading')
         const form = new FormData(); form.append('file', file)
-        const result = await api<{ id: string }>(`${base}/documents`, { method: 'POST', body: form })
-        ids.push(result.id)
+        try {
+          const result = await api<{ id: string }>(`${base}/documents`, { method: 'POST', body: form })
+          ids.push(result.id)
+          if (item) updateUploadItem(item.id, 'done')
+        } catch (cause) {
+          failed.push(`${file.name}：${(cause as Error).message}`)
+          if (item) updateUploadItem(item.id, 'failed')
+        }
       }
-      await refresh(); setSelectedIds(ids); setDocumentId(ids.at(-1) ?? ''); setAnalysisId('')
-      setNotice(`已上传 ${ids.length} 份文档，请核对提取内容`)
-    } catch (cause) { setError((cause as Error).message) } finally { setBusy(false); if (input.current) input.current.value = '' }
+      if (ids.length) {
+        await refresh(); setSelectedIds(ids); setDocumentId(ids.at(-1) ?? ''); setAnalysisId('')
+        setNotice(`已上传 ${ids.length} 份文档，请核对提取内容`)
+      }
+      if (failed.length) setError(previous => [previous, ...failed].filter(Boolean).join('；'))
+    } catch (cause) {
+      setError(previous => [previous, (cause as Error).message].filter(Boolean).join('；'))
+    } finally { setBusy(false); if (input.current) input.current.value = '' }
   }
+
+  const formatUploadSize = (size: number) => size >= 1024 * 1024 ? `${(size / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(size / 1024))} KB`
+  const uploadLimitLabel = `${Math.round((model?.max_document_bytes ?? 100 * 1024 * 1024) / 1024 / 1024)} MB`
   useEffect(() => {
     if (!documentId) return
     let active = true
@@ -156,8 +190,17 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
     {notice && <div className="ai-alert" role="status">{notice}</div>}
     <div className="ai-columns">
       <aside className="ai-rail">
-        <div className="ai-rail-heading"><h2>需求材料</h2><Button variant="outline" size="sm" onClick={() => input.current?.click()} disabled={readonly || busy}><Plus data-icon="inline-start" />上传</Button></div>
+        <div className="ai-rail-heading"><div><h2>需求材料</h2><p className="ai-upload-limit-note">单文件最大 {uploadLimitLabel} · Codex 将分块读取大文档</p></div><Button variant="outline" size="sm" onClick={() => input.current?.click()} disabled={readonly || busy}><Plus data-icon="inline-start" />上传</Button></div>
         <input ref={input} type="file" multiple hidden accept=".md,.markdown,.txt,.png,.jpg,.jpeg,.webp,.pdf,.doc,.docx" onChange={event => void uploadFiles(event.target.files)} />
+        <AnimatePresence initial={false}>
+          {uploadItems.length > 0 && <motion.div className="ai-upload-queue" role="status" aria-live="polite" initial={{ opacity: 0, height: 0, y: -4 }} animate={{ opacity: 1, height: 'auto', y: 0 }} exit={{ opacity: 0, height: 0, y: -4 }}>
+            <div className="ai-upload-queue-head"><span>上传队列</span><button type="button" onClick={() => setUploadItems([])} disabled={busy}>清除</button></div>
+            {uploadItems.map(item => <motion.div className={`ai-upload-item is-${item.status}`} key={item.id} initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 8 }}>
+              <span className="ai-upload-item-name" title={item.name}>{item.name}</span><small>{formatUploadSize(item.size)}</small>
+              <span className="ai-upload-item-status">{item.status === 'uploading' ? <><Loader2 size={12} className="spin" />上传中</> : item.status === 'done' ? '已完成' : item.status === 'rejected' ? '超过大小限制' : item.status === 'failed' ? '失败' : '等待中'}</span>
+            </motion.div>)}
+          </motion.div>}
+        </AnimatePresence>
         {documents.length ? documents.map(doc => <div className="ai-document" key={doc.id}>
           <input type="checkbox" aria-label={`选择 ${doc.filename}`} checked={selectedIds.includes(doc.id)} onChange={event => setSelectedIds(previous => event.target.checked ? [...previous, doc.id] : previous.filter(id => id !== doc.id))} />
           <button className={documentId === doc.id && !analysisId ? 'is-active' : ''} onClick={() => { setDocumentId(doc.id); setAnalysisId('') }}><FileText size={15} /><span>{doc.filename}</span></button>
