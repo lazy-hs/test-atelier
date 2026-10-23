@@ -130,7 +130,7 @@ API 和 Nginx 同时返回同源 Content-Security-Policy（禁止插件、内联
 4. 修复配置或依赖后查看 `worker.jobs.recovered`、`ai_job.succeeded`/`ai_job.failed`，确认任务最终状态和容量计数回落。
 5. 迁移或恢复前先执行备份并用 `scripts/backup_data.py verify` 校验归档；恢复后重新执行 ready、worker、日志契约和业务只读 smoke。
 
-Worker 停止或租约失效时，CLI 子进程会被进程组终止；Ollama/远程 HTTP
+Worker 停止或租约失效时，CLI 子进程会被进程组终止；远程 HTTP
 请求会在可取消的守护线程中等待，因此不会把 180 秒 provider 超时带入
 `AI_STUDIO_SHUTDOWN_TIMEOUT` 的停止宽限。OCR 与 LibreOffice 文档转换同样在
 独立进程组中运行，超时会回收整个进程组，且解析器环境会移除应用和云服务凭据。任务不会在取消路径伪造成功或失败，

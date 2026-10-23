@@ -33,7 +33,7 @@ def context():
 def test_admin_can_save_masked_settings_and_reader_cannot(context):
     client, headers, root = context
     initial = client.get(f"{root}/ai/admin-config").json()
-    assert initial["local_model"] == "qwen3:8b" and initial["remote_enabled"] is False
+    assert initial["local_model"] == "" and initial["local_enabled"] is False and initial["remote_enabled"] is False
     secret = "sk-test-secret"
     payload = {"local_url": "http://127.0.0.1:11434", "local_model": "qwen3:14b", "remote_enabled": True,
                "remote_url": "https://example.com/v1", "remote_model": "remote-model", "remote_api_key": secret,
@@ -42,7 +42,7 @@ def test_admin_can_save_masked_settings_and_reader_cannot(context):
     saved = client.put(f"{root}/ai/admin-config", json=payload, headers=headers)
     assert saved.status_code == 200, saved.text
     body = saved.json()
-    assert body["local_model"] == "qwen3:14b" and body["remote_enabled"] is True
+    assert body["local_model"] == "" and body["local_enabled"] is False and body["remote_enabled"] is True
     assert body["remote_api_key_set"] is True and secret not in saved.text
     assert body["codex_enabled"] is True and body["codex_model"] == "gpt-test"
     assert body["claude_enabled"] is True and body["claude_model"] == "sonnet-test"
@@ -396,6 +396,6 @@ def test_new_database_seeds_provider_settings_from_environment(monkeypatch):
         assert client.get("/api/v1/health/ready").status_code == 200
     with SessionLocal() as db:
         settings = db.get(AiSettings, 1)
-        assert settings.local_model == "qwen3:14b"
+        assert settings.local_model == ""
         assert settings.codex_enabled is True and settings.codex_model == "gpt-test"
         assert settings.remote_enabled is True and ai_engine.decrypt_secret(settings.remote_api_key) == "sk-seeded"

@@ -42,7 +42,7 @@
 api/                    后端包
   main.py               应用装配 + 内联端点（2111 行）+ 权限依赖
   db.py                 全部 ORM 模型（639 行 / 34 张表）
-  ai_engine.py          模型 provider 抽象（Ollama / 远程 / Codex CLI / Claude Code）
+  ai_engine.py          模型 provider 抽象（远程云端 API / Codex CLI / Claude Code）
   ai_jobs.py            AI 任务持久化、入队、容量预留、恢复
   worker.py             独立 worker 进程（数据库即队列 + 租约 + 心跳）
   skill_runner.py       外部 qa-doc-skills 技能仓发现与脚本执行

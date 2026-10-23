@@ -62,9 +62,10 @@ def upgrade():
             pass
         if not isinstance(catalog, list):
             catalog = []
-        if not any(isinstance(item, dict) and item.get("id") == "local" for item in catalog):
-            catalog.insert(0, {"id": "local", "kind": "local", "name": "本机 Ollama",
-                               "endpoint": settings.get("local_url") or "", "model": settings.get("local_model") or "qwen3:8b", "enabled": True})
+        # Local model entries are intentionally not materialized anymore.
+        # Legacy singleton columns remain readable for migration compatibility,
+        # but new catalogs contain cloud endpoints only.
+        catalog = [item for item in catalog if not (isinstance(item, dict) and item.get("kind") == "local")]
         if settings.get("remote_enabled") and not any(isinstance(item, dict) and item.get("id") == "remote" for item in catalog):
             catalog.append({"id": "remote", "kind": "remote", "name": "远程模型",
                             "endpoint": settings.get("remote_url") or "", "model": settings.get("remote_model") or "", "enabled": True})

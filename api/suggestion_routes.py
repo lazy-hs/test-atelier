@@ -32,7 +32,10 @@ class CaseIds(BaseModel):
 
 
 class ModelRequest(CaseIds):
-    provider: Literal["local", "remote", "codex", "codex_cli", "claude", "claude_code"] = "local"
+    # Inference is cloud-only. Legacy ``local``/``ollama`` values are no
+    # longer accepted at the API boundary; queued historical jobs are still
+    # normalized by ``ai_engine.request_structured``.
+    provider: Literal["remote", "codex", "codex_cli", "claude", "claude_code"] = "remote"
 
 
 class SuggestionChoice(BaseModel):
@@ -222,8 +225,6 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_m
             payload.provider = "codex_cli"
         if payload.provider == "claude":
             payload.provider = "claude_code"
-        if payload.provider == "local" and not ai_engine.LOCAL_ENABLED:
-            raise HTTPException(403, "本地模型未由管理员启用")
         if payload.provider == "remote" and (user.role != "admin" or not ai_engine.REMOTE_ENABLED):
             raise HTTPException(403, "远程模型未由管理员启用")
         if payload.provider == "codex_cli" and not ai_engine.CODEX_ENABLED:

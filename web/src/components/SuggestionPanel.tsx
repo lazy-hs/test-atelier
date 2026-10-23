@@ -20,8 +20,7 @@ export function SuggestionPanel({ projectId, item, canDecide, refreshSignal, onA
   const [version, setVersion] = useState<TaxonomyVersion | null>(null)
   const [choice, setChoice] = useState<Choice | null>(null)
   const [reason, setReason] = useState('')
-  const [provider, setProvider] = useState('local')
-  const [localEnabled, setLocalEnabled] = useState(true)
+  const [provider, setProvider] = useState('remote')
   const [remoteEnabled, setRemoteEnabled] = useState(false)
   const [codexEnabled, setCodexEnabled] = useState(false)
   const [claudeEnabled, setClaudeEnabled] = useState(false)
@@ -40,9 +39,8 @@ export function SuggestionPanel({ projectId, item, canDecide, refreshSignal, onA
     void Promise.all([load(), api<Pick<AiConfig, 'local_enabled' | 'remote_enabled' | 'codex_enabled' | 'claude_enabled'>>(`${base}/ai/config`),
       api<SuggestionJob[]>(`${base}/suggestion-jobs`)]).then(([, config, jobs]) => {
         if (active) {
-          const nextLocal = config.local_enabled !== false
-          setLocalEnabled(nextLocal); setRemoteEnabled(config.remote_enabled); setCodexEnabled(Boolean(config.codex_enabled)); setClaudeEnabled(Boolean(config.claude_enabled))
-          if (!nextLocal) setProvider(current => current === 'local' ? (config.remote_enabled ? 'remote' : config.codex_enabled ? 'codex' : config.claude_enabled ? 'claude' : 'local') : current)
+          setRemoteEnabled(config.remote_enabled); setCodexEnabled(Boolean(config.codex_enabled)); setClaudeEnabled(Boolean(config.claude_enabled))
+          setProvider(current => current === 'local' ? (config.remote_enabled ? 'remote' : config.codex_enabled ? 'codex' : config.claude_enabled ? 'claude' : 'remote') : current)
           setJob(jobs.find(value => value.case_ids.includes(item.id) && (value.status === 'queued' || value.status === 'running' || value.status === 'failed' || value.status === 'partial')) ?? null)
         }
       }).catch(cause => { if (active) setError(cause.message) })
@@ -113,7 +111,7 @@ export function SuggestionPanel({ projectId, item, canDecide, refreshSignal, onA
   return <div className="suggestion-panel">
     <div className="section-caption">用例建议 <span>{suggestions.length} 条</span></div>
     <div className="suggestion-actions"><Button variant="outline" size="sm" disabled={!canDecide || busy} onClick={() => void generateRule()}>规则建议</Button>
-      {(localEnabled || remoteEnabled || codexEnabled || claudeEnabled) && <Select value={provider} onValueChange={setProvider}><SelectTrigger aria-label="建议模型来源"><SelectValue /></SelectTrigger><SelectContent><SelectGroup>{localEnabled && <SelectItem value="local">本地模型</SelectItem>}{remoteEnabled && <SelectItem value="remote">远程模型</SelectItem>}{codexEnabled && <SelectItem value="codex">Codex CLI（本机）</SelectItem>}{claudeEnabled && <SelectItem value="claude">Claude Code（本机）</SelectItem>}</SelectGroup></SelectContent></Select>}
+      {(remoteEnabled || codexEnabled || claudeEnabled) && <Select value={provider} onValueChange={setProvider}><SelectTrigger aria-label="建议模型来源"><SelectValue /></SelectTrigger><SelectContent><SelectGroup>{remoteEnabled && <SelectItem value="remote">远程模型</SelectItem>}{codexEnabled && <SelectItem value="codex">Codex CLI（本机）</SelectItem>}{claudeEnabled && <SelectItem value="claude">Claude Code（本机）</SelectItem>}</SelectGroup></SelectContent></Select>}
       <Button variant="outline" size="sm" disabled={!canDecide || busy} onClick={() => void generateModel()}><Sparkles data-icon="inline-start" />AI 建议</Button></div>
     {job && <div className={`suggestion-job ${['failed', 'partial'].includes(job.status) ? 'is-error' : ''}`} role="status">
       <span>{job.status === 'done' ? 'AI 建议完成' : job.status === 'failed' ? 'AI 建议失败' : job.status === 'partial' ? '部分失败' : `AI 建议处理中 ${job.completed}/${job.total}`}</span>

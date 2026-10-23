@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test'
 
 test('需求分析确认后编写、导出与发布用例', async ({ page }) => {
-  if (!process.env.AI_STUDIO_E2E_MODEL_STUB) test.skip(true, 'Run with the local Ollama test stub')
+  if (!process.env.AI_STUDIO_E2E_MODEL_STUB) test.skip(true, 'Set AI_STUDIO_E2E_MODEL_STUB for the cloud API test stub')
   const errors: string[] = []
   page.on('pageerror', error => errors.push(error.message))
   page.on('dialog', dialog => void dialog.accept())

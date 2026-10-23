@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test'
 import path from 'node:path'
 
 test('模型候选只在人工接受后写入最终值', async ({ page }) => {
-  if (!process.env.AI_STUDIO_E2E_MODEL_STUB) test.skip(true, 'Run with the local Ollama test stub')
+  if (!process.env.AI_STUDIO_E2E_MODEL_STUB) test.skip(true, 'Set AI_STUDIO_E2E_MODEL_STUB for the cloud API test stub')
   const errors: string[] = []
   page.on('pageerror', error => errors.push(error.message))
   await page.goto('/')
@@ -15,7 +15,7 @@ test('模型候选只在人工接受后写入最终值', async ({ page }) => {
   await page.getByRole('button', { name: '用例库' }).first().click()
   await expect(page.getByRole('heading', { name: '用例审核' })).toBeVisible()
   await page.locator('header.topbar').getByRole('button', { name: '导入用例' }).click()
-  await page.locator('input[type=file]').setInputFiles(path.resolve(process.env.AI_STUDIO_E2E_SAMPLE || '/Users/lazy/Downloads/UGOS_PRO_测试用例_20261015141029.xls'))
+  await page.locator('input[type=file]').setInputFiles(path.resolve(process.env.AI_STUDIO_E2E_SAMPLE || 'e2e/fixtures/UGOS_PRO_sample.xlsx'))
   await page.getByRole('button', { name: '确认导入 100 条' }).click()
   await page.getByText('001252040').first().click()
   await page.getByRole('tab', { name: '建议' }).click()

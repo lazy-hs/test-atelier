@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 
-test('管理员配置本地与远程模型', async ({ page }) => {
+test('管理员配置云端模型连接', async ({ page }) => {
   const password = process.env.AI_STUDIO_E2E_PASSWORD
   if (!password) test.skip(true, 'Set AI_STUDIO_E2E_PASSWORD')
   const errors: string[] = []
@@ -24,12 +24,10 @@ test('管理员配置本地与远程模型', async ({ page }) => {
   await expect(page.getByText('仅全局管理员可见')).toBeVisible()
   await expect(page.getByRole('button', { name: /Codex CLI/ })).toHaveCount(0)
   await expect(page.getByRole('button', { name: /Claude Code/ })).toHaveCount(0)
-  const localProvider = page.locator('.provider-row').filter({ hasText: '本机 Ollama' }).first()
-  if (!(await localProvider.getAttribute('class'))?.includes('is-muted')) await localProvider.locator('.provider-switch').click()
-  await expect(localProvider).toHaveClass(/is-muted/)
+  await expect(page.locator('.provider-row').filter({ hasText: '本机 Ollama' })).toHaveCount(0)
   await page.getByRole('button', { name: '保存配置' }).click()
-  await expect(page.getByText('模型配置已保存并立即生效')).toBeVisible()
-  await page.getByRole('button', { name: '添加供应商' }).click()
+  await expect(page.getByText('模型连接与 AI 工具配置已保存并立即生效')).toBeVisible()
+  await page.getByRole('button', { name: '添加连接' }).click()
   await expect(page.getByRole('heading', { name: '自定义供应商' })).toBeVisible()
   await page.getByLabel('供应商名称').fill('E2E Relay')
   await page.getByLabel('供应商 Base URL').fill('https://example.com/v1')
@@ -43,14 +41,14 @@ test('管理员配置本地与远程模型', async ({ page }) => {
   await expect(page.getByText('已检测 1 个模型 1 个可用')).toBeVisible()
   await page.getByRole('button', { name: '添加', exact: true }).click()
   await page.getByRole('button', { name: '保存配置' }).click()
-  await expect(page.getByText('模型配置已保存并立即生效')).toBeVisible()
+  await expect(page.getByText('模型连接与 AI 工具配置已保存并立即生效')).toBeVisible()
   await expect(page.getByText('E2E Relay').first()).toBeVisible()
   await page.getByRole('button', { name: /E2E Relay/ }).first().click()
   await expect(page.getByRole('heading', { name: '编辑供应商' })).toBeVisible()
   await page.getByLabel('供应商名称').fill('E2E Relay Updated')
   await page.getByRole('button', { name: '保存', exact: true }).click()
   await page.getByRole('button', { name: '保存配置' }).click()
-  await expect(page.getByText('模型配置已保存并立即生效')).toBeVisible()
+  await expect(page.getByText('模型连接与 AI 工具配置已保存并立即生效')).toBeVisible()
   await page.getByRole('button', { name: /E2E Relay Updated/ }).first().click()
   await expect(page.getByRole('heading', { name: '编辑供应商' })).toBeVisible()
   await page.getByRole('button', { name: '复制', exact: true }).click()
@@ -60,7 +58,7 @@ test('管理员配置本地与远程模型', async ({ page }) => {
   await page.getByRole('button', { name: '移除', exact: true }).click()
   await expect(page.getByText('供应商已移除 点击保存配置后生效')).toBeVisible()
   await page.getByRole('button', { name: '保存配置' }).click()
-  await expect(page.getByText('模型配置已保存并立即生效')).toBeVisible()
+  await expect(page.getByText('模型连接与 AI 工具配置已保存并立即生效')).toBeVisible()
   await page.getByLabel('选择测试 provider').selectOption('remote')
   await page.getByRole('button', { name: '测试连接' }).click()
   await expect(page.getByText(/无法连接|模型服务无法连接/)).toBeVisible({ timeout: 10000 })

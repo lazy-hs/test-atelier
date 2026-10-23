@@ -86,11 +86,11 @@ def _load_ai_config(*, log_availability: bool = True) -> None:
             return
         model_rows = {row.provider_id: row for row in db.scalars(select(AiModel)).all()}
         tool_rows = {row.tool_id: row for row in db.scalars(select(AiTool)).all()}
-        local_row, remote_row = model_rows.get("local"), model_rows.get("remote")
+        remote_row = model_rows.get("remote")
         codex_row, claude_row = tool_rows.get("codex_cli"), tool_rows.get("claude_code")
-        local_url = local_row.endpoint if local_row else settings.local_url
-        local_model = local_row.model if local_row else settings.local_model
-        local_enabled = local_row.enabled if local_row else ai_engine.catalog_provider_enabled(settings.providers_json, "local")
+        local_url = ""
+        local_model = ""
+        local_enabled = False
         remote_enabled = remote_row.enabled if remote_row else settings.remote_enabled
         remote_url = remote_row.endpoint if remote_row else settings.remote_url
         remote_model = remote_row.model if remote_row else settings.remote_model

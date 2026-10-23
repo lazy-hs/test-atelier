@@ -27,8 +27,8 @@ def test_model_and_tool_catalogs_are_persisted_in_separate_tables(context):
     client, headers, root = context
     secret = "sk-normalized-secret"
     payload = {
-        "local_url": "http://127.0.0.1:11434",
-        "local_model": "qwen3:8b",
+        "local_url": "",
+        "local_model": "",
         "remote_enabled": True,
         "remote_url": "https://relay.example/v1",
         "remote_model": "relay-model",
@@ -40,9 +40,6 @@ def test_model_and_tool_catalogs_are_persisted_in_separate_tables(context):
         "claude_command": "claude",
         "claude_model": "sonnet-test",
         "providers": [
-            {"id": "local", "kind": "local", "name": "本机 Ollama",
-             "endpoint": "http://127.0.0.1:11434", "model": "qwen3:8b",
-             "enabled": True, "protocol": "openai"},
             {"id": "relay", "kind": "remote", "name": "Relay",
              "endpoint": "https://relay.example/v1", "model": "relay-model",
              "enabled": True, "protocol": "openai", "api_key": secret},
@@ -62,8 +59,8 @@ def test_model_and_tool_catalogs_are_persisted_in_separate_tables(context):
         tools = db.scalars(select(AiTool).order_by(AiTool.tool_id)).all()
         settings = db.get(AiSettings, 1)
         assert settings is not None
-        assert {row.provider_id for row in models} == {"local", "relay"}
-        assert {row.scope for row in models} == {"local", "remote"}
+        assert {row.provider_id for row in models} == {"relay"}
+        assert {row.scope for row in models} == {"remote"}
         assert all(row.provider_id not in {"codex_cli", "claude_code"} for row in models)
         assert {row.tool_id for row in tools} == {"codex_cli", "claude_code"}
         codex = next(row for row in tools if row.tool_id == "codex_cli")
@@ -72,7 +69,7 @@ def test_model_and_tool_catalogs_are_persisted_in_separate_tables(context):
         relay = next(row for row in models if row.provider_id == "relay")
         assert relay.api_key_encrypted and relay.api_key_encrypted != secret
 
-    assert {row["id"] for row in body["models"]} == {"local", "relay"}
+    assert {row["id"] for row in body["models"]} == {"relay"}
     assert {row["id"] for row in body["tools"]} == {"codex_cli", "claude_code"}
     assert secret not in response.text
 
@@ -81,8 +78,8 @@ def test_legacy_settings_payload_still_materializes_model_rows(context):
     """Development databases created with ``create_all`` have no migration seed."""
     client, headers, root = context
     payload = {
-        "local_url": "http://127.0.0.1:11434",
-        "local_model": "qwen3:8b",
+        "local_url": "",
+        "local_model": "",
         "local_enabled": False,
         "remote_enabled": True,
         "remote_url": "https://relay.example/v1",
@@ -93,11 +90,10 @@ def test_legacy_settings_payload_still_materializes_model_rows(context):
     assert response.status_code == 200, response.text
     with SessionLocal() as db:
         rows = db.scalars(select(AiModel).order_by(AiModel.provider_id)).all()
-        assert {row.provider_id: row.scope for row in rows} == {"local": "local", "remote": "remote"}
-        assert next(row for row in rows if row.provider_id == "local").enabled is False
+        assert {row.provider_id: row.scope for row in rows} == {"remote": "remote"}
 
 
-def test_fresh_schema_seeds_local_model_and_cli_tools_without_merging_them(tmp_path):
+def test_fresh_schema_seeds_cloud_model_and_cli_tools_without_merging_them(tmp_path):
     path = tmp_path / "fresh-model-tools.db"
     result = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "20261027_model_tool_schema"],
@@ -116,7 +112,7 @@ def test_fresh_schema_seeds_local_model_and_cli_tools_without_merging_them(tmp_p
         tools = db.execute(
             "SELECT tool_id, enabled, command FROM ai_tools ORDER BY tool_id"
         ).fetchall()
-        assert models == [("local", "local")]
+        assert models == []
         assert [row[0] for row in tools] == ["claude_code", "codex_cli"]
         assert all(row[0] not in {"claude_code", "codex_cli"} for row in models)
 
@@ -156,7 +152,6 @@ def test_migration_backfills_legacy_catalog_and_cli_columns(tmp_path):
             "SELECT provider_id, scope, endpoint FROM ai_models ORDER BY provider_id"
         ).fetchall() == [
             ("legacy-remote", "remote", "https://legacy.example/v1"),
-            ("local", "local", "http://127.0.0.1:11434"),
         ]
         assert db.execute(
             "SELECT tool_id, enabled, command, model FROM ai_tools ORDER BY tool_id"

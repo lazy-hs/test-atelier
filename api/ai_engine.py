@@ -38,9 +38,12 @@ def _env_truthy(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-LOCAL_URL = os.getenv("AI_STUDIO_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
-LOCAL_MODEL = os.getenv("AI_STUDIO_OLLAMA_MODEL", "qwen3:8b")
-LOCAL_ENABLED = True
+# Model inference is intentionally cloud-only.  Keep the legacy local fields
+# in memory for old database rows and API payloads, but never send a request to
+# Ollama or another on-device model.
+LOCAL_URL = ""
+LOCAL_MODEL = ""
+LOCAL_ENABLED = False
 REMOTE_ENABLED = _env_truthy("AI_STUDIO_REMOTE_ENABLED")
 REMOTE_URL = os.getenv("AI_STUDIO_REMOTE_URL", "").rstrip("/")
 REMOTE_MODEL = os.getenv("AI_STUDIO_REMOTE_MODEL", "")
@@ -143,9 +146,11 @@ def decrypt_secret_checked(value: str) -> str:
 def apply_config(config: dict) -> None:
     global LOCAL_URL, LOCAL_MODEL, LOCAL_ENABLED, REMOTE_ENABLED, REMOTE_URL, REMOTE_MODEL, REMOTE_API_KEY
     global CODEX_ENABLED, CODEX_COMMAND, CODEX_MODEL, CLAUDE_ENABLED, CLAUDE_COMMAND, CLAUDE_MODEL
-    LOCAL_URL = str(config.get("local_url") or "http://127.0.0.1:11434").rstrip("/")
-    LOCAL_MODEL = str(config.get("local_model") or "qwen3:8b")
-    LOCAL_ENABLED = bool(config.get("local_enabled", True))
+    # Local model settings are accepted only as a compatibility shape. They
+    # are deliberately ignored so every AI workflow uses a cloud API.
+    LOCAL_URL = ""
+    LOCAL_MODEL = ""
+    LOCAL_ENABLED = False
     REMOTE_ENABLED = bool(config.get("remote_enabled"))
     REMOTE_URL = str(config.get("remote_url") or "").rstrip("/")
     REMOTE_MODEL = str(config.get("remote_model") or "")
@@ -832,6 +837,11 @@ def _run_logged(provider: str, operation):
 
 
 def request_structured(prompt: str, schema: dict, provider: str) -> dict:
+    # Existing queued jobs may still contain the historical ``local`` value.
+    # Route those jobs to the configured cloud endpoint rather than attempting
+    # a local Ollama request.
+    if provider in {"local", "ollama"}:
+        provider = "remote"
     if provider == "codex":
         provider = "codex_cli"
     if provider == "claude":
@@ -891,17 +901,7 @@ def request_structured(prompt: str, schema: dict, provider: str) -> dict:
             return _remote_json_content(response.json())
         return _run_logged(provider, remote_request)
 
-    def local_request():
-        try:
-            response = _run_http_cancellable(lambda: httpx.post(f"{LOCAL_URL}/api/generate", json={
-                "model": LOCAL_MODEL, "prompt": prompt, "stream": False, "format": schema,
-                "options": {"temperature": 0},
-            }, timeout=180))
-            response.raise_for_status()
-            return json.loads(response.json()["response"])
-        except (httpx.ConnectError, httpx.TimeoutException) as exc:
-            raise RuntimeError("无法连接本地 Ollama；请启动模型服务后重试") from exc
-    return _run_logged("local", local_request)
+    raise RuntimeError("云端模型未由管理员配置和启用")
 
 
 def validate_analysis(output: AnalysisOutput, source_ids: list[str]) -> dict:

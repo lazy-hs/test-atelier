@@ -123,7 +123,7 @@ def _codex_session_view(session: CodexSession, db: Session) -> dict:
 
 class AnalysisCreate(BaseModel):
     source_ids: list[str] = Field(min_length=1, max_length=10)
-    provider: str = Field(default="local", max_length=32)
+    provider: str = Field(default="remote", max_length=32)
 
 
 class DraftGenerateRequest(BaseModel):
@@ -147,9 +147,10 @@ class DraftEdit(BaseModel):
 
 
 class AiSettingsUpdate(BaseModel):
-    local_url: str = Field(min_length=1, max_length=255)
-    local_model: str = Field(min_length=1, max_length=120)
-    local_enabled: bool = True
+    # Deprecated compatibility fields. Cloud-only deployments ignore them.
+    local_url: str = Field(default="", max_length=255)
+    local_model: str = Field(default="", max_length=120)
+    local_enabled: bool = False
     remote_enabled: bool = False
     remote_url: str = Field(default="", max_length=255)
     remote_model: str = Field(default="", max_length=120)
@@ -162,7 +163,7 @@ class AiSettingsUpdate(BaseModel):
     claude_command: str = Field(default="claude", max_length=255)
     claude_model: str = Field(default="", max_length=120)
     providers: list[dict] | None = Field(default=None, max_length=50)
-    provider: str = "local"
+    provider: str = "remote"
 
 
 class ProviderProbeRequest(BaseModel):
@@ -567,7 +568,7 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             legacy = []
         return [{key: item[key] for key in ("id", "kind", "name", "endpoint", "model", "enabled", "detail", "protocol") if key in item}
                 | {"api_key_set": bool(item.get("api_key_encrypted"))}
-                for item in legacy if isinstance(item, dict) and item.get("kind") in {"local", "remote"}]
+                for item in legacy if isinstance(item, dict) and item.get("kind") == "remote"]
 
     def tool_rows(db: Session, settings: AiSettings) -> list[dict]:
         rows = db.scalars(select(AiTool).order_by(AiTool.id)).all()
@@ -593,17 +594,14 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             | {"api_key_set": bool(item.get("api_key_encrypted"))}
             for item in providers if isinstance(item, dict)
         ]
-        normalized_models = model_rows(db, settings)
+        normalized_models = [row for row in model_rows(db, settings) if row.get("kind") == "remote"]
         # Once normalized rows exist they are the source of truth; legacy JSON
         # remains only as a read fallback for pre-migration databases.
         tools = tool_rows(db, settings)
         tool_by_id = {item["id"]: item for item in tools}
         codex_tool = tool_by_id.get("codex_cli", {})
         claude_tool = tool_by_id.get("claude_code", {})
-        local_enabled = next((bool(item.get("enabled")) for item in normalized_models if item.get("id") == "local"),
-                             ai_engine.catalog_provider_enabled(settings.providers_json, "local"))
-        return {"local_url": settings.local_url, "local_model": settings.local_model,
-                "local_enabled": local_enabled,
+        return {"local_url": "", "local_model": "", "local_enabled": False,
                 "remote_enabled": bool(settings.remote_enabled) and admin,
                 "remote_url": settings.remote_url if admin else "",
                 "remote_model": settings.remote_model if admin else "",
@@ -637,15 +635,15 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         scope(project_id, user, db)
         if user.role != "admin":
             raise HTTPException(403, "仅全局管理员可配置模型")
-        local_url, remote_url = payload.local_url.strip().rstrip("/"), payload.remote_url.strip().rstrip("/")
+        remote_url = payload.remote_url.strip().rstrip("/")
         settings = settings_for(db)
-        if not valid_url(local_url) or (payload.remote_enabled and not valid_url(remote_url, required=True)):
+        if payload.remote_enabled and not valid_url(remote_url, required=True):
             raise HTTPException(422, "模型地址必须是 http 或 https 地址")
         catalog_api_key = next((str(item.get("api_key", "")).strip() for item in (payload.providers or []) if isinstance(item, dict) and str(item.get("api_key", "")).strip()), "")
         if payload.remote_enabled and (not payload.remote_model.strip() or (not payload.remote_api_key.strip() and not settings.remote_api_key and not catalog_api_key)):
             raise HTTPException(422, "启用远程模型时必须填写模型名称和 API Key")
-        settings.local_url = local_url
-        settings.local_model = payload.local_model.strip()
+        settings.local_url = ""
+        settings.local_model = ""
         settings.remote_enabled = payload.remote_enabled
         settings.remote_url = remote_url
         settings.remote_model = payload.remote_model.strip()
@@ -669,7 +667,7 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             name = str(item.get("name", "")).strip()[:120]
             scope_name = str(item.get("kind", "remote")).strip()
             protocol = str(item.get("protocol", "openai")).strip()
-            if not provider_id or not name or scope_name not in {"local", "remote"}:
+            if not provider_id or not name or scope_name != "remote":
                 return
             row = db.scalar(select(AiModel).where(AiModel.provider_id == provider_id))
             if row is None:
@@ -694,12 +692,8 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
 
         upsert_tool("codex_cli", "Codex CLI", payload.codex_enabled, codex_command, payload.codex_model.strip())
         upsert_tool("claude_code", "Claude Code", payload.claude_enabled, claude_command, payload.claude_model.strip())
-        # Always materialize the built-in local endpoint. The remote endpoint
-        # is materialized only when a legacy client omits a provider catalog;
-        # custom remote rows are otherwise the canonical connection record.
-        upsert_model({"id": "local", "kind": "local", "name": "本机 Ollama",
-                      "endpoint": local_url, "model": payload.local_model.strip(),
-                      "enabled": payload.local_enabled})
+        # The built-in local endpoint has been removed. Only the cloud model
+        # row is materialized for compatibility with existing databases.
         remote_secret = settings.remote_api_key
         if payload.remote_api_key.strip():
             remote_secret = ai_engine.encrypt_secret(payload.remote_api_key.strip())
@@ -718,9 +712,7 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
                 previous_catalog = []
             previous_by_id = {str(item.get("id")): item for item in previous_catalog if isinstance(item, dict)}
             catalog = []
-            # The built-in local endpoint is always managed from the top-level
-            # fields, even when an older client submits only custom providers.
-            normalized_ids: set[str] = {"local"}
+            normalized_ids: set[str] = set()
             for item in payload.providers:
                 if not isinstance(item, dict):
                     continue
@@ -728,13 +720,13 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
                 name = str(item.get("name", "")).strip()[:120]
                 kind = str(item.get("kind", "remote")).strip()
                 protocol = str(item.get("protocol", "openai")).strip()
-                if not provider_id or not name or kind not in {"local", "remote", "cli"} or protocol not in {"openai", "responses", "anthropic", "gemini", "system-one"}:
+                if not provider_id or not name or kind not in {"remote", "cli"} or protocol not in {"openai", "responses", "anthropic", "gemini", "system-one"}:
                     continue
                 prior = previous_by_id.get(provider_id, {})
                 encrypted_key = str(prior.get("api_key_encrypted", ""))
                 if str(item.get("api_key", "")).strip():
                     encrypted_key = ai_engine.encrypt_secret(str(item["api_key"]).strip())
-                if kind in {"local", "remote"}:
+                if kind == "remote":
                     upsert_model(item, encrypted_key)
                     normalized_ids.add(provider_id)
                 catalog.append({
@@ -763,9 +755,7 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             settings.remote_api_key = ""
         settings.updated_at = utcnow()
         db.commit(); db.refresh(settings)
-        normalized_local = db.scalar(select(AiModel.enabled).where(AiModel.provider_id == "local"))
-        ai_engine.apply_config({"local_url": settings.local_url, "local_model": settings.local_model,
-                                "local_enabled": bool(normalized_local) if normalized_local is not None else ai_engine.catalog_provider_enabled(settings.providers_json, "local"),
+        ai_engine.apply_config({"local_url": "", "local_model": "", "local_enabled": False,
                                 "remote_enabled": settings.remote_enabled, "remote_url": settings.remote_url,
                                 "remote_model": settings.remote_model,
                                 "remote_api_key": ai_engine.decrypt_secret(settings.remote_api_key),
@@ -853,16 +843,16 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         scope(project_id, user, db)
         if user.role != "admin":
             raise HTTPException(403, "仅全局管理员可测试模型")
-        local_url, remote_url = payload.local_url.strip().rstrip("/"), payload.remote_url.strip().rstrip("/")
+        remote_url = payload.remote_url.strip().rstrip("/")
         remote_required = payload.provider == "remote"
-        if not valid_url(local_url) or (remote_required and not valid_url(remote_url, required=True)):
+        if remote_required and not valid_url(remote_url, required=True):
             raise HTTPException(422, "模型地址必须是 http 或 https 地址")
         test_started = monotonic()
         tested_provider = payload.provider
         test_error_type = None
         try:
-            if payload.provider == "local" and not ai_engine.LOCAL_ENABLED:
-                raise ValueError("本地模型未启用")
+            if payload.provider in {"local", "ollama"}:
+                raise ValueError("本地模型已移除，请选择云端模型")
             if payload.provider in {"codex", "codex_cli", "claude", "claude_code"}:
                 if payload.provider in {"codex", "codex_cli"}:
                     command, enabled = (payload.codex_command or payload.codex_binary or "codex").strip(), payload.codex_enabled
@@ -890,10 +880,7 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
                 response = httpx.get(remote_url + "/models", headers={"Authorization": f"Bearer {remote_api_key}"}, timeout=8)
                 response.raise_for_status()
                 return {"ok": True, "provider": "remote", "message": "远程模型服务可连接"}
-            response = httpx.get(local_url + "/api/tags", timeout=8)
-            response.raise_for_status()
-            models = [item.get("name") for item in response.json().get("models", []) if item.get("name")]
-            return {"ok": True, "provider": "local", "models": models, "message": "Ollama 可连接"}
+            raise ValueError("请选择云端模型或已启用的 AI 工具")
         except ValueError as exc:
             test_error_type = type(exc).__name__
             raise HTTPException(422, str(exc)) from exc
@@ -1015,10 +1002,8 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             payload.provider = "codex_cli"
         if payload.provider == "claude":
             payload.provider = "claude_code"
-        if payload.provider not in {"local", "remote", "codex_cli", "claude_code"}:
+        if payload.provider not in {"remote", "codex_cli", "claude_code"}:
             raise HTTPException(422, "模型类型无效")
-        if payload.provider == "local" and not ai_engine.LOCAL_ENABLED:
-            raise HTTPException(403, "本地模型未由管理员启用")
         if payload.provider == "remote" and (user.role != "admin" or not ai_engine.REMOTE_ENABLED):
             raise HTTPException(403, "远程模型未由管理员启用")
         if payload.provider == "codex_cli" and not ai_engine.CODEX_ENABLED:
@@ -1110,10 +1095,8 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             provider = "codex_cli"
         if provider == "claude":
             provider = "claude_code"
-        if provider not in {"local", "remote", "codex_cli", "claude_code"}:
+        if provider not in {"remote", "codex_cli", "claude_code"}:
             raise HTTPException(422, "模型类型无效")
-        if provider == "local" and not ai_engine.LOCAL_ENABLED:
-            raise HTTPException(403, "本地模型未由管理员启用")
         if provider == "remote" and (user.role != "admin" or not ai_engine.REMOTE_ENABLED):
             raise HTTPException(403, "远程模型未由管理员启用")
         if provider == "codex_cli" and not ai_engine.CODEX_ENABLED:

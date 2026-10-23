@@ -37,7 +37,7 @@
 
 - Python 3.10+（实测 3.12）
 - Node.js 20+
-- 可选：Ollama、Tesseract（含 `chi_sim` 和 `eng`）、LibreOffice
+- 可选：Tesseract（含 `chi_sim` 和 `eng`）、LibreOffice；AI 推理统一使用云端 API
 - 首次启动前备份已有的 `data/ai_studio.db` 和 `data/`
 
 ### 2. 安装依赖并初始化
@@ -141,8 +141,6 @@ export TEST_ATELIER_SKILL_ROOT=/Users/lazy/huangsheng/project/qa-doc-skills
 | `AI_STUDIO_BACKUP_MAX_UNCOMPRESSED_BYTES` | `8589934592` | 备份归档解压后的总大小上限，防止压缩炸弹 |
 | `AI_STUDIO_DATA_DIR` | `./data` | 原始文档和转换结果目录 |
 | `AI_STUDIO_REQUIRE_MIGRATIONS` / `AI_STUDIO_MIGRATION_HEAD` / `AI_STUDIO_MIGRATION_TIMEOUT` | 开发 `0`、生产 `1` / `20261032_case_timestamps` / `120` | 启动时执行并校验数据库迁移版本；生产前置检查强制保持 `1`，迁移超时后以结构化错误退出 |
-| `AI_STUDIO_OLLAMA_URL` | `http://127.0.0.1:11434` | 本地 Ollama 地址 |
-| `AI_STUDIO_OLLAMA_MODEL` | `qwen3:8b` | 本地模型名称，需自行下载 |
 | `AI_STUDIO_REMOTE_ENABLED` | `0` | 是否允许管理员使用远程 OpenAI 兼容接口 |
 | `AI_STUDIO_REMOTE_URL` / `AI_STUDIO_REMOTE_MODEL` / `AI_STUDIO_REMOTE_API_KEY` | 空 | 远程模型配置；密钥只在 API 进程使用 |
 | `AI_STUDIO_CODEX_ENABLED` / `AI_STUDIO_CODEX_COMMAND` / `AI_STUDIO_CODEX_MODEL` | `0` / `codex` / 空 | 可选 Codex CLI provider（`1`、`true`、`yes`、`on` 均表示启用）；也可登录后在“模型配置”中启用 |
@@ -168,17 +166,17 @@ export TEST_ATELIER_SKILL_ROOT=/Users/lazy/huangsheng/project/qa-doc-skills
 
 模型供应商和技能注册信息会在 API 启动、模型配置保存或项目技能读取时同步到 `data/config/settings.json`。该文件位于持久化数据目录，使用临时文件加 `os.replace` 原子写入，并设置为仅当前用户可读写；容器部署时它会随 `files_data` 卷保留。可以通过 `AI_STUDIO_CONFIG_FILE` 指定其他路径。
 
-配置文件中的 `models` 保存本地模型、远程模型、CLI provider 和供应商目录；远程密钥只保存服务端加密密文，不保存明文。`skills_root` 保存技能仓根路径，`skills` 只保存技能 ID、名称、标签、相对路径和简短描述等基本信息，不复制技能正文。`config/settings.example.json` 是结构示例，不包含真实密钥；数据库仍保存项目启停状态和业务数据。
+配置文件中的 `models` 保存远程云端模型、CLI provider 和供应商目录；远程密钥只保存服务端加密密文，不保存明文。`skills_root` 保存技能仓根路径，`skills` 只保存技能 ID、名称、标签、相对路径和简短描述等基本信息，不复制技能正文。`config/settings.example.json` 是结构示例，不包含真实密钥；数据库仍保存项目启停状态和业务数据。
 
-登录后进入项目侧栏的“模型配置”，全局管理员可以直接修改本地 Ollama 地址与模型、启用远程 OpenAI 兼容接口，或启用本机 Codex CLI/Claude Code 并填写可执行文件路径和可选模型，然后使用“测试连接”验证服务。空数据库首次启动时也会读取 `AI_STUDIO_*` provider 环境变量作为初始配置，之后以页面保存的数据库配置为准。CLI 任务和技能仓库辅助脚本使用无 shell 的参数数组启动，不把命令字符串交给 shell；技能仓库辅助脚本还会隔离应用会话密钥、数据库地址、远程 API Key、指标令牌、技能仓路径以及常见云服务和源码托管凭据。CLI 子进程还会移除 `AI_STUDIO_*` 和 Codex 桌面 app-server 的 `CODEX_*` 管道/会话变量，避免后台任务意外连接当前桌面会话，同时保留 CLI 自身需要的 `HOME`、`PATH` 和认证变量。CLI 任务额外使用临时 JSON Schema 和只读沙箱，Codex 后台任务还会跳过项目规则并清空桌面通知钩子，避免交互式配置阻塞服务；仍应先确认 CLI 的账号、工作区和权限策略。网页保存的远程密钥使用当前会话密钥加密存储，只返回“已配置”状态，不回显原文；修改只影响新建 AI 任务，独立 worker 会在领取新任务时重新加载配置。
+登录后进入项目侧栏的“模型配置”，全局管理员可以启用远程 OpenAI 兼容接口，或启用 Codex CLI/Claude Code 云端工具 并填写可执行文件路径和可选模型，然后使用“测试连接”验证服务。空数据库首次启动时也会读取 `AI_STUDIO_*` provider 环境变量作为初始配置，之后以页面保存的数据库配置为准。CLI 任务和技能仓库辅助脚本使用无 shell 的参数数组启动，不把命令字符串交给 shell；技能仓库辅助脚本还会隔离应用会话密钥、数据库地址、远程 API Key、指标令牌、技能仓路径以及常见云服务和源码托管凭据。CLI 子进程还会移除 `AI_STUDIO_*` 和 Codex 桌面 app-server 的 `CODEX_*` 管道/会话变量，避免后台任务意外连接当前桌面会话，同时保留 CLI 自身需要的 `HOME`、`PATH` 和认证变量。CLI 任务额外使用临时 JSON Schema 和只读沙箱，Codex 后台任务还会跳过项目规则并清空桌面通知钩子，避免交互式配置阻塞服务；仍应先确认 CLI 的账号、工作区和权限策略。网页保存的远程密钥使用当前会话密钥加密存储，只返回“已配置”状态，不回显原文；修改只影响新建 AI 任务，独立 worker 会在领取新任务时重新加载配置。
 
-Codex CLI 与 Claude Code 均是可选的本机 provider。安装对应 CLI 后，在页面启用并选择它即可用于需求分析、用例编写和分类建议；未安装或未启用时，原有 Ollama、规则候选和人工审核流程不受影响。不要把包含敏感信息的材料提交给未审计的本机 CLI 账号。
+Codex CLI 与 Claude Code 均是可选的本机 provider。安装对应 CLI 后，在页面启用并选择它即可用于需求分析、用例编写和分类建议；未安装或未启用时，规则候选和人工审核流程不受影响。不要把包含敏感信息的材料提交给未审计的本机 CLI 账号。
 
 启用 Codex 后，项目侧栏的“Codex 工作台”可直接创建会话并发送任务。工作台使用 `codex exec` 在每个会话独立创建的空白临时工作区中执行，采用 `workspace-write` 沙箱；不会把当前项目目录或项目规则带入会话。工作区根目录固定在系统临时目录，避免被配置到项目源码目录。会话通过 SSE 流式返回，并将会话和消息持久化到数据库。只读成员不能执行 Codex 任务，部署前请固定 CLI 版本并审计会话工作区权限。
 
 不要把包含敏感信息的需求文件上传到不受信任的实例；日志不应记录原文、令牌或模型密钥。
 
-API 提供 `/api/v1/health/live`（进程存活）、`/api/v1/health/ready`（数据库可用、数据目录可写且服务已完成启动）、`/api/v1/health/worker`（独立 worker 心跳）和 `/api/v1/health`（存活别名）探针；设置 `AI_STUDIO_RELEASE` 后 API 健康响应会返回 API 发布标识，worker 心跳还会返回实际消费者版本 `worker_release`，便于识别滚动发布中的旧 worker；启动或优雅停止期间 ready 返回 `503`。上传文件按私有权限原子写入，下载时使用不跟随符号链接的文件描述符，替换后的链接会被拒绝并记录低敏安全事件。`/api/v1/metrics` 提供低基数 Prometheus 指标，可通过 `METRICS_TOKEN` 保护，并暴露数据库连接池 size/checked-out/overflow、AI 进程队列的 active/capacity gauge、独立 worker 的 `worker_up`、心跳年龄和实际过期阈值 gauge、Codex/Claude CLI 启用状态与可执行性，以及按 provider/outcome 聚合的模型请求次数和耗时，便于发现连接池耗尽、CLI 未安装、CLI 超时和 provider 故障。应用日志默认输出 JSON，每条日志带有 `schema_version`、service/environment，每条请求带有 `request_id` 和 `X-Request-ID` 响应头；启动脚本、worker 启动和备份 CLI 使用 `request_id="-"` 表示非 HTTP 事件；异步任务保存创建请求 ID，重启恢复后仍可关联原始请求。日志记录路由模板、状态码、耗时和任务元数据，但不会写入请求正文、上传文件、提示词、模型响应、SQL 语句或绑定参数。SQLAlchemy、HTTPX、HTTP core、urllib3、multipart 的低级日志固定在 `WARNING` 以上，避免 `LOG_LEVEL=DEBUG` 时泄露请求和数据库细节。Compose 的 Nginx 边缘访问日志同样使用带 `schema_version` 的 JSON 格式并写入容器 stdout，只保留路由、状态码、耗时和请求 ID，不写入 Cookie、Authorization、查询字符串或请求体；Nginx 原生 error log 由容器入口包装器转换为同一 JSON envelope 后写入 stdout，避免代理错误把非结构化文本混入采集流。API 和 Nginx 返回同源 Content-Security-Policy，禁止内联脚本、插件和跨源连接。API 停止时会停止接收新任务并在宽限期内处理运行中的任务；独立 worker 会主动终止正在运行的 CLI 子进程，Ollama/远程 HTTP provider 也会响应停止或租约失效信号，不把完整 provider 超时拖过停止宽限；被取消的任务保持可恢复状态。
+API 提供 `/api/v1/health/live`（进程存活）、`/api/v1/health/ready`（数据库可用、数据目录可写且服务已完成启动）、`/api/v1/health/worker`（独立 worker 心跳）和 `/api/v1/health`（存活别名）探针；设置 `AI_STUDIO_RELEASE` 后 API 健康响应会返回 API 发布标识，worker 心跳还会返回实际消费者版本 `worker_release`，便于识别滚动发布中的旧 worker；启动或优雅停止期间 ready 返回 `503`。上传文件按私有权限原子写入，下载时使用不跟随符号链接的文件描述符，替换后的链接会被拒绝并记录低敏安全事件。`/api/v1/metrics` 提供低基数 Prometheus 指标，可通过 `METRICS_TOKEN` 保护，并暴露数据库连接池 size/checked-out/overflow、AI 进程队列的 active/capacity gauge、独立 worker 的 `worker_up`、心跳年龄和实际过期阈值 gauge、Codex/Claude CLI 启用状态与可执行性，以及按 provider/outcome 聚合的模型请求次数和耗时，便于发现连接池耗尽、CLI 未安装、CLI 超时和 provider 故障。应用日志默认输出 JSON，每条日志带有 `schema_version`、service/environment，每条请求带有 `request_id` 和 `X-Request-ID` 响应头；启动脚本、worker 启动和备份 CLI 使用 `request_id="-"` 表示非 HTTP 事件；异步任务保存创建请求 ID，重启恢复后仍可关联原始请求。日志记录路由模板、状态码、耗时和任务元数据，但不会写入请求正文、上传文件、提示词、模型响应、SQL 语句或绑定参数。SQLAlchemy、HTTPX、HTTP core、urllib3、multipart 的低级日志固定在 `WARNING` 以上，避免 `LOG_LEVEL=DEBUG` 时泄露请求和数据库细节。Compose 的 Nginx 边缘访问日志同样使用带 `schema_version` 的 JSON 格式并写入容器 stdout，只保留路由、状态码、耗时和请求 ID，不写入 Cookie、Authorization、查询字符串或请求体；Nginx 原生 error log 由容器入口包装器转换为同一 JSON envelope 后写入 stdout，避免代理错误把非结构化文本混入采集流。API 和 Nginx 返回同源 Content-Security-Policy，禁止内联脚本、插件和跨源连接。API 停止时会停止接收新任务并在宽限期内处理运行中的任务；独立 worker 会主动终止正在运行的 CLI 子进程，远程 HTTP provider 也会响应停止或租约失效信号，不把完整 provider 超时拖过停止宽限；被取消的任务保持可恢复状态。
 转换、文档提取和导入解析失败会记录低敏的失败事件；独立 worker 会记录数据库领取失败、任务恢复和任务崩溃，并在短暂数据库故障后继续重试。
 
 部署验收时可用无依赖的日志契约检查器扫描 JSONL 文件或 Compose 日志。它会校验统一 envelope、拒绝请求正文/提示词/密钥字段、非有限数字和常见凭据格式；成功时输出一条 `log_stream.validated` 事件：
@@ -312,4 +310,4 @@ compose.yaml         PostgreSQL + API + Nginx 部署示例
 
 ## 开源参考
 
-工程在流程和基础设施选型上参考了 [Kiwi TCMS](https://github.com/kiwitcms/Kiwi)、[FastAPI](https://github.com/fastapi/fastapi)、[Vite](https://github.com/vitejs/vite)、[shadcn/ui](https://github.com/shadcn-ui/ui)、[Ollama](https://github.com/ollama/ollama)、[OpenAI Codex](https://github.com/openai/codex) 和 [Claude Code](https://github.com/anthropics/claude-code) 的公开文档与实践；业务代码、数据模型和界面按本项目需求实现。
+工程在流程和基础设施选型上参考了 [Kiwi TCMS](https://github.com/kiwitcms/Kiwi)、[FastAPI](https://github.com/fastapi/fastapi)、[Vite](https://github.com/vitejs/vite)、[shadcn/ui](https://github.com/shadcn-ui/ui)、[OpenAI Codex](https://github.com/openai/codex) 和 [Claude Code](https://github.com/anthropics/claude-code) 的公开文档与实践；业务代码、数据模型和界面按本项目需求实现。

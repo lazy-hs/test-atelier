@@ -19,8 +19,8 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
   const [analysisId, setAnalysisId] = useState('')
   const [analysis, setAnalysis] = useState<Analysis | null>(null)
   const [jobs, setJobs] = useState<AiJob[]>([])
-  const [model, setModel] = useState<Pick<AiConfig, 'local_model' | 'local_enabled' | 'remote_enabled' | 'codex_enabled' | 'claude_enabled'> | null>(null)
-  const [provider, setProvider] = useState('local')
+  const [model, setModel] = useState<Pick<AiConfig, 'remote_enabled' | 'codex_enabled' | 'claude_enabled'> | null>(null)
+  const [provider, setProvider] = useState('remote')
   const [reportText, setReportText] = useState('')
   const [decisions, setDecisions] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
@@ -35,7 +35,7 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
   const refresh = useCallback(async () => {
     const [docs, runs, config] = await Promise.all([
       api<SourceDocument[]>(`${base}/documents`), api<Analysis[]>(`${base}/analyses`),
-      api<Pick<AiConfig, 'local_model' | 'local_enabled' | 'remote_enabled' | 'codex_enabled' | 'claude_enabled'>>(`${base}/ai/config`),
+      api<Pick<AiConfig, 'remote_enabled' | 'codex_enabled' | 'claude_enabled'>>(`${base}/ai/config`),
     ])
     setDocuments(docs); setAnalyses(runs); setModel(config)
     setAnalysisId(previous => previous || runs[0]?.id || '')
@@ -43,12 +43,10 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
 
   useEffect(() => { void refresh().catch(cause => setError(cause.message)) }, [refresh])
   // Keep the controlled select aligned with the provider catalog after the
-  // async config request. A stale initial "local" value could otherwise be
-  // submitted even though only the remote model is enabled.
+  // async config request.
   useEffect(() => {
     if (!model) return
     const enabled = [
-      model.local_enabled !== false ? 'local' : '',
       model.remote_enabled ? 'remote' : '',
       model.codex_enabled ? 'codex' : '',
       model.claude_enabled ? 'claude' : '',
@@ -143,7 +141,7 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
     ? 'Codex CLI 本机'
     : analysis?.provider === 'claude' || analysis?.provider === 'claude_code'
       ? 'Claude Code 本机'
-      : analysis?.provider === 'remote' ? '远程模型' : '本地模型'
+      : analysis?.provider === 'remote' ? '云端模型' : 'AI 工具'
   // Keep the checkpoint language aligned with the requirement-analysis skill.
   // These are UI checkpoints only; the worker remains the source of truth.
   const workflow = [
@@ -181,7 +179,7 @@ export function RequirementsPage({ projectId, readonly, onOpenAuthoring }: { pro
           })}
         </AnimatePresence>
         <div className="ai-rail-footer"><label htmlFor="model-provider">分析模型</label><select id="model-provider" value={provider} onChange={event => setProvider(event.target.value)} disabled={readonly || !model}>
-          {model?.local_enabled !== false && <option value="local">本地 {model?.local_model ?? 'Ollama'}</option>}{model?.remote_enabled && <option value="remote">远程模型（发送正文）</option>}{model?.codex_enabled && <option value="codex">Codex CLI（本机）</option>}{model?.claude_enabled && <option value="claude">Claude Code（本机）</option>}
+          {model?.remote_enabled && <option value="remote">远程模型（发送正文）</option>}{model?.codex_enabled && <option value="codex">Codex CLI（本机）</option>}{model?.claude_enabled && <option value="claude">Claude Code（本机）</option>}
         </select><Button onClick={() => void start()} disabled={readonly || busy || !selectedIds.length || !model || !provider}>开始分析</Button></div>
       </aside>
       <section className="ai-main">

@@ -19,7 +19,12 @@ test('工作站模块、转换历史与需求上传', async ({ page }) => {
   await page.waitForTimeout(300)
   await page.screenshot({ path: '/tmp/ai-studio-workstation-home.png' })
 
-  await page.getByRole('button', { name: '分析需求' }).click()
+  // Verify the cloud-only model settings surface before continuing.
+  await page.getByRole('button', { name: '模型配置' }).click()
+  await expect(page.getByRole('heading', { name: '模型配置' })).toBeVisible()
+  await expect(page.locator('.provider-row').filter({ hasText: '本机 Ollama' })).toHaveCount(0)
+  await page.getByRole('button', { name: '需求分析' }).click()
+
   await expect(page.getByRole('heading', { name: '需求分析' })).toBeVisible()
   await page.getByRole('button', { name: '首页', exact: true }).click()
   await page.getByRole('button', { name: /用例转换.*核对 Excel 与 XMind/ }).click()
@@ -44,13 +49,23 @@ test('工作站模块、转换历史与需求上传', async ({ page }) => {
   await expect(page.getByRole('heading', { name: '需求分析' })).toBeVisible()
   await page.locator('input[type=file]').setInputFiles({ name: 'requirement.md', mimeType: 'text/markdown', buffer: Buffer.from('# 登录\n输入有效账号后进入首页') })
   await expect(page.getByText('提取内容预览')).toBeVisible()
-  await page.getByRole('button', { name: '开始分析' }).click()
-  await expect(page.getByText('无法连接本地 Ollama')).toBeVisible({ timeout: 15000 })
+  if (process.env.AI_STUDIO_E2E_MODEL_STUB) {
+    const startAnalysis = page.getByRole('button', { name: '开始分析' })
+    await expect(startAnalysis).toBeEnabled({ timeout: 15000 })
+    await startAnalysis.click()
+    await expect(page.getByText('REQ-1 登录')).toBeVisible({ timeout: 45000 })
+  } else {
+    await expect(page.getByRole('button', { name: '开始分析' })).toBeDisabled()
+  }
   await page.screenshot({ path: '/tmp/ai-studio-workstation-analysis.png' })
   await page.setViewportSize({ width: 390, height: 844 })
   await page.reload()
   await expect(page.getByRole('heading', { name: '需求分析' })).toBeVisible()
-  await expect(page.getByText('无法连接本地 Ollama')).toBeVisible()
+  if (process.env.AI_STUDIO_E2E_MODEL_STUB) {
+    await expect(page.getByText('REQ-1 登录')).toBeVisible({ timeout: 45000 })
+  } else {
+    await expect(page.getByRole('button', { name: '开始分析' })).toBeDisabled()
+  }
   await page.waitForTimeout(400)
   await expect(page.getByRole('button', { name: '开始分析' })).toBeVisible()
   await page.screenshot({ path: '/tmp/ai-studio-workstation-mobile.png' })

@@ -186,11 +186,6 @@ def model_config_from_settings(settings: Any) -> dict[str, Any]:
             provider["api_key_encrypted"] = encrypted
         providers.append(provider)
     return {
-        "local": {
-            "enabled": _provider_enabled(providers, "local", True),
-            "url": str(getattr(settings, "local_url", "") or ""),
-            "model": str(getattr(settings, "local_model", "") or ""),
-        },
         "remote": {
             "enabled": bool(getattr(settings, "remote_enabled", False)),
             "url": str(getattr(settings, "remote_url", "") or ""),

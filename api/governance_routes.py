@@ -58,7 +58,7 @@ class MoveRequest(BaseModel):
 
 
 class AiGovernanceRequest(BaseModel):
-    provider: Literal["local", "remote", "codex_cli", "claude_code"] = "codex_cli"
+    provider: Literal["remote", "codex_cli", "claude_code"] = "codex_cli"
 
 
 class CaseEditRequest(BaseModel):
@@ -391,8 +391,6 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_r
         group = db.get(GovernanceDuplicateGroup, group_id)
         if not group or group.project_id != project_id:
             raise HTTPException(404, "重复组不存在")
-        if payload.provider == "local" and not ai_engine.LOCAL_ENABLED:
-            raise HTTPException(403, "本地模型未由管理员启用")
         if payload.provider == "remote" and (user.role != "admin" or not ai_engine.REMOTE_ENABLED):
             raise HTTPException(403, "远程模型未由管理员启用")
         if payload.provider == "codex_cli" and not ai_engine.CODEX_ENABLED:

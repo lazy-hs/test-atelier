@@ -25,8 +25,8 @@ function uiProvider(provider: string) {
 export function AuthoringPage({ projectId, readonly, onOpenCases }: { projectId: number; readonly: boolean; onOpenCases: () => void }) {
   const base = `/projects/${projectId}`
   const [analyses, setAnalyses] = useState<Analysis[]>([])
-  const [model, setModel] = useState<Pick<AiConfig, 'local_model' | 'local_enabled' | 'remote_enabled' | 'codex_enabled' | 'codex_model' | 'claude_enabled' | 'claude_model'> | null>(null)
-  const [provider, setProvider] = useState('local')
+  const [model, setModel] = useState<Pick<AiConfig, 'remote_enabled' | 'codex_enabled' | 'codex_model' | 'claude_enabled' | 'claude_model'> | null>(null)
+  const [provider, setProvider] = useState('remote')
   const [analysisId, setAnalysisId] = useState('')
   const [drafts, setDrafts] = useState<Draft[]>([])
   const [selected, setSelected] = useState('')
@@ -42,7 +42,7 @@ export function AuthoringPage({ projectId, readonly, onOpenCases }: { projectId:
   const refresh = useCallback(async () => {
     const [runs, config] = await Promise.all([
       api<Analysis[]>(`${base}/analyses`),
-      api<Pick<AiConfig, 'local_model' | 'local_enabled' | 'remote_enabled' | 'codex_enabled' | 'codex_model' | 'claude_enabled' | 'claude_model'>>(`${base}/ai/config`),
+      api<Pick<AiConfig, 'remote_enabled' | 'codex_enabled' | 'codex_model' | 'claude_enabled' | 'claude_model'>>(`${base}/ai/config`),
     ])
     setAnalyses(runs.filter(run => run.status === 'ready'))
     setModel(config)
@@ -68,7 +68,6 @@ export function AuthoringPage({ projectId, readonly, onOpenCases }: { projectId:
   useEffect(() => {
     if (!model) return
     const enabled = [
-      model.local_enabled !== false ? 'local' : '',
       model.remote_enabled ? 'remote' : '',
       model.codex_enabled ? 'codex' : '',
       model.claude_enabled ? 'claude' : '',
@@ -142,7 +141,7 @@ export function AuthoringPage({ projectId, readonly, onOpenCases }: { projectId:
     <div className="authoring-toolbar"><label htmlFor="analysis-select">分析报告</label><select id="analysis-select" value={analysisId} onChange={event => { const next = analyses.find(item => item.id === event.target.value); setAnalysisId(event.target.value); setDraftQuery(''); if (next) setProvider(uiProvider(next.provider)) }}>
       {analyses.length ? analyses.map(item => <option value={item.id} key={item.id}>{item.title || new Date(item.created_at).toLocaleString('zh-CN')} · {item.result.requirements?.length ?? 0} 条需求</option>) : <option value="">暂无已完成的分析报告</option>}
     </select><label htmlFor="authoring-provider">生成模型</label><select id="authoring-provider" value={provider} onChange={event => setProvider(event.target.value)} disabled={readonly || busy || !model}>
-      {model?.local_enabled !== false && <option value="local">本地 {model?.local_model || 'Ollama'}</option>}{model?.remote_enabled && <option value="remote">远程模型（发送报告内容）</option>}{model?.codex_enabled && <option value="codex">Codex CLI（本机）{model.codex_model ? ` · ${model.codex_model}` : ''}</option>}{model?.claude_enabled && <option value="claude">Claude Code（本机）{model.claude_model ? ` · ${model.claude_model}` : ''}</option>}
+      {model?.remote_enabled && <option value="remote">远程模型（发送报告内容）</option>}{model?.codex_enabled && <option value="codex">Codex CLI（本机）{model.codex_model ? ` · ${model.codex_model}` : ''}</option>}{model?.claude_enabled && <option value="claude">Claude Code（本机）{model.claude_model ? ` · ${model.claude_model}` : ''}</option>}
     </select>{job && <Button variant="outline" onClick={() => setPromptOpen(true)} disabled={busy}><Eye data-icon="inline-start" />查看提示词</Button>}<Button onClick={() => void generate()} disabled={readonly || busy || !model || !analysisId || !provider || Boolean(unresolved) || drafts.length > 0 || job?.status === 'running' || job?.status === 'queued'}><Plus data-icon="inline-start" />生成草稿</Button>
       {drafts.length > 0 && <><Button variant="outline" onClick={() => void exportFile('xlsx')} disabled={busy}><Download data-icon="inline-start" />Excel</Button><Button variant="outline" onClick={() => void exportFile('xmind')} disabled={busy}><Download data-icon="inline-start" />XMind</Button></>}</div>
     {unresolved && <div className="ai-alert warning"><AlertCircle size={16} />分析报告仍有关键歧义待确认</div>}

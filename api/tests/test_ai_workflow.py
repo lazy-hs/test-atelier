@@ -17,7 +17,7 @@ os.environ["AI_STUDIO_ADMIN_PASSWORD"] = "test-admin-password-123"
 
 from api import ai_engine, ai_jobs, ai_routes, skill_runner  # noqa: E402
 from api import main as api_main  # noqa: E402
-from api.db import AiJob, AiQueueState, Base, SessionLocal, engine  # noqa: E402
+from api.db import AiJob, AiQueueState, AiSettings, Base, SessionLocal, engine  # noqa: E402
 from api.main import app  # noqa: E402
 
 
@@ -26,6 +26,17 @@ def context(tmp_path, monkeypatch):
     monkeypatch.setattr(ai_routes, "DOCUMENT_DIR", tmp_path / "documents")
     Base.metadata.drop_all(engine)
     with TestClient(app) as client:
+        # Cloud-only inference: enable a deterministic remote configuration so
+        # request validation reaches the monkeypatched model implementation.
+        with SessionLocal() as db:
+            settings = db.get(AiSettings, 1)
+            settings.remote_enabled = True
+            settings.remote_url = "https://test.invalid/v1"
+            settings.remote_model = "test-remote"
+            settings.remote_api_key_encrypted = None
+            db.commit()
+        ai_engine.apply_config({"remote_enabled": True, "remote_url": "https://test.invalid/v1",
+                                "remote_model": "test-remote", "remote_api_key": ""})
         csrf = client.get("/api/v1/auth/csrf").json()["token"]
         login = client.post("/api/v1/auth/login", json={"username": "admin", "password": "test-admin-password-123"}, headers={"x-csrf-token": csrf}).json()
         headers = {"x-csrf-token": login["csrf"]}
@@ -121,7 +132,7 @@ def test_document_analysis_authoring_and_exports(context, monkeypatch, tmp_path)
     assert analysis_prompt.json()["prompt_length"] == len(analysis_prompt.json()["prompts"][0])
     structured_prompt = client.get(f"{root}/ai/jobs/{analysis_job_id}/prompts").json()
     assert structured_prompt["prompts"][0]["index"] == 1
-    assert structured_prompt["prompts"][0]["provider"] == "local"
+    assert structured_prompt["prompts"][0]["provider"] == "remote"
     assert structured_prompt["prompts"][0]["text"] == analysis_prompt.json()["prompts"][0]
     report = client.get(f"{root}/analyses/{analysis_id}").json()
     assert report["result"]["requirements"][0]["source_ids"] == [doc_id]
@@ -461,7 +472,7 @@ def test_multidocument_dedup_and_quality_gate(monkeypatch):
     monkeypatch.setattr(ai_engine, "request_structured", model)
     documents = [{"id": "a" * 32, "filename": "a.md", "text": "登录成功展示首页"},
                  {"id": "b" * 32, "filename": "b.md", "text": "有效账号可进入首页"}]
-    result = ai_engine.analyze(documents, "local")
+    result = ai_engine.analyze(documents, "remote")
     assert len(result["requirements"]) == 1
     assert set(result["requirements"][0]["source_ids"]) == {"a" * 32, "b" * 32}
     duplicate = [{"module": ["登录"], "title": "同名", "requirement_ids": ["REQ-1"], "method": "EP",

@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test'
 import path from 'node:path'
 
-test('分类版本、规则候选、人工修改与离线 AI 任务', async ({ page }) => {
+test('分类版本、规则候选、人工修改与云端 AI 任务', async ({ page }) => {
   const password = process.env.AI_STUDIO_E2E_PASSWORD
   if (!password) test.skip(true, 'Set AI_STUDIO_E2E_PASSWORD')
   const errors: string[] = []
@@ -39,7 +39,7 @@ test('分类版本、规则候选、人工修改与离线 AI 任务', async ({ p
 
   await page.getByRole('button', { name: '用例库' }).first().click()
   await page.getByRole('button', { name: '导入用例' }).click()
-  await page.locator('input[type=file]').setInputFiles(path.resolve(process.env.AI_STUDIO_E2E_SAMPLE || '/Users/lazy/Downloads/UGOS_PRO_测试用例_20261015141029.xls'))
+  await page.locator('input[type=file]').setInputFiles(path.resolve(process.env.AI_STUDIO_E2E_SAMPLE || 'e2e/fixtures/UGOS_PRO_sample.xlsx'))
   await expect(page.getByText('100 条用例 · 13 个原始字段')).toBeVisible()
   await page.getByRole('button', { name: '确认导入 100 条' }).click()
   await page.getByRole('checkbox', { name: '选择用例 001252040' }).check()
@@ -61,8 +61,14 @@ test('分类版本、规则候选、人工修改与离线 AI 任务', async ({ p
   await page.getByRole('button', { name: '关闭详情' }).click()
   await page.locator('.case-row').nth(1).getByRole('checkbox').check()
   await page.getByRole('button', { name: 'AI 建议' }).click()
-  await expect(page.getByText('AI 建议失败')).toBeVisible({ timeout: 15000 })
-  await expect(page.getByRole('button', { name: '重试' })).toBeVisible()
+  if (process.env.AI_STUDIO_E2E_MODEL_STUB) {
+    // The toolbar reports progress as completed/total; the detail panel uses
+    // the more explicit “AI 建议完成” label covered by model-suggestions.
+    await expect(page.getByText(/AI 建议 1\/1/)).toBeVisible({ timeout: 45000 })
+  } else {
+    await expect(page.getByText('AI 建议失败')).toBeVisible({ timeout: 45000 })
+    await expect(page.getByRole('button', { name: '重试' })).toBeVisible()
+  }
   await page.setViewportSize({ width: 390, height: 844 })
   await page.screenshot({ path: '/tmp/ai-studio-suggestion-mobile.png' })
   expect(errors).toEqual([])

@@ -7,7 +7,7 @@ import { api, type AiConfig } from '@/lib/api'
 
 type Settings = AiConfig
 type SettingsResponse = Partial<AiConfig>
-type ProviderKind = 'local' | 'remote' | 'cli'
+type ProviderKind = 'remote' | 'cli'
 type ProviderProtocol = 'openai' | 'responses' | 'anthropic' | 'gemini' | 'system-one'
 type ManagedProvider = { id: string; kind: ProviderKind; name: string; endpoint: string; model: string; enabled: boolean; detail: string; protocol?: ProviderProtocol; api_key_set?: boolean; api_key?: string }
 type AiTool = NonNullable<AiConfig['tools']>[number]
@@ -15,19 +15,18 @@ type ModelOption = { id: string; name: string }
 type ProbeResult = { ok: boolean; protocol: ProviderProtocol; model?: string; status?: number; error?: string }
 
 const defaults: Settings = {
-  local_url: 'http://127.0.0.1:11434', local_model: 'qwen3:8b', local_enabled: true, remote_enabled: false, remote_url: '', remote_model: '',
+  local_url: '', local_model: '', local_enabled: false, remote_enabled: false, remote_url: '', remote_model: '',
   remote_api_key_set: false, remote_api_key_mask: '', codex_enabled: false, codex_command: 'codex', codex_model: '',
   claude_enabled: false, claude_command: 'claude', claude_model: '',
 }
 
 function normalizeSettings(value: SettingsResponse): Settings { return { ...defaults, ...value, codex_command: value.codex_command || value.codex_binary || defaults.codex_command } }
-function providerIcon(kind: ProviderKind) { return kind === 'remote' ? <Globe2 size={17} /> : kind === 'cli' ? <Terminal size={17} /> : <Box size={17} /> }
+function providerIcon(kind: ProviderKind) { return kind === 'remote' ? <Globe2 size={17} /> : <Terminal size={17} /> }
 function providersFromSettings(settings: Settings): ManagedProvider[] {
-  const catalog = settings.models?.length ? settings.models : settings.providers?.filter(provider => provider.kind !== 'cli')
-  if (catalog?.length) return catalog.map(provider => ({ ...provider, kind: provider.kind as 'local' | 'remote' }))
+  const catalog = settings.models?.filter(provider => provider.kind === 'remote').length ? settings.models.filter(provider => provider.kind === 'remote') : settings.providers?.filter(provider => provider.kind === 'remote')
+  if (catalog?.length) return catalog.map(provider => ({ ...provider, kind: provider.kind as 'remote' }))
   return [
-    { id: 'local', kind: 'local', name: '本机 Ollama', endpoint: settings.local_url, model: settings.local_model, enabled: settings.local_enabled !== false, detail: settings.local_enabled === false ? '已停用' : '本地推理 不发送正文', protocol: 'openai' },
-    { id: 'remote', kind: 'remote', name: '远程 OpenAI', endpoint: settings.remote_url || '尚未配置接口地址', model: settings.remote_model || '尚未选择模型', enabled: settings.remote_enabled, detail: settings.remote_enabled ? '已允许发送正文' : '已停用', protocol: 'openai', api_key_set: settings.remote_api_key_set },
+    { id: 'remote', kind: 'remote', name: '云端 OpenAI', endpoint: settings.remote_url || '尚未配置接口地址', model: settings.remote_model || '尚未选择模型', enabled: settings.remote_enabled, detail: settings.remote_enabled ? '已允许发送正文' : '已停用', protocol: 'openai', api_key_set: settings.remote_api_key_set },
   ]
 }
 
@@ -37,7 +36,7 @@ export function ModelSettingsPage({ projectId }: { projectId: number }) {
   const [settings, setSettings] = useState<Settings>(defaults)
   const [providers, setProviders] = useState<ManagedProvider[]>(providersFromSettings(defaults))
   const [tools, setTools] = useState<AiTool[]>([])
-  const [selectedProvider, setSelectedProvider] = useState('local')
+  const [selectedProvider, setSelectedProvider] = useState('remote')
   const [providerQuery, setProviderQuery] = useState('')
   const [addOpen, setAddOpen] = useState(false)
   const [editOpen, setEditOpen] = useState(false)
@@ -54,10 +53,10 @@ export function ModelSettingsPage({ projectId }: { projectId: number }) {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [testResult, setTestResult] = useState('')
-  const [testProvider, setTestProvider] = useState('local')
+  const [testProvider, setTestProvider] = useState('remote')
   const base = `/projects/${projectId}`
 
-  useEffect(() => { void api<SettingsResponse>(`${base}/ai/admin-config`).then(value => { const next = normalizeSettings(value); setSettings(next); setProviders(providersFromSettings(next)); setTools(next.tools ?? []); setTestProvider(current => current === 'local' && next.remote_enabled ? 'remote' : current) }).catch(cause => setError((cause as Error).message)) }, [base])
+  useEffect(() => { void api<SettingsResponse>(`${base}/ai/admin-config`).then(value => { const next = normalizeSettings(value); setSettings(next); setProviders(providersFromSettings(next)); setTools(next.tools ?? []); setTestProvider(current => current === 'local' ? 'remote' : current) }).catch(cause => setError((cause as Error).message)) }, [base])
   function change(name: keyof Settings, value: string | boolean) {
     setSettings(previous => ({ ...previous, [name]: value }))
     if (name === 'codex_enabled' || name === 'claude_enabled') {
@@ -65,9 +64,6 @@ export function ModelSettingsPage({ projectId }: { projectId: number }) {
       setTools(previous => previous.map(tool => tool.id === toolId ? { ...tool, enabled: Boolean(value) } : tool))
     }
     setProviders(previous => previous.map(provider => {
-      if (provider.id === 'local' && name === 'local_url') return { ...provider, endpoint: String(value) }
-      if (provider.id === 'local' && name === 'local_model') return { ...provider, model: String(value) }
-      if (provider.id === 'local' && name === 'local_enabled') return { ...provider, enabled: Boolean(value), detail: value ? '本地推理 不发送正文' : '已停用' }
       if (provider.id === 'remote' && name === 'remote_url') return { ...provider, endpoint: String(value) }
       if (provider.id === 'remote' && name === 'remote_model') return { ...provider, model: String(value) }
       if (provider.id === 'remote' && name === 'remote_enabled') return { ...provider, enabled: Boolean(value), detail: value ? '已允许发送正文' : '已停用' }
@@ -75,12 +71,11 @@ export function ModelSettingsPage({ projectId }: { projectId: number }) {
       if (provider.id === 'claude' && name === 'claude_enabled') return { ...provider, enabled: Boolean(value), detail: value ? '本机命令行' : '已停用' }
       return provider
     }))
-    if (name === 'codex_enabled' && value === false && testProvider === 'codex_cli') setTestProvider('local')
-    if (name === 'claude_enabled' && value === false && testProvider === 'claude_code') setTestProvider('local')
-    if (name === 'remote_enabled' && value === false && testProvider === 'remote') setTestProvider('local')
-    if (name === 'remote_enabled' && value === true && testProvider === 'local') setTestProvider('remote')
+    if (name === 'codex_enabled' && value === false && testProvider === 'codex_cli') setTestProvider('remote')
+    if (name === 'claude_enabled' && value === false && testProvider === 'claude_code') setTestProvider('remote')
+    if (name === 'remote_enabled' && value === false && testProvider === 'remote') setTestProvider('codex_cli')
   }
-  function payload() { return { local_url: settings.local_url.trim(), local_model: settings.local_model.trim(), local_enabled: settings.local_enabled !== false, remote_enabled: settings.remote_enabled, remote_url: settings.remote_url.trim(), remote_model: settings.remote_model.trim(), remote_api_key: apiKey, codex_enabled: settings.codex_enabled, codex_command: settings.codex_command.trim() || 'codex', codex_binary: settings.codex_command.trim() || 'codex', codex_model: settings.codex_model.trim(), claude_enabled: settings.claude_enabled, claude_command: settings.claude_command.trim() || 'claude', claude_model: settings.claude_model.trim(), providers: modelProviders(providers), provider: testProvider } }
+  function payload() { return { local_url: '', local_model: '', local_enabled: false, remote_enabled: settings.remote_enabled, remote_url: settings.remote_url.trim(), remote_model: settings.remote_model.trim(), remote_api_key: apiKey, codex_enabled: settings.codex_enabled, codex_command: settings.codex_command.trim() || 'codex', codex_binary: settings.codex_command.trim() || 'codex', codex_model: settings.codex_model.trim(), claude_enabled: settings.claude_enabled, claude_command: settings.claude_command.trim() || 'claude', claude_model: settings.claude_model.trim(), providers: modelProviders(providers), provider: testProvider } }
   async function save(event?: FormEvent) { event?.preventDefault(); setBusy(true); setError(''); setNotice(''); setTestResult(''); try { const value = await api<SettingsResponse>(`${base}/ai/admin-config`, { method: 'PUT', body: JSON.stringify(payload()) }); const next = normalizeSettings(value); setSettings(next); setProviders(providersFromSettings(next)); setTools(next.tools ?? tools); setApiKey(''); setNotice('模型连接与 AI 工具配置已保存并立即生效') } catch (cause) { setError((cause as Error).message) } finally { setBusy(false) } }
   async function testConnection() { setTesting(true); setError(''); setTestResult(''); try { const result = await api<{ message: string; models?: string[] }>(`${base}/ai/admin-config/test`, { method: 'POST', body: JSON.stringify(payload()) }); setTestResult(result.models?.length ? `${result.message} · 已发现 ${result.models.join('、')}` : result.message) } catch (cause) { setError((cause as Error).message) } finally { setTesting(false) } }
   function probePayload(extra: Record<string, unknown> = {}) {
@@ -139,7 +134,6 @@ export function ModelSettingsPage({ projectId }: { projectId: number }) {
     setProviders(previous => previous.map(provider => provider.id === editingId
       ? { ...provider, name, kind: newProvider.kind, endpoint, model, protocol: newProvider.protocol, api_key_set: Boolean(newProvider.apiKey.trim()) || provider.api_key_set, api_key: newProvider.apiKey.trim() || provider.api_key }
       : provider))
-    if (editingId === 'local') setSettings(previous => ({ ...previous, local_url: endpoint, local_model: model }))
     if (editingId === 'remote') { setSettings(previous => ({ ...previous, remote_url: endpoint, remote_model: model, ...(newProvider.apiKey.trim() ? { remote_api_key_set: true } : {}) })); if (newProvider.apiKey.trim()) setApiKey(newProvider.apiKey.trim()) }
     setEditOpen(false)
     setEditingId(null)
@@ -149,18 +143,17 @@ export function ModelSettingsPage({ projectId }: { projectId: number }) {
     const enabled = !provider.enabled
     setProviders(previous => previous.map(item => item.id === provider.id ? { ...item, enabled, detail: enabled ? (item.kind === 'cli' ? '本机命令行' : '已允许发送正文') : '已停用' } : item))
     if (provider.id === 'remote') setSettings(previous => ({ ...previous, remote_enabled: enabled }))
-    if (provider.id === 'local') setSettings(previous => ({ ...previous, local_enabled: enabled }))
     if (provider.id === 'codex') setSettings(previous => ({ ...previous, codex_enabled: enabled }))
     if (provider.id === 'claude') setSettings(previous => ({ ...previous, claude_enabled: enabled }))
   }
   function removeProvider(provider: ManagedProvider) {
-    if (provider.id === 'local' || providers.length <= 1) return
+    if (providers.length <= 1) return
     setProviders(previous => previous.filter(item => item.id !== provider.id))
     if (provider.id === 'remote') {
       setSettings(previous => ({ ...previous, remote_enabled: false, remote_url: '', remote_model: '', remote_api_key_set: false }))
       setApiKey('')
     }
-    setSelectedProvider('local')
+    setSelectedProvider(providers.find(item => item.id !== provider.id)?.id ?? 'remote')
     setEditOpen(false)
     setEditingId(null)
     setNotice('供应商已移除 点击保存配置后生效')
@@ -178,13 +171,13 @@ export function ModelSettingsPage({ projectId }: { projectId: number }) {
   const selected = providers.find(provider => provider.id === selectedProvider) ?? providers[0]
 
   return <div className="model-settings-page">
-    <div className="model-settings-intro"><div><div className="eyebrow">AI CONTROL PLANE / 模型与工具</div><h2>模型管理</h2><p>分开管理本地模型 远程接口与 AI 工具</p></div><span className="model-security-badge"><ShieldCheck size={15} />仅全局管理员可见</span></div>
+    <div className="model-settings-intro"><div><div className="eyebrow">AI CONTROL PLANE / 模型与工具</div><h2>模型管理</h2><p>统一管理云端接口与 AI 工具</p></div><span className="model-security-badge"><ShieldCheck size={15} />仅全局管理员可见</span></div>
     {error && <div className="ai-alert error" role="alert">{error}</div>}{notice && <div className="ai-alert" role="status"><CheckCircle2 size={16} />{notice}</div>}{testResult && <div className="ai-alert" role="status"><CheckCircle2 size={16} />{testResult}</div>}
-    <section className="provider-overview" aria-label="供应商概览"><div className="provider-overview-metric"><span>已启用供应商</span><strong>{enabledCount}<small> / {providers.length}</small></strong><em><CircleDot size={12} />实时</em></div><div className="provider-overview-metric"><span>本地模型</span><strong>{providers.filter(provider => provider.kind === 'local').length}</strong><small>正文留在当前设备</small></div><div className="provider-overview-metric"><span>远程接口</span><strong>{providers.filter(provider => provider.kind === 'remote').length}</strong><small>按需发送正文</small></div><div className="provider-overview-metric"><span>连接状态</span><strong className="metric-ready"><Check size={17} />待检测</strong><small>保存后可测试</small></div></section>
-    <section className="provider-directory"><div className="provider-directory-head"><div><h3>模型连接</h3><p>模型连接独立保存 可明确区分本地推理与远程接口</p></div><div className="provider-directory-actions"><Input aria-label="查找模型连接" value={providerQuery} onChange={event => setProviderQuery(event.target.value)} placeholder="查找连接或模型" /><Button type="button" onClick={() => setAddOpen(true)}><Plus data-icon="inline-start" />添加连接</Button></div></div><div className="provider-list" role="list">{filteredProviders.map((provider, index) => <motion.button type="button" className={`provider-row ${selected?.id === provider.id ? 'is-selected' : ''} ${!provider.enabled ? 'is-muted' : ''}`} key={provider.id} onClick={event => { if ((event.target as HTMLElement).closest('.provider-switch')) { event.stopPropagation(); toggleProvider(provider); return } setSelectedProvider(provider.id); startEdit(provider) }} initial={{ opacity: 0, y: 7 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: index * .045 }}><span className="provider-drag" aria-hidden="true"><GripVertical size={14} /></span><span className={`provider-logo kind-${provider.kind}`}>{providerIcon(provider.kind)}</span><span className="provider-row-copy"><strong>{provider.name}</strong><span>{provider.endpoint} · {provider.model}</span></span><span className="provider-row-meta"><span className={`provider-scope scope-${provider.kind}`}>{provider.kind === 'local' ? '本地' : '远程'}</span><span className={`provider-status ${provider.enabled ? 'is-on' : ''}`}><i />{provider.enabled ? '运行中' : '已停用'}</span><span className="provider-detail">{provider.detail}</span></span><span className={`provider-switch ${provider.enabled ? 'is-on' : ''}`} aria-label={`${provider.name}${provider.enabled ? '已启用' : '已停用'}`} title="切换启用状态"><i /></span><ChevronRight size={17} className="provider-chevron" /></motion.button>)}{filteredProviders.length === 0 && <div className="provider-empty">没有匹配的模型连接</div>}</div></section>
+    <section className="provider-overview" aria-label="供应商概览"><div className="provider-overview-metric"><span>已启用供应商</span><strong>{enabledCount}<small> / {providers.length}</small></strong><em><CircleDot size={12} />实时</em></div><div className="provider-overview-metric"><span>云端接口</span><strong>{providers.filter(provider => provider.kind === 'remote').length}</strong><small>按需发送正文</small></div><div className="provider-overview-metric"><span>连接状态</span><strong className="metric-ready"><Check size={17} />待检测</strong><small>保存后可测试</small></div></section>
+    <section className="provider-directory"><div className="provider-directory-head"><div><h3>模型连接</h3><p>模型连接独立保存 可明确区分云端连接</p></div><div className="provider-directory-actions"><Input aria-label="查找模型连接" value={providerQuery} onChange={event => setProviderQuery(event.target.value)} placeholder="查找连接或模型" /><Button type="button" onClick={() => setAddOpen(true)}><Plus data-icon="inline-start" />添加连接</Button></div></div><div className="provider-list" role="list">{filteredProviders.map((provider, index) => <motion.button type="button" className={`provider-row ${selected?.id === provider.id ? 'is-selected' : ''} ${!provider.enabled ? 'is-muted' : ''}`} key={provider.id} onClick={event => { if ((event.target as HTMLElement).closest('.provider-switch')) { event.stopPropagation(); toggleProvider(provider); return } setSelectedProvider(provider.id); startEdit(provider) }} initial={{ opacity: 0, y: 7 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: index * .045 }}><span className="provider-drag" aria-hidden="true"><GripVertical size={14} /></span><span className={`provider-logo kind-${provider.kind}`}>{providerIcon(provider.kind)}</span><span className="provider-row-copy"><strong>{provider.name}</strong><span>{provider.endpoint} · {provider.model}</span></span><span className="provider-row-meta"><span className="provider-scope scope-remote">云端</span><span className={`provider-status ${provider.enabled ? 'is-on' : ''}`}><i />{provider.enabled ? '运行中' : '已停用'}</span><span className="provider-detail">{provider.detail}</span></span><span className={`provider-switch ${provider.enabled ? 'is-on' : ''}`} aria-label={`${provider.name}${provider.enabled ? '已启用' : '已停用'}`} title="切换启用状态"><i /></span><ChevronRight size={17} className="provider-chevron" /></motion.button>)}{filteredProviders.length === 0 && <div className="provider-empty">没有匹配的模型连接</div>}</div></section>
     <form onSubmit={event => void save(event)} className="model-settings-grid">
       <section className="model-settings-section cli-settings-section"><div className="model-settings-heading"><span className="model-settings-icon"><Cpu size={18} /></span><div><h3>AI 工具</h3><p>Codex CLI 与 Claude Code 独立于模型连接保存</p></div><span className="model-section-count">{tools.filter(tool => tool.enabled).length} 个已启用</span></div><div className="cli-local-note"><ShieldCheck size={14} /><span>AI 工具运行在本机 仅传入当前任务内容 不经过远程模型连接</span></div><div className="cli-provider-grid"><div className={`cli-provider-card ${settings.codex_enabled ? 'is-enabled' : ''}`}><label className="model-toggle"><input type="checkbox" checked={settings.codex_enabled} onChange={event => change('codex_enabled', event.target.checked)} /><span><strong>Codex CLI</strong><small>{settings.codex_enabled ? '已启用 AI 工具' : '当前关闭'}</small></span></label><label>命令<Input aria-label="Codex CLI 命令" value={settings.codex_command} onChange={event => change('codex_command', event.target.value)} placeholder="codex" /></label><label>模型（可选）<Input aria-label="Codex CLI 模型" value={settings.codex_model} onChange={event => change('codex_model', event.target.value)} placeholder="留空使用 CLI 默认模型" /></label></div><div className={`cli-provider-card ${settings.claude_enabled ? 'is-enabled' : ''}`}><label className="model-toggle"><input type="checkbox" checked={settings.claude_enabled} onChange={event => change('claude_enabled', event.target.checked)} /><span><strong>Claude Code</strong><small>{settings.claude_enabled ? '已启用 AI 工具' : '当前关闭'}</small></span></label><label>命令<Input aria-label="Claude Code 命令" value={settings.claude_command} onChange={event => change('claude_command', event.target.value)} placeholder="claude" /></label><label>模型（可选）<Input aria-label="Claude Code 模型" value={settings.claude_model} onChange={event => change('claude_model', event.target.value)} placeholder="留空使用 CLI 默认模型" /></label></div></div><p className="model-field-hint">保存后 新建的需求分析 用例编写和建议任务可选择对应 AI 工具</p></section>
-      <footer className="model-settings-footer"><span><ShieldCheck size={15} />修改后立即影响新建 AI 任务 执行中的任务继续使用原配置</span><div><select aria-label="选择测试 provider" value={testProvider} onChange={event => setTestProvider(event.target.value)} disabled={testing || busy}><option value="local">测试 Ollama</option>{settings.remote_enabled && <option value="remote">测试远程模型</option>}{settings.codex_enabled && <option value="codex_cli">测试 Codex CLI</option>}{settings.claude_enabled && <option value="claude_code">测试 Claude Code</option>}</select><Button type="button" variant="outline" onClick={() => void testConnection()} disabled={testing || busy}><FlaskConical data-icon="inline-start" />{testing ? '测试中…' : '测试连接'}</Button><Button type="submit" disabled={busy || testing}><Save data-icon="inline-start" />{busy ? '保存中…' : '保存配置'}</Button></div></footer>
+      <footer className="model-settings-footer"><span><ShieldCheck size={15} />修改后立即影响新建 AI 任务 执行中的任务继续使用原配置</span><div><select aria-label="选择测试 provider" value={testProvider} onChange={event => setTestProvider(event.target.value)} disabled={testing || busy}><option value="remote">测试云端模型</option>{settings.remote_enabled && <option value="remote">测试远程模型</option>}{settings.codex_enabled && <option value="codex_cli">测试 Codex CLI</option>}{settings.claude_enabled && <option value="claude_code">测试 Claude Code</option>}</select><Button type="button" variant="outline" onClick={() => void testConnection()} disabled={testing || busy}><FlaskConical data-icon="inline-start" />{testing ? '测试中…' : '测试连接'}</Button><Button type="submit" disabled={busy || testing}><Save data-icon="inline-start" />{busy ? '保存中…' : '保存配置'}</Button></div></footer>
     </form>
     {testing && <div className="model-testing"><LoaderCircle size={16} />正在检查模型服务响应</div>}
     <AnimatePresence>
@@ -193,7 +186,7 @@ export function ModelSettingsPage({ projectId }: { projectId: number }) {
           <div className="provider-dialog-titlebar"><span className="provider-dialog-cube"><Box size={22} /></span><div><h3>{editOpen ? '编辑供应商' : '自定义供应商'}</h3><p>{editOpen ? '修改连接信息后保存配置' : '连接一个兼容的模型服务'}</p></div><Button type="button" variant="ghost" size="icon-sm" aria-label="关闭供应商表单" onClick={() => { setAddOpen(false); setEditOpen(false) }}><X /></Button></div>
           <div className="provider-dialog-body">
             <label>名称<Input aria-label="供应商名称" value={newProvider.name} onChange={event => setNewProvider(previous => ({ ...previous, name: event.target.value }))} placeholder="例如 My Relay" autoFocus /></label>
-            <div className="provider-dialog-field"><span>部署位置</span><div className="provider-scope-tabs" role="tablist" aria-label="模型部署位置"><button type="button" role="tab" aria-selected={newProvider.kind === 'local'} className={newProvider.kind === 'local' ? 'is-active' : ''} onClick={() => setNewProvider(previous => ({ ...previous, kind: 'local' }))}><Box size={14} />本地模型</button><button type="button" role="tab" aria-selected={newProvider.kind === 'remote'} className={newProvider.kind === 'remote' ? 'is-active' : ''} onClick={() => setNewProvider(previous => ({ ...previous, kind: 'remote' }))}><Globe2 size={14} />远程接口</button></div><small className="provider-dialog-note">用于标识数据是否会离开当前设备</small></div>
+            <div className="provider-dialog-field"><span>部署位置</span><div className="provider-scope-tabs" role="tablist" aria-label="模型部署位置"><button type="button" role="tab" aria-selected={true} className="is-active"><Globe2 size={14} />云端接口</button></div><small className="provider-dialog-note">用于标识数据是否会离开当前设备</small></div>
             <label>Base URL
               <div className="protocol-tabs" role="tablist" aria-label="接口协议">
                 {([['openai', 'OpenAI 兼容'], ['responses', 'OpenAI Responses'], ['anthropic', 'Anthropic 兼容'], ['gemini', 'Gemini 兼容'], ['system-one', 'System One']] as [ProviderProtocol, string][]).map(([value, label]) => <button type="button" role="tab" aria-selected={newProvider.protocol === value} className={newProvider.protocol === value ? 'is-active' : ''} key={value} onClick={() => setNewProvider(previous => ({ ...previous, protocol: value }))}>{label}</button>)}

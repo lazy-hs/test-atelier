@@ -11,7 +11,7 @@ os.environ["AI_STUDIO_SESSION_SECRET"] = "test-only-session-secret-32-characters
 os.environ["AI_STUDIO_ADMIN_PASSWORD"] = "test-admin-password-123"
 
 from api import ai_engine, classification, suggestion_jobs  # noqa: E402
-from api.db import Base, CaseSuggestion, SessionLocal, SuggestionJob, engine  # noqa: E402
+from api.db import AiSettings, Base, CaseSuggestion, SessionLocal, SuggestionJob, engine  # noqa: E402
 from api.main import app  # noqa: E402
 
 
@@ -20,6 +20,17 @@ def context(monkeypatch):
     monkeypatch.setattr(suggestion_jobs, "enqueue", suggestion_jobs.process_job)
     Base.metadata.drop_all(engine)
     with TestClient(app) as client:
+        # Model suggestions now require an enabled cloud provider. Tests
+        # monkeypatch the request itself, so no external network call occurs.
+        with SessionLocal() as db:
+            settings = db.get(AiSettings, 1)
+            settings.remote_enabled = True
+            settings.remote_url = "https://test.invalid/v1"
+            settings.remote_model = "test-remote"
+            settings.remote_api_key_encrypted = None
+            db.commit()
+        ai_engine.apply_config({"remote_enabled": True, "remote_url": "https://test.invalid/v1",
+                                "remote_model": "test-remote", "remote_api_key": ""})
         token = client.get("/api/v1/auth/csrf").json()["token"]
         response = client.post("/api/v1/auth/login", json={"username": "admin", "password": "test-admin-password-123"},
                                headers={"x-csrf-token": token})
@@ -101,7 +112,7 @@ def test_model_suggestions_decisions_audit_and_export(context, monkeypatch):
                 "questions": ["请确认冒烟时间"]}
 
     monkeypatch.setattr(ai_engine, "request_structured", model)
-    created = client.post(f"{root}/suggestions/model", json={"case_ids": [ids[0]], "provider": "local"}, headers=headers)
+    created = client.post(f"{root}/suggestions/model", json={"case_ids": [ids[0]], "provider": "remote"}, headers=headers)
     assert created.status_code == 200, created.text
     job = wait_job(client, root, created.json()["id"])
     assert job["status"] == "done" and job["completed"] == 1

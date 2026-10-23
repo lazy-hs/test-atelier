@@ -92,8 +92,10 @@ class User(Base):
 class AiSettings(Base):
     __tablename__ = "ai_settings"
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
-    local_url: Mapped[str] = mapped_column(String(255), default="http://127.0.0.1:11434")
-    local_model: Mapped[str] = mapped_column(String(120), default="qwen3:8b")
+    # Retained for migrations and old rows only; cloud-only runtime never
+    # reads these fields for inference.
+    local_url: Mapped[str] = mapped_column(String(255), default="")
+    local_model: Mapped[str] = mapped_column(String(120), default="")
     remote_enabled: Mapped[bool] = mapped_column(default=False)
     remote_url: Mapped[str] = mapped_column(String(255), default="")
     remote_model: Mapped[str] = mapped_column(String(120), default="")
@@ -105,8 +107,8 @@ class AiSettings(Base):
     claude_command: Mapped[str] = mapped_column(String(255), default="claude")
     claude_model: Mapped[str] = mapped_column(String(120), default="")
     # Provider catalog is additive to the legacy single local/remote fields.
-    # Keeping the legacy columns lets existing workers continue to run while
-    # the admin UI can manage more than one connection.
+    # Keeping the legacy columns lets existing databases migrate safely while
+    # the cloud-only runtime manages remote connections.
     providers_json: Mapped[str] = mapped_column(Text, default="[]")
     updated_at: Mapped[str] = mapped_column(String(40), default=utcnow)
 
@@ -114,8 +116,8 @@ class AiSettings(Base):
 class AiModel(Base):
     """Durable model endpoint catalog, separate from non-model AI tools.
 
-    ``scope`` is deliberately explicit (``local`` or ``remote``) so callers
-    do not infer deployment location from provider names or URLs.
+    ``scope`` remains explicit for migration compatibility. New rows are
+    remote-only; legacy local rows are removed during application startup.
     """
     __tablename__ = "ai_models"
     __table_args__ = (CheckConstraint("scope IN ('local', 'remote')", name="ck_ai_models_scope"),)
@@ -460,7 +462,7 @@ class AnalysisRun(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     source_ids: Mapped[list] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(24), default="queued")
-    provider: Mapped[str] = mapped_column(String(24), default="local")
+    provider: Mapped[str] = mapped_column(String(24), default="remote")
     result: Mapped[dict] = mapped_column(JSON, default=dict)
     error: Mapped[str] = mapped_column(Text, default="")
     attempts: Mapped[int] = mapped_column(Integer, default=0)

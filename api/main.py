@@ -166,6 +166,61 @@ def _validate_migration_policy(environment: str, require_migrations: bool) -> No
         raise ExplicitMigrationsRequired("生产环境必须启用 AI_STUDIO_REQUIRE_MIGRATIONS=1")
 
 
+def _environment_provider_overrides() -> bool:
+    """Return whether provider environment variables contain initial values.
+
+    Older Alembic revisions created an ``ai_settings`` row before the API
+    could seed it from environment variables.  Treat that untouched legacy
+    row as an empty database only when the operator actually supplied an
+    override; a later UI save remains authoritative.
+    """
+    defaults = {
+        "AI_STUDIO_REMOTE_ENABLED": "0",
+        "AI_STUDIO_REMOTE_URL": "",
+        "AI_STUDIO_REMOTE_MODEL": "",
+        "AI_STUDIO_REMOTE_API_KEY": "",
+    }
+    return any(os.getenv(name, default).strip() != default for name, default in defaults.items())
+
+
+def _is_legacy_bootstrap_settings(settings: AiSettings) -> bool:
+    """Identify the row inserted by the pre-runtime-settings migration."""
+    return (
+        settings.local_url.rstrip("/") == "http://127.0.0.1:11434"
+        and settings.local_model == "qwen3:8b"
+        and not settings.remote_enabled
+        and not settings.remote_url
+        and not settings.remote_model
+        and not settings.remote_api_key
+        and (not settings.providers_json or settings.providers_json.strip() == "[]")
+        and not settings.codex_enabled
+        and (settings.codex_command or "codex") == "codex"
+        and not settings.codex_model
+        and not settings.claude_enabled
+        and (settings.claude_command or "claude") == "claude"
+        and not settings.claude_model
+    )
+
+
+def _seed_existing_bootstrap_settings(settings: AiSettings, ai_engine) -> None:
+    """Apply initial provider environment values to an untouched legacy row."""
+    settings.local_url = ""
+    settings.local_model = ""
+    settings.remote_enabled = os.getenv("AI_STUDIO_REMOTE_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
+    settings.remote_url = os.getenv("AI_STUDIO_REMOTE_URL", "").strip().rstrip("/")
+    settings.remote_model = os.getenv("AI_STUDIO_REMOTE_MODEL", "").strip()
+    settings.codex_enabled = os.getenv("AI_STUDIO_CODEX_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
+    settings.codex_command = os.getenv("AI_STUDIO_CODEX_COMMAND", "codex").strip() or "codex"
+    settings.codex_model = os.getenv("AI_STUDIO_CODEX_MODEL", "").strip()
+    settings.claude_enabled = os.getenv("AI_STUDIO_CLAUDE_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
+    settings.claude_command = os.getenv("AI_STUDIO_CLAUDE_COMMAND", "claude").strip() or "claude"
+    settings.claude_model = os.getenv("AI_STUDIO_CLAUDE_MODEL", "").strip()
+    remote_key = os.getenv("AI_STUDIO_REMOTE_API_KEY", "").strip()
+    if remote_key:
+        settings.remote_api_key = ai_engine.encrypt_secret(remote_key)
+    settings.updated_at = utcnow()
+
+
 def _worker_heartbeat_path() -> str:
     configured = os.getenv("AI_STUDIO_WORKER_HEARTBEAT", "").strip()
     if configured:
@@ -399,14 +454,15 @@ def initialize():
                 })
         settings = db.get(AiSettings, 1)
         settings_seeded = False
+        legacy_settings_seeded = False
         if not settings:
             # Seed a brand-new database from environment defaults so a
             # headless deployment can configure its provider before the first
             # browser login. Later UI edits remain authoritative.
             settings = AiSettings(
                 id=1,
-                local_url=os.getenv("AI_STUDIO_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/"),
-                local_model=os.getenv("AI_STUDIO_OLLAMA_MODEL", "qwen3:8b"),
+                local_url="",
+                local_model="",
                 remote_enabled=os.getenv("AI_STUDIO_REMOTE_ENABLED", "0").lower() in {"1", "true", "yes", "on"},
                 remote_url=os.getenv("AI_STUDIO_REMOTE_URL", "").rstrip("/"),
                 remote_model=os.getenv("AI_STUDIO_REMOTE_MODEL", ""),
@@ -435,6 +491,25 @@ def initialize():
                 })
             else:
                 settings_seeded = True
+        elif _environment_provider_overrides() and _is_legacy_bootstrap_settings(settings):
+            # Alembic creates a bootstrap singleton before the API starts. If
+            # it is still untouched, honor deployment environment values just
+            # as we do for a brand-new database. A later UI save is kept
+            # authoritative because it no longer matches this exact shape.
+            _seed_existing_bootstrap_settings(settings, ai_engine)
+            legacy_settings_seeded = True
+        # Cloud-only mode: remove legacy Ollama catalog entries and clear the
+        # old singleton fields. Keeping a disabled local row would make it
+        # possible for a stale worker or UI to select on-device inference.
+        db.execute(delete(AiModel).where(AiModel.scope == "local"))
+        try:
+            catalog = json.loads(settings.providers_json or "[]")
+        except (TypeError, ValueError):
+            catalog = []
+        cloud_catalog = [item for item in catalog if isinstance(item, dict) and item.get("kind") == "remote"]
+        settings.local_url = ""
+        settings.local_model = ""
+        settings.providers_json = json.dumps(cloud_catalog, ensure_ascii=False)
         # Existing databases created before CLI provider support have empty
         # command columns; normalize them before loading the runtime config.
         changed = False
@@ -456,14 +531,21 @@ def initialize():
             if tool is None:
                 db.add(AiTool(tool_id=tool_id, name=name, enabled=bool(enabled), command=command or name.lower(), model=model or ""))
                 tools_changed = True
+            elif legacy_settings_seeded:
+                # Model/tool rows are the runtime source of truth after the
+                # catalog migration, so keep them in sync with the bootstrap
+                # environment values as well.
+                tool.enabled = bool(enabled)
+                tool.command = command or name.lower()
+                tool.model = model or ""
+                tool.updated_at = utcnow()
+                tools_changed = True
         if tools_changed:
             db.commit()
         # ``create_all`` development databases also need built-in model rows;
         # production migrations perform the equivalent backfill.
         model_defaults = (
-            ("local", "本机 Ollama", "local", settings.local_url, settings.local_model,
-             ai_engine.catalog_provider_enabled(settings.providers_json, "local")),
-            ("remote", "远程模型", "remote", settings.remote_url, settings.remote_model, bool(settings.remote_enabled)),
+            ("remote", "云端模型", "remote", settings.remote_url, settings.remote_model, bool(settings.remote_enabled)),
         )
         models_changed = False
         for provider_id, name, scope, endpoint, model, enabled in model_defaults:
@@ -473,19 +555,26 @@ def initialize():
                                model=model or "", enabled=enabled,
                                api_key_encrypted=settings.remote_api_key if provider_id == "remote" else ""))
                 models_changed = True
+            elif legacy_settings_seeded and provider_id == "remote":
+                model_row.endpoint = endpoint or ""
+                model_row.model = model or ""
+                model_row.enabled = bool(enabled)
+                if provider_id == "remote" and settings.remote_api_key:
+                    model_row.api_key_encrypted = settings.remote_api_key
+                model_row.updated_at = utcnow()
+                models_changed = True
         if models_changed:
             db.commit()
         # Normalized model/tool rows are authoritative after migration. Keep
         # legacy singleton fields as a fallback for old/unmigrated databases.
         model_rows = {row.provider_id: row for row in db.scalars(select(AiModel)).all()}
         tool_rows = {row.tool_id: row for row in db.scalars(select(AiTool)).all()}
-        local_row = model_rows.get("local")
         remote_row = model_rows.get("remote")
         codex_row = tool_rows.get("codex_cli")
         claude_row = tool_rows.get("claude_code")
-        local_url = local_row.endpoint if local_row else settings.local_url
-        local_model = local_row.model if local_row else settings.local_model
-        local_enabled = local_row.enabled if local_row else ai_engine.catalog_provider_enabled(settings.providers_json, "local")
+        local_url = ""
+        local_model = ""
+        local_enabled = False
         remote_enabled = remote_row.enabled if remote_row else settings.remote_enabled
         remote_url = remote_row.endpoint if remote_row else settings.remote_url
         remote_model = remote_row.model if remote_row else settings.remote_model
@@ -548,7 +637,7 @@ def initialize():
                                 "codex_enabled": codex_enabled, "codex_command": codex_command,
                                 "codex_model": codex_model, "claude_enabled": claude_enabled,
                                 "claude_command": claude_command, "claude_model": claude_model})
-        if settings_seeded:
+        if settings_seeded or legacy_settings_seeded:
             logger.info("ai.settings.seeded", extra={
                 "event": "ai.settings.seeded", "component": "ai-settings", "source": "environment",
             })

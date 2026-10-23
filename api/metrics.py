@@ -33,7 +33,7 @@ _model_duration_sum = defaultdict(float)
 _cli_enabled = {provider: 0 for provider in ("codex_cli", "claude_code")}
 _cli_available = {provider: 0 for provider in ("codex_cli", "claude_code")}
 _KNOWN_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"}
-_KNOWN_PROVIDERS = {"local", "remote", "codex_cli", "claude_code"}
+_KNOWN_PROVIDERS = {"remote", "codex_cli", "claude_code"}
 _KNOWN_MODEL_OUTCOMES = {"success", "failure", "cancelled", "timeout"}
 
 
