@@ -26,6 +26,10 @@ Playwright）：10 项全部通过，覆盖 Harness 分析/用例刷新与 Sessi
 未启用 Harness、未配置生产发布标识或本机 Docker/Compose 等预期警告。未使用模型凭据，
 临时 Secret 已在进程结束后清理。
 
+随后以相同的临时 Secret、`AI_STUDIO_ENV=production` 和 `COOKIE_SECURE=1` 运行生产门禁，
+结果明确只拒绝 Intel macOS 当前的 `cryptography` 版本（`failed_checks=["cryptography"]`）。
+这证明生产预检会在安全依赖不满足时失败关闭，而不会把本机开发环境通过结果提升为生产通过。
+
 开始执行最终重构计划后，三个 Harness 结果页面（需求分析、用例编写、项目技能）在浏览器
 渲染前再次核对 `completed`、项目 ID、任务 ID、结果 Schema、结果任务 ID、Session ID、
 分析 ID 和来源文档范围；不匹配的完成响应只显示固定校验失败提示，不进入结果区。原始 JSON
