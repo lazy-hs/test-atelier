@@ -1,0 +1,21 @@
+{
+  "recordedAt": "2026-10-24",
+  "requestedUpstream": "https://github.com/deepseek-ai/deepseek-harness",
+  "localOrigin": "https://gitee.com/giaog/deepseek-harness.git",
+  "upstreamRemote": "https://github.com/deepseek-ai/deepseek-harness.git",
+  "defaultBranch": "master",
+  "commit": "22ddee3792402c3e70ec5f86a63c3e3e895a2f60",
+  "version": "0.2.1-rc.3",
+  "node": ">=24.9.0",
+  "pnpm": "11.28.5",
+  "lockfileSha256": "de5ef69ab7f418a6b7e97e83943bdc7b04e943a59c798a1a97aaf3a244c80d73",
+  "supportedPlatforms": ["darwin", "win32", "linux"],
+  "workspaceStatus": "clean on isolated upstream sync branch",
+  "upstreamHead": "22ddee3792402c3e70ec5f86a63c3e3e895a2f60",
+  "upstreamHeadFetchedAt": "2026-10-25",
+  "upstreamAheadCommits": 0,
+  "syncStatus": "upstream candidate promoted after Harness typecheck, Profile composition and extension compatibility checks; aggregate GUI timeout caveat recorded in compatibility matrix",
+  "extensionVersion": "0.1.8",
+  "extensionCommit": "81a8862daba97e44860ff1bd0b2a257133b99a91",
+  "extensionLockfileSha256": "773c2d5ca0c37cb3db5c0f7d762727c750793785107d008e70473478a3d45d01"
+}
