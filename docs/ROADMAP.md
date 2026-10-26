@@ -16,6 +16,11 @@ Windows/Linux 实机、真实模型和生产部署门禁仍未解除。
 `22ddee3792402c3e70ec5f86a63c3e3e895a2f60`，与锁定基线一致，因此没有创建同步分支、
 切换 Harness 工作区或修改上游 checkout。
 
+随后在当前工作树重新运行隔离浏览器 Smoke（临时 SQLite、Fake Host、独立 Projector、
+Playwright）：10 项全部通过，覆盖 Harness 分析/用例刷新与 Session 回放、暂存结果隔离、
+历史分析边界、项目技能并发确认、转换证据、知识归档、项目删除恢复和执行报告。该证据仍
+只覆盖 macOS 本机协议与交互，不替代真实模型质量、Windows/Linux 或生产部署验收。
+
 开始执行最终重构计划后，三个 Harness 结果页面（需求分析、用例编写、项目技能）在浏览器
 渲染前再次核对 `completed`、项目 ID、任务 ID、结果 Schema、结果任务 ID、Session ID、
 分析 ID 和来源文档范围；不匹配的完成响应只显示固定校验失败提示，不进入结果区。原始 JSON
