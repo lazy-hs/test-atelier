@@ -229,7 +229,8 @@ Key 只能通过环境变量、受限 Secret 文件或部署 Secret Store 注入
 2. 获取 Windows 实机证据：Profile、Host、ACP 确认、进程树、Session、ACL 和浏览器。
 3. 获取 Linux/容器证据：Docker 构建、Compose、PostgreSQL、Nginx/HTTPS、Secret 和 Projector 故障恢复。
 4. 完成 Web Shell 生产安全设计：普通成员 ACL、生产 Shell 能力限制和目标环境长连接验证；服务端 Session nonce 吊销及原生设置/凭据入口禁用已实现。
-5. 整理 Extension 工作树后重新运行发布基线；脏工作树不能作为锁定发布版本。
+5. 已完成 Extension 工作树整理、提交和发布基线复核；当前锁定提交为
+   `81a8862daba97e44860ff1bd0b2a257133b99a91`，后续每次同步仍必须重复同一门禁。
 
 ## 11. 实施原则
 
