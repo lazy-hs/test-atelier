@@ -64,6 +64,154 @@ def test_sqlite_restore_supports_empty_data_directory(tmp_path):
     assert list(restored_data.iterdir()) == []
 
 
+def test_harness_stopped_backup_restores_task_replay_and_sessions(tmp_path):
+    source = tmp_path / "source.db"
+    make_database(source)
+    data = tmp_path / "data"
+    tasks = tmp_path / "tasks"
+    sessions = tmp_path / "sessions"
+    for root in (data, tasks, sessions):
+        root.mkdir()
+    (tasks / "task.json").write_text('{"id":"task-1"}', encoding="utf-8")
+    (tasks / "task-1.events.jsonl").write_text('{"result":"full model output"}\n', encoding="utf-8")
+    (sessions / "session.jsonl").write_text('{"event":"done"}\n', encoding="utf-8")
+    archive = create_backup(f"sqlite:///{source}", data, tmp_path / "backups",
+                            tasks, sessions, services_stopped=True)
+    manifest = verify_archive(archive)
+    assert manifest["harness_storage"] == "task-session-v1"
+    assert {"harness/tasks/task-1.events.jsonl", "harness/sessions/session.jsonl"} <= {
+        entry["path"] for entry in manifest["files"]
+    }
+    target = tmp_path / "target"
+    restore_sqlite(archive, target / "db.sqlite3", target / "data", False,
+                   target / "tasks", target / "sessions", services_stopped=True)
+    assert (target / "tasks" / "task-1.events.jsonl").read_text() == '{"result":"full model output"}\n'
+    assert (target / "sessions" / "session.jsonl").read_text() == '{"event":"done"}\n'
+
+
+def test_harness_backup_requires_stopped_and_both_roots(tmp_path):
+    source = tmp_path / "source.db"
+    make_database(source)
+    tasks = tmp_path / "tasks"
+    sessions = tmp_path / "sessions"
+    tasks.mkdir()
+    sessions.mkdir()
+    with pytest.raises(ValueError, match="停机"):
+        create_backup(f"sqlite:///{source}", tmp_path / "data", tmp_path / "backups", tasks, sessions)
+    with pytest.raises(ValueError, match="同时提供"):
+        create_backup(f"sqlite:///{source}", tmp_path / "data", tmp_path / "backups", tasks,
+                      services_stopped=True)
+    with pytest.raises(ValueError, match="重叠"):
+        create_backup(f"sqlite:///{source}", tmp_path / "data", tmp_path / "backups", tasks,
+                      tasks, services_stopped=True)
+    with pytest.raises(ValueError, match="重叠"):
+        create_backup(f"sqlite:///{source}", tasks, tmp_path / "backups", tasks, sessions,
+                      services_stopped=True)
+
+
+def test_harness_restore_rejects_incomplete_or_legacy_target(tmp_path):
+    source = tmp_path / "source.db"
+    make_database(source)
+    tasks = tmp_path / "tasks"
+    sessions = tmp_path / "sessions"
+    tasks.mkdir()
+    sessions.mkdir()
+    bundled = create_backup(f"sqlite:///{source}", tmp_path / "data", tmp_path / "backups",
+                            tasks, sessions, services_stopped=True)
+    target = tmp_path / "target"
+    with pytest.raises(ValueError, match="必须指定"):
+        restore_sqlite(bundled, target / "db", target / "data", False)
+    assert not target.exists()
+    with pytest.raises(ValueError, match="停机"):
+        restore_sqlite(bundled, target / "db", target / "data", False,
+                       target / "tasks", target / "sessions")
+    legacy = create_backup(f"sqlite:///{source}", tmp_path / "data", tmp_path / "old")
+    with pytest.raises(ValueError, match="旧归档"):
+        restore_sqlite(legacy, target / "db", target / "data", False,
+                       target / "tasks", target / "sessions", services_stopped=True)
+
+
+def test_harness_restore_rolls_back_roots_when_database_install_fails(tmp_path, monkeypatch):
+    source = tmp_path / "source.db"
+    make_database(source)
+    tasks = tmp_path / "tasks"
+    sessions = tmp_path / "sessions"
+    tasks.mkdir()
+    sessions.mkdir()
+    (tasks / "index.json").write_text("new")
+    archive = create_backup(f"sqlite:///{source}", tmp_path / "data", tmp_path / "backups",
+                            tasks, sessions, services_stopped=True)
+    target = tmp_path / "target"
+    (target / "tasks").mkdir(parents=True)
+    (target / "sessions").mkdir()
+    (target / "tasks" / "index.json").write_text("old")
+    (target / "sessions" / "session.json").write_text("old-session")
+    original_replace = backup_data.os.replace
+
+    def fail_database(source_path, target_path):
+        if Path(target_path) == target / "db" and Path(source_path).name.startswith(".db.restore-"):
+            raise OSError("simulated install failure")
+        return original_replace(source_path, target_path)
+
+    monkeypatch.setattr(backup_data.os, "replace", fail_database)
+    with pytest.raises(OSError, match="simulated"):
+        restore_sqlite(archive, target / "db", target / "data", True,
+                       target / "tasks", target / "sessions", services_stopped=True)
+    assert (target / "tasks" / "index.json").read_text() == "old"
+    assert (target / "sessions" / "session.json").read_text() == "old-session"
+    assert not (target / "db").exists()
+
+
+def test_sqlite_database_inside_data_dir_is_one_consistent_snapshot(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    source = data / "ai_studio.db"
+    make_database(source)
+    (data / "document.txt").write_text("original")
+    (data / "ai_studio.db-wal").write_text("stale wal")
+    archive = create_backup(f"sqlite:///{source}", data, tmp_path / "backups")
+    manifest = verify_archive(archive)
+    assert not any(entry["path"].startswith("data/ai_studio.db") for entry in manifest["files"])
+    target_data = tmp_path / "target" / "data"
+    restore_sqlite(archive, target_data / "ai_studio.db", target_data, False)
+    assert sqlite3.connect(target_data / "ai_studio.db").execute(
+        "SELECT version_num FROM alembic_version").fetchone()[0] == manifest["schema_revision"]
+    assert (target_data / "document.txt").read_text() == "original"
+    assert not (target_data / "ai_studio.db-wal").exists()
+
+
+def test_harness_cli_requires_stop_and_round_trips_empty_session_root(tmp_path):
+    source = tmp_path / "source.db"
+    make_database(source)
+    tasks = tmp_path / "tasks"
+    sessions = tmp_path / "sessions"
+    tasks.mkdir()
+    sessions.mkdir()
+    (tasks / "index.json").write_text("{}")
+    root = Path(__file__).resolve().parents[2]
+
+    def run(*arguments):
+        return subprocess.run([sys.executable, "scripts/backup_data.py", *arguments],
+                              cwd=root, capture_output=True, text=True, check=False)
+
+    arguments = ("--database-url", f"sqlite:///{source}", "--data-dir", str(tmp_path / "data"),
+                 "--harness-task-dir", str(tasks), "--harness-session-dir", str(sessions),
+                 "--output-dir", str(tmp_path / "backups"))
+    refused = run("backup", *arguments)
+    assert refused.returncode == 1
+    assert "停机" in refused.stderr
+    created = run("backup", *arguments, "--services-stopped")
+    assert created.returncode == 0, created.stderr
+    archive = tmp_path / "backups" / json.loads(created.stdout)["archive"]
+    target = tmp_path / "target"
+    restored = run("restore", str(archive), "--database-path", str(target / "db"),
+                   "--data-dir", str(target / "data"), "--harness-task-dir", str(target / "tasks"),
+                   "--harness-session-dir", str(target / "sessions"), "--services-stopped")
+    assert restored.returncode == 0, restored.stderr
+    assert (target / "tasks" / "index.json").read_text() == "{}"
+    assert list((target / "sessions").iterdir()) == []
+
+
 def test_backup_cli_sqlite_round_trip(tmp_path):
     """Exercise the operator CLI, not only the underlying backup functions."""
     root = Path(__file__).resolve().parents[2]
@@ -278,6 +426,42 @@ def test_backup_rejects_data_symlink(tmp_path):
     (data / "linked.txt").symlink_to(outside)
     with pytest.raises(ValueError, match="符号链接"):
         create_backup(f"sqlite:///{source}", data, tmp_path / "backups")
+
+
+def test_backup_rejects_junction_like_data_directory(tmp_path, monkeypatch):
+    source = tmp_path / "ai_studio.db"
+    make_database(source)
+    data = tmp_path / "data"
+    linked = data / "linked"
+    linked.mkdir(parents=True)
+    (linked / "secret.txt").write_text("do not archive", encoding="utf-8")
+    original = Path.is_junction
+    monkeypatch.setattr(Path, "is_junction", lambda self: self == linked or original(self))
+    with pytest.raises(ValueError, match="符号链接"):
+        create_backup(f"sqlite:///{source}", data, tmp_path / "backups")
+    assert not list((tmp_path / "backups").glob("*.tar.gz"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction runtime contract")
+def test_backup_and_restore_reject_real_windows_junction(tmp_path):
+    source = tmp_path / "ai_studio.db"
+    make_database(source)
+    data = tmp_path / "data"
+    data.mkdir()
+    archive = create_backup(f"sqlite:///{source}", data, tmp_path / "backups")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("keep", encoding="utf-8")
+    junction = tmp_path / "linked-data"
+    result = subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert junction.is_junction()
+    with pytest.raises(ValueError, match="符号链接"):
+        create_backup(f"sqlite:///{source}", junction, tmp_path / "second-backup")
+    with pytest.raises(ValueError, match="符号链接"):
+        restore_sqlite(archive, tmp_path / "restored.db", junction, force=True)
+    assert (outside / "secret.txt").read_text(encoding="utf-8") == "keep"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink permissions are not portable on Windows")
@@ -555,7 +739,7 @@ def test_manifest_summary_does_not_include_uploaded_paths():
     })
     assert summary == {
         "database_kind": "sqlite", "schema_revision": "head",
-        "data_file_count": 1, "file_count": 1,
+        "data_file_count": 1, "harness_storage": "none", "file_count": 1,
     }
     assert "customer-sensitive-name.txt" not in json.dumps(summary)
 
@@ -646,6 +830,41 @@ def test_postgres_restore_failure_keeps_existing_data(tmp_path, monkeypatch):
     assert not list(tmp_path.glob(".restored-data.restore-*"))
 
 
+def test_postgres_failure_rolls_back_harness_roots(tmp_path, monkeypatch):
+    content = {"database.dump": b"pg dump", "harness/tasks/index.json": b"new task",
+               "harness/sessions/session.jsonl": b"new session"}
+    manifest = {
+        "format": 1, "database_kind": "postgresql", "database_url": "postgresql://db/atelier",
+        "schema_revision": "external-pg-dump", "data_file_count": 0,
+        "harness_storage": "task-session-v1",
+        "files": [{"path": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                  for name, data in content.items()],
+    }
+    archive = tmp_path / "postgres.tar.gz"
+    with tarfile.open(archive, "w:gz") as stream:
+        content["manifest.json"] = json.dumps(manifest).encode()
+        for name, data in content.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            stream.addfile(info, io.BytesIO(data))
+    target = tmp_path / "target"
+    tasks = target / "tasks"
+    sessions = target / "sessions"
+    tasks.mkdir(parents=True)
+    sessions.mkdir()
+    (tasks / "index.json").write_text("old task")
+    (sessions / "session.jsonl").write_text("old session")
+    monkeypatch.setattr("scripts.backup_data.subprocess.run", lambda *_args, **_kwargs: type(
+        "Result", (), {"returncode": 1, "stdout": "", "stderr": "database unavailable"}
+    )())
+    with pytest.raises(RuntimeError, match="pg_restore 失败"):
+        postgres_restore(archive, "postgresql://app:secret@db/atelier", target / "data", True,
+                         tasks, sessions, services_stopped=True)
+    assert (tasks / "index.json").read_text() == "old task"
+    assert (sessions / "session.jsonl").read_text() == "old session"
+    assert not (target / "data").exists()
+
+
 def test_postgres_dump_timeout_is_reported(tmp_path, monkeypatch):
     def timeout(*_args, **_kwargs):
         raise subprocess.TimeoutExpired("pg_dump", 1)
@@ -669,3 +888,49 @@ def test_postgres_dump_failure_redacts_provider_output(tmp_path, monkeypatch):
         postgres_dump("postgresql://app:secret@db:5432/atelier", tmp_path / "dump")
     assert "db-secret" not in str(error.value)
     assert "hunter2" not in str(error.value)
+
+
+def test_backup_uses_file_backed_database_password_without_leaking_path(monkeypatch, tmp_path, capsys):
+    from urllib.parse import urlparse
+
+    secret = tmp_path / "db-key"
+    secret.write_text("database-secret-12345\n", encoding="utf-8")
+    monkeypatch.setenv("DATABASE_URL", "")
+    monkeypatch.delenv("POSTGRES_PASSWORD", raising=False)
+    monkeypatch.setenv("AI_STUDIO_DATABASE_PASSWORD_FILE", str(secret))
+    monkeypatch.setattr(sys, "argv", ["backup_data.py", "backup", "--data-dir", str(tmp_path / "data")])
+    captured = []
+
+    def stop_after_configured(url, *_args, **_kwargs):
+        captured.append(url)
+        raise RuntimeError("synthetic backup stop")
+
+    monkeypatch.setattr(backup_data, "create_backup", stop_after_configured)
+    assert backup_data.main() == 1
+    assert len(captured) == 1 and urlparse(captured[0]).password == "database-secret-12345"
+    child_env = backup_data.postgres_environment(urlparse(captured[0]))
+    assert child_env["PGPASSWORD"] == "database-secret-12345"
+    assert "AI_STUDIO_DATABASE_PASSWORD_FILE" not in child_env
+    assert str(secret) not in capsys.readouterr().err
+
+
+def test_restore_can_use_file_backed_password_for_a_separate_database(monkeypatch, tmp_path, capsys):
+    from sqlalchemy.engine import make_url
+
+    secret = tmp_path / "db-key"
+    secret.write_text("database-secret-12345\n", encoding="utf-8")
+    monkeypatch.setenv("AI_STUDIO_DATABASE_PASSWORD_FILE", str(secret))
+    monkeypatch.setenv("DATABASE_URL", "")
+    monkeypatch.delenv("POSTGRES_PASSWORD", raising=False)
+    monkeypatch.setattr(backup_data, "verify_archive", lambda _archive: {"database_kind": "postgresql"})
+    captured = []
+    monkeypatch.setattr(backup_data, "postgres_restore", lambda archive, url, *args, **kwargs: captured.append(url))
+    monkeypatch.setattr(sys, "argv", ["backup_data.py", "restore", str(tmp_path / "archive.tar.gz"),
+                                      "--database-name", "ai_studio_restore", "--data-dir", str(tmp_path / "uploads")])
+    assert backup_data.main() == 0
+    assert make_url(captured[0]).database == "ai_studio_restore"
+    assert make_url(captured[0]).password == "database-secret-12345"
+    assert "database-secret-12345" not in capsys.readouterr().out
+    monkeypatch.setattr(sys, "argv", ["backup_data.py", "restore", str(tmp_path / "archive.tar.gz"),
+                                      "--database-name", "ai_studio", "--data-dir", str(tmp_path / "uploads")])
+    assert backup_data.main() == 1

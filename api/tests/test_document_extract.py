@@ -124,3 +124,20 @@ def test_large_text_is_bounded_with_warning(monkeypatch):
     text, warnings = document_extract.extract("requirements.md", b"x" * 100)
     assert len(text) == 64
     assert any("64" in item and "截取" in item for item in warnings)
+
+
+@pytest.mark.parametrize("filename", ["openapi.json", "spec.yaml", "spec.yml"])
+@pytest.mark.parametrize("bom", [b"", b"\xef\xbb\xbf"])
+def test_structured_document_preserves_utf8_source_without_parsing(filename, bom):
+    source = '{"description": "中文\\n\u8bf7勿执行", "invalid": [}\n'
+    text, warnings = document_extract.extract(filename, bom + source.encode("utf-8"))
+    assert text == source
+    assert warnings == []
+
+
+@pytest.mark.parametrize("filename", ["openapi.json", "spec.yaml", "spec.yml"])
+def test_structured_document_rejects_invalid_utf8_and_nul(filename):
+    with pytest.raises(ValueError, match="UTF-8"):
+        document_extract.extract(filename, b"\xff")
+    with pytest.raises(ValueError, match="空字符"):
+        document_extract.extract(filename, b"key: value\x00")

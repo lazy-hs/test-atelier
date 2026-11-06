@@ -19,6 +19,10 @@ from pathlib import Path
 
 from sqlalchemy import select, text, update
 
+from .runtime_config import install_runtime_config
+
+install_runtime_config()
+
 from . import ai_engine, ai_jobs, suggestion_jobs
 from .db import AiJob, AiModel, AiSettings, AiTool, SessionLocal, SuggestionJob, database_kind
 from .observability import (configure_logging, deployment_release, env_float, monotonic,
@@ -133,16 +137,20 @@ def _load_ai_config(*, log_availability: bool = True) -> None:
 
 
 def _check_migrations() -> None:
-    expected = os.getenv("AI_STUDIO_MIGRATION_HEAD", "20261032_case_timestamps")
+    expected = os.getenv("AI_STUDIO_MIGRATION_HEAD", "20261047_auth_session_revocations")
+    if expected != "20261047_auth_session_revocations":
+        raise RuntimeError("迁移目标版本已过期，请将 AI_STUDIO_MIGRATION_HEAD 更新到当前版本")
     with SessionLocal() as db:
         actual = db.execute(text("SELECT version_num FROM alembic_version")).scalar()
-    if actual != expected:
-        logger.error("worker.migrations.version_mismatch", extra={
-            "event": "worker.migrations.version_mismatch", "component": "external-worker",
-            "error_type": "MigrationVersionMismatch", "revision": actual or "unversioned",
-            "expected_revision": expected, "worker_id": WORKER_ID,
-        })
-        raise RuntimeError(f"数据库迁移版本不匹配：当前 {actual or '空'}，需要 {expected}")
+        if actual != expected:
+            logger.error("worker.migrations.version_mismatch", extra={
+                "event": "worker.migrations.version_mismatch", "component": "external-worker",
+                "error_type": "MigrationVersionMismatch", "revision": actual or "unversioned",
+                "expected_revision": expected, "worker_id": WORKER_ID,
+            })
+            raise RuntimeError(f"数据库迁移版本不匹配：当前 {actual or '空'}，需要 {expected}")
+        from .project_write_fence import assert_project_write_fence
+        assert_project_write_fence(db)
     logger.info("worker.migrations.checked", extra={
         "event": "worker.migrations.checked", "component": "external-worker",
         "revision": actual, "worker_id": WORKER_ID, "database_kind": database_kind,
@@ -230,6 +238,7 @@ def _heartbeat() -> None:
         "timestamp": time.time(),
         "release": deployment_release(),
         "worker_id": WORKER_ID,
+        "harness_only": ai_jobs.harness_only_mode(),
     }
     write_private_atomic(
         HEARTBEAT_PATH,
@@ -323,7 +332,8 @@ def _run_claimed(kind: str, job_id: str) -> None:
         # reload before each claimed job so new work uses the latest provider
         # configuration without requiring a worker restart.
         try:
-            _load_ai_config(log_availability=False)
+            if kind != "ai" or not ai_jobs.harness_only_mode():
+                _load_ai_config(log_availability=False)
         except Exception as exc:
             _log_worker_error("worker.config.reload_failed", job_id=job_id,
                               kind=kind, component="external-worker", worker_id=WORKER_ID,
@@ -386,7 +396,8 @@ def _startup() -> int:
     """Validate the worker environment and recover leases before polling."""
     _production_preflight()
     _check_migrations()
-    _load_ai_config()
+    if not ai_jobs.harness_only_mode():
+        _load_ai_config()
     return _recover_running()
 
 

@@ -16,7 +16,7 @@ const MODE_EXTENSIONS = {
 };
 
 export default function Converter({ projectId, readonly = false }) {
-  const { clearHistory, createPreview, deleteHistory, downloadHistory, downloadResult,
+  const { clearHistory, createPreview, deleteHistory, downloadHistory, downloadSource, downloadResult,
     getConfig, getHistory, getHistoryPreview, savePrefixPath } = useMemo(() => createConverterApi(projectId), [projectId]);
   const [config, setConfig] = useState(null);
   const [conversionMode, setConversionMode] = useState("excel_to_excel");
@@ -203,6 +203,19 @@ export default function Converter({ projectId, readonly = false }) {
     }
   }
 
+  async function handleSourceDownload(id) {
+    setBusy(true);
+    setError("");
+    try {
+      await downloadSource(id);
+      setNotice("原始上传文件已下载");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function handleHistoryDelete(id) {
     const record = history.records.find((item) => item.id === id);
     const name = record?.output_filename || "这条历史记录";
@@ -275,6 +288,7 @@ export default function Converter({ projectId, readonly = false }) {
               onRefresh={loadHistory}
               onView={handleHistoryView}
               onDownload={handleHistoryDownload}
+              onDownloadSource={handleSourceDownload}
               onDelete={readonly ? undefined : handleHistoryDelete}
               onClear={readonly ? undefined : handleHistoryClear}
             />

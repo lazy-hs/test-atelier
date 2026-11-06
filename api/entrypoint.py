@@ -11,7 +11,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .runtime_config import install_runtime_config
 from .observability import deployment_release, redact_sensitive_text, sanitize_log_fields
+
+install_runtime_config(required=Path("config/runtime.json").is_file())
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

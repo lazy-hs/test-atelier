@@ -9,16 +9,40 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_NAME="test-atelier"
 LOG_DIR="$ROOT_DIR/.test-atelier-logs"
 DEP_MARKER="$LOG_DIR/dependencies-$ENV_NAME.sha256"
+API_PID_FILE="$LOG_DIR/api.pid"
 API_PID=""
-CONFIG_ONLY="${TEST_ATELIER_CONFIG_ONLY:-0}"
-SKIP_CONFIG="${TEST_ATELIER_SKIP_CONFIG:-0}"
+PROJECTOR_PID_FILE="$LOG_DIR/harness-projector.pid"
+PROJECTOR_PID=""
+PROJECTOR_HEARTBEAT=""
 
 die() {
   printf '错误：%s\n' "$1" >&2
   exit 1
 }
 
+CONFIG_ONLY=0
+SKIP_CONFIG=0
+for argument in "$@"; do
+  case "$argument" in
+    --config-only) CONFIG_ONLY=1 ;;
+    --skip-config) SKIP_CONFIG=1 ;;
+    *) die "用法：$0 [--config-only] [--skip-config]" ;;
+  esac
+done
+RUNTIME_CONFIG="$ROOT_DIR/config/runtime.json"
+
 cleanup() {
+  if [[ -n "$PROJECTOR_HEARTBEAT" ]]; then
+    rm -f "$PROJECTOR_HEARTBEAT"
+  fi
+  if [[ -n "$PROJECTOR_PID" ]] && kill -0 "$PROJECTOR_PID" 2>/dev/null; then
+    pkill -TERM -P "$PROJECTOR_PID" 2>/dev/null || true
+    kill "$PROJECTOR_PID" 2>/dev/null || true
+    wait "$PROJECTOR_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$PROJECTOR_PID" && -f "$PROJECTOR_PID_FILE" && "$(cat "$PROJECTOR_PID_FILE")" == "$PROJECTOR_PID" ]]; then
+    rm -f "$PROJECTOR_PID_FILE"
+  fi
   if [[ -n "$API_PID" ]] && kill -0 "$API_PID" 2>/dev/null; then
     # conda run is a wrapper; terminate its direct children before the
     # wrapper so the Python API does not remain orphaned after Ctrl+C.
@@ -26,10 +50,14 @@ cleanup() {
     kill "$API_PID" 2>/dev/null || true
     wait "$API_PID" 2>/dev/null || true
   fi
+  if [[ -n "$API_PID" && -f "$API_PID_FILE" && "$(cat "$API_PID_FILE")" == "$API_PID" ]]; then
+    rm -f "$API_PID_FILE"
+  fi
 }
 trap cleanup EXIT INT TERM
 
 [[ -d "$ROOT_DIR/api" && -d "$ROOT_DIR/web" ]] || die "请从 test-atelier 工程目录运行此脚本"
+[[ -s "$RUNTIME_CONFIG" ]] || die "未找到配置文件 $RUNTIME_CONFIG，请先运行 scripts/configure_full_runtime.py"
 command -v npm >/dev/null 2>&1 || die "未找到 npm，请先安装 Node.js 20+"
 command -v curl >/dev/null 2>&1 || die "未找到 curl，请先安装 curl"
 command -v openssl >/dev/null 2>&1 || die "未找到 openssl，请先安装 openssl"
@@ -69,7 +97,7 @@ if [[ "$SKIP_CONFIG" != "1" ]]; then
   )"
   DEP_MARKER_VALUE=""
   [[ -s "$DEP_MARKER" ]] && DEP_MARKER_VALUE="$(cat "$DEP_MARKER")"
-  if [[ "$ENV_CREATED" == "true" || "${TEST_ATELIER_FORCE_INSTALL:-0}" == "1" || \
+  if [[ "$ENV_CREATED" == "true" || \
         "$DEP_MARKER_VALUE" != "$DEP_FINGERPRINT" || ! -d "$ROOT_DIR/web/node_modules" ]]; then
     printf '安装 Python 依赖 ...\n'
     "$CONDA_EXE" run --no-capture-output -n "$ENV_NAME" python -m pip install -r "$ROOT_DIR/api/requirements-dev.txt"
@@ -83,8 +111,13 @@ else
   [[ -d "$ROOT_DIR/web/node_modules" ]] || die "未找到前端依赖，请先运行 configure_environment_linux.sh"
 fi
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ai-studio"
-SECRET_FILE="$CONFIG_DIR/session-secret"
+SECRET_FILE="$(python - "$RUNTIME_CONFIG" <<'PY'
+import json, sys
+from pathlib import Path
+print(Path(json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))['test_atelier']['session_secret_file']).expanduser())
+PY
+)"
+CONFIG_DIR="$(dirname "$SECRET_FILE")"
 mkdir -p "$CONFIG_DIR"
 chmod 700 "$CONFIG_DIR"
 if [[ "$SKIP_CONFIG" == "1" && ! -s "$SECRET_FILE" ]]; then
@@ -94,23 +127,15 @@ if [[ "$SKIP_CONFIG" != "1" && ! -s "$SECRET_FILE" ]]; then
   umask 077
   openssl rand -hex 32 > "$SECRET_FILE"
 fi
-export AI_STUDIO_SESSION_SECRET="$(cat "$SECRET_FILE")"
-export AI_STUDIO_REQUIRE_MIGRATIONS=1
-export AI_STUDIO_MIGRATION_HEAD="20261032_case_timestamps"
-# This launcher starts only the API and Vite. Do not inherit a production
-# external-worker flag or queued AI jobs would have no consumer.
-export AI_STUDIO_EXTERNAL_WORKER=0
-export AI_STUDIO_ENV=development
-
 BOOTSTRAP_MARKER="$LOG_DIR/admin-initialized"
 if [[ "$CONFIG_ONLY" != "1" && ( "$ENV_CREATED" == "true" || ! -f "$BOOTSTRAP_MARKER" ) ]]; then
-  if [[ -z "${AI_STUDIO_ADMIN_PASSWORD:-}" ]]; then
-    read -r -s -p '管理员密码（至少 6 位，直接回车使用默认密码 123456）：' AI_STUDIO_ADMIN_PASSWORD
-    printf '\n'
-  fi
-  AI_STUDIO_ADMIN_PASSWORD="${AI_STUDIO_ADMIN_PASSWORD:-123456}"
-  [[ "${#AI_STUDIO_ADMIN_PASSWORD}" -ge 6 ]] || die "管理员密码至少需要 6 位"
-  export AI_STUDIO_ADMIN_PASSWORD
+  ADMIN_PASSWORD_FILE="$(python - "$RUNTIME_CONFIG" <<'PY'
+import json, sys
+from pathlib import Path
+print(Path(json.loads(Path(sys.argv[1]).read_text())['test_atelier']['admin_password_file']).expanduser())
+PY
+)"
+  [[ -s "$ADMIN_PASSWORD_FILE" ]] || die "未找到管理员密码文件，请运行 scripts/configure_full_runtime.py"
 fi
 
 if [[ "$SKIP_CONFIG" != "1" ]]; then
@@ -127,7 +152,13 @@ PORTS="$(cd "$ROOT_DIR" && "$CONDA_EXE" run --no-capture-output -n "$ENV_NAME" \
   python "$ROOT_DIR/scripts/read_server_ports.py" | tail -n 1)"
 read -r API_PORT WEB_PORT <<< "$PORTS"
 [[ "$API_PORT" =~ ^[0-9]+$ && "$WEB_PORT" =~ ^[0-9]+$ ]] || die "settings.json 中的端口配置无效"
-export AI_STUDIO_API_TARGET="${AI_STUDIO_API_TARGET:-http://127.0.0.1:$API_PORT}"
+HARNESS_ENABLED="$($CONDA_EXE run --no-capture-output -n "$ENV_NAME" python -c 'from api.runtime_config import runtime_environment; print(runtime_environment().get("TEST_ATELIER_HARNESS_URL", ""))' | tail -n 1)"
+if [[ -n "$HARNESS_ENABLED" ]]; then
+  "$CONDA_EXE" run --no-capture-output -n "$ENV_NAME" python \
+    "$ROOT_DIR/scripts/harness_secret_file.py" --config "$RUNTIME_CONFIG" || die "已配置 Harness Host，但作用域密钥无效或不可读取"
+elif [[ "$($CONDA_EXE run --no-capture-output -n "$ENV_NAME" python -c 'from api.runtime_config import runtime_environment; print(runtime_environment().get("TEST_ATELIER_HARNESS_ONLY", "0"))' | tail -n 1)" == "1" ]]; then
+  die "Harness-only 模式必须先配置 TEST_ATELIER_HARNESS_URL"
+fi
 
 API_LOG="$LOG_DIR/api.log"
 if [[ -f "$API_LOG" ]] && [[ "$(stat -c%s "$API_LOG" 2>/dev/null || printf 0)" -gt 52428800 ]]; then
@@ -138,6 +169,7 @@ printf '启动 API（日志：%s）...\n' "$API_LOG"
 (cd "$ROOT_DIR" && "$CONDA_EXE" run --no-capture-output -n "$ENV_NAME" \
   python -m api.uvicorn_entrypoint --host 127.0.0.1 --port "$API_PORT" > "$API_LOG" 2>&1) &
 API_PID=$!
+printf '%s\n' "$API_PID" > "$API_PID_FILE"
 
 API_READY="false"
 for _ in {1..20}; do
@@ -151,6 +183,27 @@ done
 [[ "$API_READY" == "true" ]] || die "API 未在 20 秒内就绪，请查看 $API_LOG"
 touch "$BOOTSTRAP_MARKER"
 
+if [[ -n "$HARNESS_ENABLED" ]]; then
+  # Use the configured path; do not assume the legacy harness-projector-heartbeat log location.
+  PROJECTOR_HEARTBEAT="$(config_value paths projector_heartbeat)"
+  [[ "$PROJECTOR_HEARTBEAT" = /* ]] || die "配置文件中的 Projector 心跳路径必须是绝对路径"
+  mkdir -p "$(dirname "$PROJECTOR_HEARTBEAT")"
+  rm -f "$PROJECTOR_HEARTBEAT"
+  printf '启动 Harness Projector（日志：%s）...\n' "$LOG_DIR/harness-projector.log"
+  (cd "$ROOT_DIR" && "$CONDA_EXE" run --no-capture-output -n "$ENV_NAME" \
+    python -m api.harness_projector > "$LOG_DIR/harness-projector.log" 2>&1) &
+  PROJECTOR_PID=$!
+  printf '%s\n' "$PROJECTOR_PID" > "$PROJECTOR_PID_FILE"
+  for _ in {1..20}; do
+    [[ -f "$PROJECTOR_HEARTBEAT" ]] && break
+    kill -0 "$PROJECTOR_PID" 2>/dev/null || die "Harness Projector 启动失败，请查看 $LOG_DIR/harness-projector.log"
+    sleep 1
+  done
+  [[ -f "$PROJECTOR_HEARTBEAT" ]] && kill -0 "$PROJECTOR_PID" 2>/dev/null || die "Harness Projector 未在 20 秒内就绪，请查看 $LOG_DIR/harness-projector.log"
+fi
+
 printf '启动前端：http://127.0.0.1:%s\n' "$WEB_PORT"
-printf '按 Ctrl+C 可同时停止 API 和前端\n'
+printf '按 Ctrl+C 可同时停止 API、Harness Projector 和前端\n'
+# Keep Vite's development proxy on the same API port as this process.
+export AI_STUDIO_API_TARGET="http://127.0.0.1:$API_PORT"
 (cd "$ROOT_DIR/web" && npm run dev -- --host 127.0.0.1 --port "$WEB_PORT")

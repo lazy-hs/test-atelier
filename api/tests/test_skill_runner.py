@@ -41,6 +41,23 @@ def test_skill_scripts_do_not_receive_application_secrets(monkeypatch):
     assert environment["PATH"] == "/usr/bin"
 
 
+def test_skill_root_default_is_portable_and_env_override_wins(monkeypatch, tmp_path):
+    assert skill_runner.DEFAULT_ROOT.name == "qa-doc-skills"
+    sibling = tmp_path / "sibling" / "qa-doc-skills"
+    home = tmp_path / "home" / "qa-doc-skills"
+    sibling.mkdir(parents=True)
+    home.mkdir(parents=True)
+    monkeypatch.delenv("TEST_ATELIER_SKILL_ROOT", raising=False)
+    monkeypatch.setattr(skill_runner, "DEFAULT_ROOT", sibling)
+    monkeypatch.setattr(skill_runner, "HOME_ROOT", home)
+    assert skill_runner.skill_root() == sibling.resolve()
+    sibling.rmdir()
+    assert skill_runner.skill_root() == home.resolve()
+    configured = tmp_path / "qa-doc-skills"
+    monkeypatch.setenv("TEST_ATELIER_SKILL_ROOT", str(configured))
+    assert skill_runner.skill_root() == configured.resolve()
+
+
 def test_skill_script_failure_redacts_credentials(monkeypatch):
     class Result:
         returncode = 1
@@ -70,6 +87,32 @@ def test_skill_file_reads_are_bounded(tmp_path):
     source = tmp_path / "large-skill.md"
     source.write_text("x" * 100_000, encoding="utf-8")
     assert len(skill_runner._read(source, 128)) == 128
+
+
+def test_frontmatter_folds_multiline_skill_description_without_swallowing_next_key():
+    text = """---
+name: qa-doc-skills-api-parsing
+description: >-
+  解析 OpenAPI 和 Postman 集合，
+  输出接口检查点。
+compatibility: Requires Python 3
+---
+# 正文不属于简介
+"""
+    metadata = skill_runner._frontmatter(text)
+    assert metadata["description"] == "解析 OpenAPI 和 Postman 集合， 输出接口检查点。"
+    assert metadata["compatibility"] == "Requires Python 3"
+    assert skill_runner._frontmatter("---\ndescription: 单行简介\n---\n")["description"] == "单行简介"
+
+
+def test_discover_skills_uses_folded_source_description(monkeypatch, tmp_path):
+    source = tmp_path / "skills" / "api-parsing" / "SKILL.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\ndescription: >-\n  第一行\n  第二行\n---\n# 正文\n", encoding="utf-8")
+    monkeypatch.setenv("TEST_ATELIER_SKILL_ROOT", str(tmp_path))
+    monkeypatch.setattr(skill_runner, "registry_specs", lambda: [skill_runner.SkillSpec(
+        "api-parsing", "api-parsing", "接口解析", "skills/api-parsing/SKILL.md")])
+    assert skill_runner.discover_skills()[0].description == "第一行 第二行"
 
 
 def test_skill_context_has_one_total_budget(monkeypatch, tmp_path):

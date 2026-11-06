@@ -1,0 +1,18 @@
+# Production overlay for the independently built Harness Host image. Runtime
+# values are loaded from config/runtime.json; only Harness cross-service
+# secrets are added here.
+services:
+  api:
+    secrets:
+      - harness_scope_secret
+      - harness_host_api_token
+  harness-projector:
+    secrets:
+      - harness_scope_secret
+      - harness_host_api_token
+
+secrets:
+  harness_scope_secret:
+    file: ./config/secrets/harness_scope_secret
+  harness_host_api_token:
+    file: ./config/secrets/harness_host_api_token

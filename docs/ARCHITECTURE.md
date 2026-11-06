@@ -47,6 +47,10 @@ api/                    后端包
   worker.py             独立 worker 进程（数据库即队列 + 租约 + 心跳）
   skill_runner.py       外部 qa-doc-skills 技能仓发现与脚本执行
   ai_routes.py          AI 工作流路由（需求分析 / 草稿 / Codex 会话 / 模型配置）
+  harness_routes.py     DeepSeek Harness API Bridge（任务、SSE、取消、确认）
+  harness_bridge.py     独立 Harness Node Host HTTP 适配器（不访问数据库）
+  harness_contracts.py  版本化任务/结果 Schema 与来源追溯校验
+  harness_chunking.py   大文档窗口规划（保留源文档偏移，与 Harness Host 分层 map/reduce 对齐）
   suggestion_routes.py  分类法 + 规则/模型建议
   smoke_routes.py       冒烟套件与执行（后端保留，前端入口已下线）
   conversion_routes.py  XMind/Excel 互转与项目历史
@@ -59,7 +63,7 @@ api/                    后端包
   observability.py      结构化日志、脱敏、请求 ID、故障窗口
   metrics.py            Prometheus 指标收集与文本渲染
   ai_rules/             5 份业务规则文档（喂给模型的领域知识）
-  migrations/versions/  Alembic，20 个 revision，head=20261032_case_timestamps
+  migrations/versions/  Alembic 迁移链，head=20261047_auth_session_revocations
   tests/                27 个测试文件
 web/                    前端
   src/App.tsx           登录态 + 路由解析 + 用例域状态中枢（355 行）
@@ -157,6 +161,7 @@ data/                   运行时数据：ai_studio.db、documents、conversions
 | `analysis_runs` | `source_ids`、`status`、`provider`、`result` JSON（需求/歧义）、`version` |
 | `case_drafts` | `analysis_id`、`payload`、`status` draft/published、`case_id` |
 | `ai_jobs` | `kind`、`status`、`request_id`、`lease_owner`/`lease_until`/`lease_heartbeat`、`queue_reserved`、`prompts`/`prompt_sha256`（Prompt 全量留痕） |
+| `harness_tasks` / `harness_task_events` | Harness 任务与 SSE 事件的业务侧投影；保存 `task_id`、主 `session_id`、有界 `session_ids`、版本化结果、远端序号和 Projector 租约，不替代 Harness Session。独立 `api.harness_projector` 消费非终态任务；任务详情请求保留有界远端 catch-up 作为断线补偿。 |
 | `ai_queue_state` | **单行 `id=1`**，`active_jobs` — 跨副本原子容量计数器 |
 | `ai_settings` / `ai_models` / `ai_tools` | local/remote/codex/claude 四通道；models 带 `protocol`、`api_key_encrypted`；tools 为 `codex_cli`/`claude_code` |
 
@@ -285,6 +290,8 @@ data/                   运行时数据：ai_studio.db、documents、conversions
 | `converter/` | 1234 行 JSX/JS 子应用，Shadow DOM 隔离，4 种转换模式 |
 
 **已软下线**：`SmokePage.tsx`（269 行）全仓库无 import，但类型保留在 `api.ts`，`e2e/smoke.spec.ts` 反向断言它不在导航中 —— 有意保留以便回滚。
+
+`ExecutionReportsPage.tsx` 是独立的只读质量报告入口，只展示已完成执行统计与冻结 JSON 报告的受权下载；它不恢复 `SmokePage.tsx` 的编辑/执行导航。
 
 ### 5.3 路由与状态
 
@@ -443,7 +450,7 @@ cd web && npm run dev -- --host 127.0.0.1                        # 终端二
 | `AI_STUDIO_EXTERNAL_WORKER` | `1` = API 只写队列，由独立 worker 消费（Compose 默认开） |
 | `AI_STUDIO_WORKER_LEASE_SECONDS` | 900，必须 > CLI 与技能脚本超时 |
 | `AI_STUDIO_CLI_TEST_TIMEOUT` | 必须 ≤ `AI_STUDIO_CLI_TIMEOUT` |
-| `TEST_ATELIER_SKILL_ROOT` | 技能仓根，默认 `/Users/lazy/huangsheng/project/qa-doc-skills`；Compose 必须显式挂载 |
+| `TEST_ATELIER_SKILL_ROOT` | 技能仓根；开发默认查找 Test Atelier 同级 `qa-doc-skills` 或 `~/qa-doc-skills`，Compose 必须显式挂载 |
 | `AI_STUDIO_REQUIRE_MIGRATIONS` | 生产强制 `1`，不能靠设 `0` 回退到隐式 `create_all` |
 
 完整列表见根 README 的配置表。
@@ -455,7 +462,7 @@ cd web && npm run dev -- --host 127.0.0.1                        # 终端二
 ### 10.1 后端
 
 ```bash
-python -m pytest -q      # 当前基线 361 passed
+python -m pytest -q      # 当前基线 512 passed, 1 skipped
 ```
 
 27 个测试文件，覆盖：AI 设置与工作流、CLI provider、Codex 工作台、转换、文档抽取、治理（core + api）、迁移、队列容量、审核协作、技能 runner、冒烟、存储、建议、团队、worker（含独立 worker 启停）、uvicorn entrypoint。
@@ -479,7 +486,7 @@ AI_STUDIO_E2E_PASSWORD='管理员密码' npm run test:e2e
 
 ### 10.3 CI（`.github/workflows/ci.yml`）
 
-push / PR 触发，执行：后端测试与编译检查、`pip check`、Linux 依赖审计、前端依赖高危漏洞审计、前端构建/lint、构建后 SPA preview smoke、Compose 插值校验、API/Web 镜像构建（Web 还跑 `nginx -t`）、单进程 API smoke、SQLite 独立 worker 启停 + JSON 日志契约校验、一次 PostgreSQL + worker + Nginx 的 Compose smoke、临时 PostgreSQL 上的备份/校验/恢复演练。
+push / PR 触发，执行：macOS、Windows、Linux 三平台启动器与前置检查契约、后端测试与编译检查、`pip check`、Linux 依赖审计、前端依赖高危漏洞审计、前端构建/lint、构建后 SPA preview smoke、Compose 插值校验、API/Web 镜像构建（Web 还跑 `nginx -t`）、单进程 API smoke、SQLite 独立 worker 启停 + JSON 日志契约校验、一次 PostgreSQL + worker + Nginx 的 Compose smoke、临时 PostgreSQL 上的备份/校验/恢复演练。
 
 **尚未覆盖**：真实浏览器、OCR、真实模型、PostgreSQL 多副本、目标环境恢复演练。
 
@@ -503,7 +510,7 @@ push / PR 触发，执行：后端测试与编译检查、`pip check`、Linux �
 | 写操作必须挂 `Depends(csrf)` | 前端 `api.ts` 对非 GET 自动注入 `x-csrf-token` |
 | 改 `version`/`revision` 语义要小心 | 用例用 `version`、分类法与治理组用 `revision`，都是乐观锁；前端靠错误信息含"刷新"触发自动重拉 |
 | worker 心跳文件关闭时不删 | 多副本共享路径，删除会误杀健康副本心跳 |
-| 迁移 head 已变 | 新增迁移后 `test_migrations.py` 的 head 断言和 README 的 `20261032_case_timestamps` 都要同步 |
+| 迁移 head 已变 | 新增迁移后 `test_migrations.py` 的 head 断言和 README 的 `20261047_auth_session_revocations` 都要同步 |
 | 不要给 Prometheus 加高基数 label | 禁止用 `job_id`、用户输入、文件名、完整请求路径做 label |
 | 前端无单元测试 | 只有 e2e，且默认 skip；改组件后至少跑 `npm run build` |
 | `src/converter/` 是 JSX/JS 孤岛 | 无类型校验，无法共享 `ui/` 与 `@/lib`，改动要单独自测 |

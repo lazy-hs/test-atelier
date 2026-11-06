@@ -2,17 +2,18 @@
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import exists, select, update
+from sqlalchemy import exists, func, select, update
 from sqlalchemy.orm import Session
 
-from .db import (Case, ExecutionEvent, ExecutionRun, RunCase, SmokeItem,
+from .db import (Case, ExecutionEvent, ExecutionReport, ExecutionRun, RunCase, SmokeItem,
                  SmokeSuite, User, utcnow)
+from .execution_report_core import BUDGET_SECONDS, RESULTS, build_execution_report, canonical_json, report_integrity_ok
+from .read_snapshot import consistent_read
 
-BUDGET_SECONDS = 30 * 60
 MAX_SECONDS = 4 * 60 * 60
-RESULTS = ("not_run", "passed", "failed", "blocked", "skipped")
 
 
 class SuiteCreate(BaseModel):
@@ -256,7 +257,7 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         run = ExecutionRun(project_id=project_id, suite_id=suite_id, suite_revision=suite.revision,
                            title=suite.title, target_version=suite.target_version,
                            environment=suite.environment, required_chains=list(suite.required_chains),
-                           status="active", started_by=user.id)
+                           frozen_case_count=len(rows), status="active", started_by=user.id)
         db.add(run); db.flush()
         for row in rows:
             case = cases[row.case_id]
@@ -305,10 +306,79 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
                           .order_by(ExecutionRun.id.desc()).limit(50)).all()
         return [run_dict(row, db, include_detail=False) for row in rows]
 
+    @router.get("/execution-statistics")
+    def execution_statistics(project_id: int, suite_id: int | None = Query(default=None, ge=1),
+                             target_version: str | None = Query(default=None, min_length=1, max_length=80),
+                             environment: str | None = Query(default=None, min_length=1, max_length=80),
+                             user: User = Depends(current_user), db: Session = Depends(get_db)):
+        with consistent_read(db.get_bind()) as snapshot_db:
+            project_access(project_id, user, snapshot_db)
+            if suite_id is not None:
+                suite_for(project_id, suite_id, snapshot_db)
+            filters = [ExecutionRun.project_id == project_id, ExecutionRun.status == "completed"]
+            if suite_id is not None:
+                filters.append(ExecutionRun.suite_id == suite_id)
+            if target_version is not None:
+                filters.append(ExecutionRun.target_version == target_version)
+            if environment is not None:
+                filters.append(ExecutionRun.environment == environment)
+            completed_count = snapshot_db.scalar(select(func.count(ExecutionRun.id)).where(*filters)) or 0
+            results = {key: 0 for key in RESULTS}
+            run_count = estimated = actual = 0
+            recent = []
+            rows = snapshot_db.execute(select(ExecutionRun, ExecutionReport).join(
+                ExecutionReport, ExecutionReport.run_id == ExecutionRun.id
+            ).where(*filters, ExecutionReport.completeness == "verified").order_by(
+                ExecutionRun.id.desc())).yield_per(100)
+            for run, snapshot in rows:
+                if not report_integrity_ok(snapshot):
+                    raise HTTPException(503, "执行报告完整性校验失败，无法统计")
+                source = snapshot.payload["source"]
+                if any(source.get(field) != getattr(run, field) for field in (
+                        "suite_id", "suite_revision", "title", "target_version", "environment", "completed_at")):
+                    raise HTTPException(503, "执行报告来源与完成记录不一致，无法统计")
+                run_count += 1
+                for key in RESULTS:
+                    results[key] += getattr(snapshot, f"{key}_count")
+                estimated += snapshot.estimated_seconds
+                actual += snapshot.actual_seconds
+                if len(recent) < 20:
+                    recent.append({"run_id": run.id, "suite_id": run.suite_id,
+                                   "suite_revision": run.suite_revision, "title": run.title,
+                                   "target_version": run.target_version, "environment": run.environment,
+                                   "completed_at": run.completed_at,
+                                   "results": {key: getattr(snapshot, f"{key}_count") for key in RESULTS}})
+        eligible = results["passed"] + results["failed"] + results["blocked"]
+        return {"project_id": project_id,
+                "filters": {"suite_id": suite_id, "target_version": target_version, "environment": environment},
+                "scope": "仅统计有已验证完整性快照的完成执行；历史用例数无法证明的记录不纳入统计，跳过与未执行不计入通过率分母",
+                "run_count": run_count, "case_executions": sum(results.values()), "results": results,
+                "unavailable_runs": max(0, completed_count - run_count),
+                "pass_rate": round(100 * results["passed"] / eligible, 1) if eligible else None,
+                "estimated_seconds": estimated, "actual_seconds": actual,
+                "recent_runs": recent}
+
     @router.get("/execution-runs/{run_id}")
     def get_run(project_id: int, run_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
         project_access(project_id, user, db)
         return run_dict(run_for(project_id, run_id, db), db)
+
+    @router.get("/execution-runs/{run_id}/report")
+    def download_report(project_id: int, run_id: int,
+                        user: User = Depends(current_user), db: Session = Depends(get_db)):
+        project_access(project_id, user, db)
+        run = run_for(project_id, run_id, db)
+        if run.status != "completed" or not run.completed_at:
+            raise HTTPException(409, "请先结束执行，再下载报告")
+        snapshot = db.get(ExecutionReport, run_id)
+        if not snapshot or snapshot.project_id != project_id:
+            raise HTTPException(409, "历史执行快照缺失，无法复核报告")
+        if not report_integrity_ok(snapshot):
+            raise HTTPException(503, "执行报告完整性校验失败，请联系管理员")
+        report = snapshot.payload
+        return Response(content=canonical_json(report) + b"\n", media_type="application/json",
+                        headers={"Content-Disposition": f'attachment; filename="execution-report-{run.id}.json"',
+                                 "Cache-Control": "no-store"})
 
     @router.put("/execution-runs/{run_id}/cases/{run_case_id}", dependencies=[Depends(csrf)])
     def update_result(project_id: int, run_id: int, run_case_id: int, payload: ResultUpdate,
@@ -358,6 +428,25 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
                              .execution_options(synchronize_session=False))
         if changed.rowcount != 1:
             db.rollback(); raise HTTPException(409, "执行记录已被其他成员结束")
+        db.flush(); db.refresh(run)
+        rows = db.scalars(select(RunCase).where(RunCase.run_id == run_id).order_by(RunCase.id)).all()
+        if run.frozen_case_count is None or len(rows) != run.frozen_case_count:
+            db.rollback()
+            raise HTTPException(409, "执行快照缺失，无法结束执行")
+        try:
+            report = build_execution_report(run, rows)
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(409, "执行快照不完整，无法结束执行") from exc
+        counts = report["summary"]["results"]
+        db.add(ExecutionReport(run_id=run_id, project_id=project_id, payload=report,
+                               completeness="verified",
+                               payload_sha256=report["integrity"]["payload_sha256"],
+                               **{f"{key}_count": counts[key] for key in RESULTS},
+                               case_executions=report["summary"]["case_count"],
+                               estimated_seconds=report["summary"]["estimated_seconds"],
+                               actual_seconds=report["summary"]["actual_seconds"],
+                               created_at=run.completed_at))
         db.commit(); db.refresh(run)
         return run_dict(run, db)
 

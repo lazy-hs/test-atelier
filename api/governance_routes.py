@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 from openpyxl import Workbook, load_workbook
+from starlette.background import BackgroundTask
 
 from . import ai_engine
 from .db import (Case, GovernanceChangeLog, GovernanceDirectory, GovernanceDuplicateGroup,
@@ -25,6 +26,7 @@ from .db import (Case, GovernanceChangeLog, GovernanceDirectory, GovernanceDupli
 from .governance_core import (SEP, analyze, content_hash, fingerprint, load_rules, load_whitelist,
                               name_key, predict_domain, source_case_timestamps, split_dir, text, validate_rows)
 from .importers import ImportErrorDetail, parse
+from .storage import ensure_private_directory, is_link_like, open_private_regular_file, write_private_atomic
 
 
 class Decision(BaseModel):
@@ -99,12 +101,7 @@ def _parse_file(filename: str, data: bytes) -> tuple[list[str], list[list], list
 
 def _source_root() -> Path:
     path = Path(os.getenv("AI_STUDIO_DATA_DIR", "data")) / "governance-snapshots"
-    path.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(path, 0o700)
-    except OSError:
-        pass
-    return path
+    return ensure_private_directory(path)
 
 
 def _manager(project_id: int, user: User, db: Session, project_role) -> None:
@@ -198,14 +195,20 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_r
         # whitelist gates apply to M3 new-case validation, not baseline import.
         validation = validate_rows(source_rows[: min(100, len(source_rows))], _rows_for_project(project_id, db), mode="legacy", rules=rules, whitelist=whitelist)
         previous = db.scalar(select(ImportBatch).where(ImportBatch.project_id == project_id, ImportBatch.kind == "governance", ImportBatch.status == "done").order_by(ImportBatch.id.desc()))
+        writable(user, project_id, db, fence=True)
+        duplicate = db.scalar(select(ImportBatch).where(ImportBatch.project_id == project_id, ImportBatch.kind == "governance", ImportBatch.sha256 == digest))
+        if duplicate: raise HTTPException(409, "相同文件已经导入过")
+        snapshot = _source_root() / str(project_id) / f"{digest}.{file.filename.rsplit('.', 1)[-1].lower()}"
         batch = ImportBatch(project_id=project_id, filename=file.filename[:255], headers=headers, rows=rows, warnings=warnings,
                             status="preview", kind="governance", sha256=digest, source_sheet="Tcase_list", rules_hash=rules_hash, row_count=len(rows))
-        db.add(batch); db.commit()
-        snapshot = _source_root() / f"{digest}.{file.filename.rsplit('.', 1)[-1].lower()}"
-        snapshot.write_bytes(data)
-        try: os.chmod(snapshot, 0o600)
-        except OSError: pass
-        batch.snapshot_path = str(snapshot); db.commit()
+        try:
+            write_private_atomic(snapshot, data, root=snapshot.parent.parent)
+            batch.snapshot_path = str(snapshot)
+            db.add(batch); db.commit()
+        except Exception:
+            db.rollback()
+            snapshot.unlink(missing_ok=True)
+            raise
         return {"id": batch.id, "filename": batch.filename, "sha256": digest, "headers": headers, "count": len(rows),
                 "sample": rows[:5], "warnings": warnings, "rules_hash": rules_hash, "whitelist_hash": whitelist_hash,
                 "validation": validation, "previous_batch_id": previous.id if previous else None}
@@ -574,7 +577,6 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_r
             book = Workbook(); sheet = book.active; sheet.title = "Tcase_list"; sheet.append(headers)
             for row in rows: sheet.append([row.get(header, "") for header in headers])
             book.save(output); payload = output.getvalue(); media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"; suffix = "xlsx"
-        digest = uuid.uuid4().hex; destination = _source_root() / f"export-{digest}.{suffix}"; destination.write_bytes(payload)
         selfcheck = {"sheet": "Tcase_list", "headers": headers, "rows": len(rows), "format": format, "readback": True}
         try:
             if format == "xls":
@@ -586,7 +588,19 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_r
                 check_sheet = check_book["Tcase_list"]; selfcheck["readback_rows"] = max(0, check_sheet.max_row - 1); selfcheck["readback_headers"] = [cell.value for cell in next(check_sheet.iter_rows(max_row=1))]; check_book.close()
         except Exception as exc:
             selfcheck = {**selfcheck, "readback": False, "error": type(exc).__name__}
-        job = GovernanceExportJob(project_id=project_id, kind="cases", format=format, path=str(destination), rows=len(rows), selfcheck=selfcheck, created_by=user.id); db.add(job); db.commit()
+        selfcheck = {**selfcheck, "created_sha256": hashlib.sha256(payload).hexdigest(),
+                     "created_size": len(payload)}
+        project_access(project_id, user, db, fence=True)
+        digest = uuid.uuid4().hex
+        destination = _source_root() / str(project_id) / f"export-{digest}.{suffix}"
+        job = GovernanceExportJob(project_id=project_id, kind="cases", format=format, path=str(destination), rows=len(rows), selfcheck=selfcheck, created_by=user.id)
+        try:
+            write_private_atomic(destination, payload, root=destination.parent.parent)
+            db.add(job); db.commit()
+        except Exception:
+            db.rollback()
+            destination.unlink(missing_ok=True)
+            raise
         return {"id": job.id, "filename": destination.name, "rows": len(rows), "selfcheck": selfcheck, "download": f"/api/v1/projects/{project_id}/governance/exports/{job.id}/download"}
 
     @router.get("/exports/{export_id}/selfcheck")
@@ -598,9 +612,32 @@ def build_router(get_db, current_user, csrf, project_access, writable, project_r
     @router.get("/exports/{export_id}/download")
     def export_download(project_id: int, export_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
         project_access(project_id, user, db); job = db.get(GovernanceExportJob, export_id)
-        if not job or job.project_id != project_id or not Path(job.path).is_file(): raise HTTPException(404, "导出文件不存在")
+        if not job or job.project_id != project_id: raise HTTPException(404, "导出文件不存在")
+        path = Path(job.path)
+        root = _source_root()
+        if is_link_like(root.parent) or is_link_like(root / str(project_id)) or path.parent.resolve() not in (root.resolve(), (root / str(project_id)).resolve()):
+            raise HTTPException(404, "导出文件不存在")
+        try:
+            stream, size = open_private_regular_file(path, root=root)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(404, "导出文件不存在") from exc
+        metadata = job.selfcheck or {}
+        if "created_sha256" in metadata or "created_size" in metadata:
+            expected_digest, expected_size = metadata.get("created_sha256"), metadata.get("created_size")
+            if (not isinstance(expected_digest, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_digest)
+                    or type(expected_size) is not int or expected_size < 0 or size != expected_size):
+                stream.close()
+                raise HTTPException(409, "治理导出创建时的文件摘要或大小损坏")
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+            if digest.hexdigest() != expected_digest:
+                stream.close()
+                raise HTTPException(409, "治理导出文件与创建时的摘要不一致")
+            stream.seek(0)
         media_type = "application/vnd.ms-excel" if job.format == "xls" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        return StreamingResponse(Path(job.path).open("rb"), media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{Path(job.path).name}"'})
+        return StreamingResponse(stream, media_type=media_type, background=BackgroundTask(stream.close),
+                                 headers={"Content-Disposition": f'attachment; filename="{path.name}"'})
 
     return router
 

@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import re
 import time
@@ -10,6 +11,7 @@ from docx import Document
 from PIL import Image
 from pypdf import PdfWriter
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 
 os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["AI_STUDIO_SESSION_SECRET"] = "test-only-session-secret-32-characters-long"
@@ -17,13 +19,16 @@ os.environ["AI_STUDIO_ADMIN_PASSWORD"] = "test-admin-password-123"
 
 from api import ai_engine, ai_jobs, ai_routes, skill_runner  # noqa: E402
 from api import main as api_main  # noqa: E402
-from api.db import AiJob, AiQueueState, AiSettings, Base, SessionLocal, engine  # noqa: E402
+from api.db import AiJob, AiQueueState, AiSettings, AnalysisRun, Base, SessionLocal, engine  # noqa: E402
 from api.main import app  # noqa: E402
 
 
 @pytest.fixture
 def context(tmp_path, monkeypatch):
     monkeypatch.setattr(ai_routes, "DOCUMENT_DIR", tmp_path / "documents")
+    from api import conversion_routes
+    monkeypatch.setattr(conversion_routes, "DATA_DIR", tmp_path / "conversions")
+    monkeypatch.setenv("AI_STUDIO_DATA_DIR", str(tmp_path))
     Base.metadata.drop_all(engine)
     with TestClient(app) as client:
         # Cloud-only inference: enable a deterministic remote configuration so
@@ -62,6 +67,21 @@ def fake_model(prompt, schema, _provider):
     return {"cases": [{"module": ["登录"], "title": "有效账号登录", "priority": "P1", "precondition": "有账号",
                        "steps": [{"action": "输入正确账号", "expected": "进入首页"}], "requirement_ids": ["REQ-1"],
                        "method": "EP", "label": "Web", "remark": "", "smoke": ""}]}
+
+
+def test_metrics_file_token_authenticates_and_fails_closed(context, monkeypatch, tmp_path):
+    client, _, _ = context
+    token = tmp_path / "metrics-token"
+    token.write_bytes(b"metrics-file-token-123456\r\n")
+    monkeypatch.delenv("METRICS_TOKEN", raising=False)
+    monkeypatch.setenv("METRICS_TOKEN_FILE", str(token))
+    assert client.get("/api/v1/metrics").status_code == 401
+    assert client.get("/api/v1/metrics", headers={"X-Metrics-Token": "metrics-file-token-123456"}).status_code == 200
+    monkeypatch.setenv("METRICS_TOKEN", "inline-metrics-token-123456")
+    assert client.get("/api/v1/metrics", headers={"X-Metrics-Token": "metrics-file-token-123456"}).status_code == 503
+    monkeypatch.delenv("METRICS_TOKEN")
+    token.unlink()
+    assert client.get("/api/v1/metrics", headers={"X-Metrics-Token": "metrics-file-token-123456"}).status_code == 503
 
 
 def test_document_analysis_authoring_and_exports(context, monkeypatch, tmp_path):
@@ -192,6 +212,10 @@ def test_document_analysis_authoring_and_exports(context, monkeypatch, tmp_path)
     assert overview["document_count"] == 1
     assert overview["draft_count"] == 0
     assert {item["kind"] for item in overview["recent_activity"]} >= {"analysis", "draft", "document"}
+    deleted = client.delete(f"{root}/analyses/{analysis_id}", headers=headers)
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {"id": analysis_id, "deleted": 1}
+    assert client.get(f"{root}/analyses/{analysis_id}").status_code == 404
 
 
 def test_readiness_rejects_traffic_during_shutdown(context, monkeypatch):
@@ -285,6 +309,31 @@ def test_worker_health_logs_unknown_release_for_legacy_worker(context, monkeypat
                for _level, message, fields in records)
 
 
+@pytest.mark.parametrize("api_mode, worker_mode, expected_status", [
+    (True, True, 200), (True, False, 503), (True, None, 503),
+    (False, True, 503), (False, False, 200), (False, None, 200),
+])
+def test_worker_health_detects_harness_cutover_mismatch(context, monkeypatch, tmp_path,
+                                                        api_mode, worker_mode, expected_status):
+    client, _headers, _root = context
+    monkeypatch.setattr(ai_jobs, "EXTERNAL_WORKER", True)
+    monkeypatch.setenv("TEST_ATELIER_HARNESS_ONLY", "1" if api_mode else "0")
+    heartbeat = tmp_path / "worker-heartbeat"
+    payload = {"release": "worker-build"}
+    if worker_mode is not None:
+        payload["harness_only"] = worker_mode
+    heartbeat.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("AI_STUDIO_WORKER_HEARTBEAT", str(heartbeat))
+
+    response = client.get("/api/v1/health/worker")
+
+    assert response.status_code == expected_status
+    if expected_status == 503:
+        assert "Harness-only" in response.json()["detail"]
+    elif worker_mode is not None:
+        assert response.json()["harness_only"] is worker_mode
+
+
 def test_readiness_rejects_unwritable_data_directory(context, monkeypatch, tmp_path):
     client, _headers, _root = context
     monkeypatch.setenv("AI_STUDIO_DATA_DIR", str(tmp_path / "missing-data"))
@@ -358,6 +407,100 @@ def test_word_extraction_and_offline_failure(context, monkeypatch):
     assert client.post(f"{root}/ai/jobs/{job['job_id']}/retry", headers=headers).status_code == 200
     assert wait_job(client, root, job["job_id"])["status"] == "failed"
     assert client.get(f"{root}/ai/jobs/{job['job_id']}/prompt").json()["prompt_calls"] == 2
+
+
+@pytest.mark.parametrize("harness_only, run_status, provider", [
+    (True, "failed", "remote"), (False, "deleting", "remote"), (False, "failed", "harness"),
+])
+def test_legacy_job_retry_rejects_harness_cutover_and_analysis_deletion(context, monkeypatch,
+                                                                       harness_only, run_status, provider):
+    client, headers, root = context
+    project_id = int(root.rsplit("/", 1)[-1])
+    with SessionLocal.begin() as db:
+        db.add(AnalysisRun(id="legacy-retry-run", project_id=project_id, user_id=1,
+                           source_ids=[], provider=provider, status=run_status, result={}))
+        db.add(AiJob(id="legacy-retry-job", project_id=project_id, user_id=1,
+                     analysis_id="legacy-retry-run", kind="analysis", status="failed", error="offline"))
+    monkeypatch.setenv("TEST_ATELIER_HARNESS_ONLY", "1" if harness_only else "0")
+    enqueued = []
+    monkeypatch.setattr(ai_jobs, "enqueue", lambda *args: enqueued.append(args) or True)
+
+    response = client.post(f"{root}/ai/jobs/legacy-retry-job/retry", headers=headers)
+    assert response.status_code == 409
+    assert not enqueued
+    assert client.get(f"{root}/ai/jobs/legacy-retry-job").json()["status"] == "failed"
+    with SessionLocal() as db:
+        assert db.get(AiJob, "legacy-retry-job").error == "offline"
+        assert db.get(AnalysisRun, "legacy-retry-run").status == run_status
+        assert db.get(AnalysisRun, "legacy-retry-run").provider == provider
+
+
+@pytest.mark.parametrize("changed_state, expected_status", [("harness", 409), ("deleted", 404)])
+def test_legacy_generation_rechecks_analysis_after_project_lock(context, monkeypatch,
+                                                                changed_state, expected_status):
+    client, headers, root = context
+    project_id = int(root.rsplit("/", 1)[-1])
+    monkeypatch.setenv("TEST_ATELIER_HARNESS_ONLY", "0")
+    with SessionLocal.begin() as db:
+        db.add(AnalysisRun(id="generation-race", project_id=project_id, user_id=1,
+                           source_ids=[], provider="remote", status="ready", result={}))
+    intercepted = []
+
+    def change_analysis_at_lock(connection, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lower().startswith("update projects set name=") and not intercepted:
+            intercepted.append(True)
+            if changed_state == "deleted":
+                connection.exec_driver_sql("DELETE FROM analysis_runs WHERE id = ?", ("generation-race",))
+            else:
+                connection.exec_driver_sql("UPDATE analysis_runs SET provider = 'harness' WHERE id = ?",
+                                           ("generation-race",))
+
+    event.listen(engine, "before_cursor_execute", change_analysis_at_lock)
+    try:
+        response = client.post(f"{root}/analyses/generation-race/generate",
+                               json={"provider": "remote"}, headers=headers)
+    finally:
+        event.remove(engine, "before_cursor_execute", change_analysis_at_lock)
+
+    assert intercepted and response.status_code == expected_status, response.text
+    with SessionLocal() as db:
+        assert db.query(AiJob).filter_by(analysis_id="generation-race").count() == 0
+
+
+@pytest.mark.parametrize("kind, leased, harness_only, provider", [
+    ("analysis", False, True, "remote"), ("cases", True, True, "remote"),
+    ("analysis", False, False, "harness"), ("cases", True, False, "harness"),
+])
+def test_legacy_job_cannot_execute_after_cutover_or_on_harness_analysis(context, monkeypatch,
+                                                                        kind, leased, harness_only, provider):
+    _client, _headers, root = context
+    project_id = int(root.rsplit("/", 1)[-1])
+    with SessionLocal.begin() as db:
+        db.add(AnalysisRun(id="cutover-run", project_id=project_id, user_id=1, source_ids=[],
+                           provider=provider, status="ready" if kind == "cases" or provider == "harness" else "queued", result={}))
+        db.add(AiJob(id="cutover-job", project_id=project_id, user_id=1, analysis_id="cutover-run",
+                     kind=kind, status="running" if leased else "queued", queue_reserved=True,
+                     lease_owner="worker-1" if leased else "", lease_until=time.time() + 90 if leased else 0))
+        state = db.get(AiQueueState, 1)
+        state.active_jobs = 1
+    monkeypatch.setenv("TEST_ATELIER_HARNESS_ONLY", "1" if harness_only else "0")
+
+    def unexpected_model(*_args):
+        pytest.fail("protected analysis invoked legacy model")
+
+    monkeypatch.setattr(skill_runner, "analyze", unexpected_model)
+    monkeypatch.setattr(skill_runner, "generate_cases", unexpected_model)
+    ai_jobs._process_job("cutover-job", "worker-1" if leased else "")
+
+    with SessionLocal() as db:
+        job = db.get(AiJob, "cutover-job")
+        run = db.get(AnalysisRun, "cutover-run")
+        assert job.status == "failed" and "Harness" in job.error
+        assert job.attempts == 0 and not job.queue_reserved
+        assert job.lease_owner == "" and job.lease_until == 0
+        assert db.get(AiQueueState, 1).active_jobs == 0
+        assert run.status == ("failed" if kind == "analysis" and provider != "harness" else "ready")
+        assert run.provider == provider
 
 
 def test_failed_ai_job_keeps_prompt_for_diagnostics(context, monkeypatch):

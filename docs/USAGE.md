@@ -8,9 +8,17 @@ Python 依赖不限定虚拟环境工具：可以使用 `conda create -n test-at
 
 ### 核心配置文件
 
-启动后会自动生成 `data/config/settings.json`。`server.port` 和 `server.web_port` 分别控制 API 与 Vite 的本地端口，平台启动脚本会读取它们；修改端口后重启服务即可生效。模型设置保存后会立即同步 `models` 节点；技能仓根路径和注册表会同步到 `skills_root`、`skills` 节点，技能节点仅包含路径和基本元数据，不写入技能正文。文件采用私有权限和原子替换写入，适合随 `data/` 一起备份。若部署环境需要独立位置，可设置 `AI_STUDIO_CONFIG_FILE`；不要把包含加密密钥的运行时文件提交到版本库。结构参考 `config/settings.example.json`。
+生产启动配置写入 `config/runtime.json`；`server.api_port` 和 `server.web_port` 分别控制 API 与 Vite，平台启动脚本和 Vite 代理都会读取该文件。模型设置、技能注册表等应用运行数据仍会同步到 `data/config/settings.json`，该文件不再承担生产进程启动配置。不要把包含加密密钥的运行时文件提交到版本库。结构参考 `config/runtime.example.json` 和 `config/settings.example.json`。
 
-本机环境配置与服务启动分开执行。先运行对应系统的 `configure_environment_*` 脚本创建 Conda 环境、按依赖指纹安装依赖、生成会话密钥并迁移数据库，再运行 `start_*` 脚本启动 API 与 Vite。启动脚本只校验已配置的 Conda 环境、前端依赖和会话密钥，不会安装依赖、创建密钥或执行迁移；缺少这些前置文件时会明确提示先完成配置。macOS 使用 `configure_environment_macos.command` + `start_macos.command`，Windows 使用 `configure_environment_windows.ps1` + `start_windows.ps1`，Linux 使用 `configure_environment_linux.sh` + `start_linux.sh`。启动脚本会明确关闭 `AI_STUDIO_EXTERNAL_WORKER`，避免继承生产环境变量后任务进入无人消费的持久队列。原有 `setup_and_start_*` 文件保留兼容，但新部署建议使用分离脚本。Compose 部署时必须额外挂载完整的 `qa-doc-skills` 源目录并设置 `TEST_ATELIER_SKILL_ROOT`。
+本机环境配置与服务启动分开执行。先运行 `python3 scripts/configure_full_runtime.py` 生成
+`config/runtime.json` 和受保护 Secret 文件，再运行对应系统的启动脚本。macOS、Windows、
+Linux 启动器均从该 JSON 读取配置，不要求操作者导出环境变量；配置 Harness URL 时会启动
+独立 Projector。当前交付只支持 macOS、Windows、Linux；其他平台会在生产前置检查中被拒绝。
+原有 `configure_environment_*` 和 `setup_and_start_*` 文件保留兼容，但新部署应优先使用
+JSON 配置入口。Compose 部署使用 `python3 scripts/prepare_production_runtime.py`，技能仓
+路径和 Secret 挂载由 JSON 与 Compose 固定声明。详见 `docs/platform-support.md`。
+
+本机启动器会在 `.test-atelier-logs/api.pid` 写入 API 的根 PID；配置 Harness URL 时还会在 `.test-atelier-logs/harness-projector.pid` 写入 Projector 的根 PID，并在正常退出时清理。需要从另一个终端停止 API 和 Projector 时，macOS 使用 `scripts/stop_macos.command`，Linux 使用 `scripts/stop_linux.sh`，Windows 使用 `scripts/stop_windows.ps1` 或 `scripts/stop_windows.bat`。停止脚本只接受启动器记录且命令行分别包含 `api.uvicorn_entrypoint` 或 `api.harness_projector` 的进程，PID 过期会自动清理；PID 被其他进程占用时会拒绝操作，不按端口杀进程。前端由启动窗口的 `npm run dev` 管理，关闭启动窗口或按 Ctrl+C 后再执行停止脚本即可清理 API 和 Projector；独立 Host 需要另行停止。
 
 ### 生产探针与日志
 
@@ -55,6 +63,11 @@ Web 镜像直接以前台 Nginx 进程启动，避免官方 shell entrypoint 的
 3. 从顶部项目选择器切换项目；切换后页面、历史和权限随项目变化
 4. 不要在多个环境之间复用同一数据库，除非已确认会话密钥、文件目录和迁移版本一致
 
+删除项目时先取消或等待全部执行中任务。若 Harness Host 不可达、旧版 Session
+尚未迁移或私有文件清理失败，项目会保留为“删除待完成”；项目管理中可看到状态并
+重试清理。此时不再选择该项目执行新任务，也不要直接删除数据库行或 Host 目录。
+备份和只读对账步骤见 `docs/harness-backup-recovery.md`。
+
 ### 角色
 
 | 角色 | 可读 | 可写 | 成员管理 | 跨项目 |
@@ -65,6 +78,44 @@ Web 镜像直接以前台 Nginx 进程启动，避免官方 shell entrypoint 的
 | 只读成员 | 当前项目 | 否 | 否 | 否 |
 
 成员被移除或降为只读后，未完成的用例分派会自动解除并留下事件记录。
+
+### 冒烟执行、报告与缺陷
+
+在“用例库”人工审核候选用例，将最终冒烟确认为“是”并保存依据；再打开
+“冒烟执行”，创建套件、填写目标版本/环境与核心链路，逐条选择已审核候选和预计时长。
+30 分钟预算和未覆盖链路仅提示，不会自动删减用例。开始执行会冻结当时的套件修订
+与用例信息；逐条保存通过、失败、阻塞或跳过及实际时长，失败/阻塞/跳过必须写明原因。
+完成全部用例后可结束执行，结束后不能再修改结果，刷新页面仍能查看历史记录。
+只读成员可以查看套件和执行记录，但不能创建或修改。质量报告空态可前往冒烟执行；
+已结束的执行可直接跳转质量报告。
+
+在项目的“质量报告”中查看已完成执行的统计与最近 20 条记录；输入执行 ID 可下载更早
+的 JSON 报告或查看其关联缺陷。报告包含 SHA-256 完整性摘要，旧历史报告如标为
+“未验证完整性”，不能当作经过验证的完整执行统计。只有已完成报告里的失败或阻塞
+用例可登记缺陷。关联缺陷保存独立版本和审计记录，不会更改报告内容或摘要；已解决、
+已关闭时必须填写处理结论。项目只读成员只能查看记录。删除来源用例后仍按冻结快照
+显示来源；删除整个项目会一并清理报告和缺陷。
+
+### 项目知识
+
+项目左侧的“项目知识”保存人工复核后可复用的结论。新建时选择来源类型并输入项目内
+现有产物 ID；从质量报告中的“沉淀知识”可以直接带入执行报告 ID。可引用需求材料、
+已完成的分析或 Harness 任务、用例、转换记录、冻结执行报告与缺陷。系统会校验来源
+所属项目并冻结其标题、版本及必要标识，不会自动把原始材料或模型全文复制为知识。
+保存修改会产生新版本，旧内容可展开复核；“归档”只隐藏当前列表，不删除版本。
+只读成员可查看正文、来源和历史，不可创建或修改。当前每条知识仅能关联一个来源，
+知识页现在可查看条目的直接来源关联及来源版本；来源被移除时只显示先前冻结的标题，不重新读取原文。侧栏“证据关系”可按类型浏览项目产物，点击直接关联继续追踪；删除来源活用例后，仍可查看已完成报告内冻结的用例节点。目录每页 40 项；直接关联每页 100 条，可持续加载后续页。未加载完时会明确提示；加载后页时会重新核对前一页的摘要，发现变化返回冲突，页面提供“从头刷新关联”。摘要只检测相邻页是否变化，不是签名，也不提供跨请求的数据库快照；项目在浏览期间发生变更时仍应刷新后重新核对。
+
+知识页和证据关系页都可下载带逐文件摘要的项目证据 ZIP，其中可能含原始需求材料和新版用例转换的原始上传文件，应在可信位置保存并限制传播。下载后用 `python scripts/verify_project_export.py <下载文件>` 校验；这不是完整数据库/Host Session 的备份，范围和容量上限见 `docs/project-evidence-export.md`。
+
+### 项目模板
+
+项目管理员在“管理项目”中打开某项目的模板入口，输入名称保存当前配置快照；
+选择模板后可核对技能开关、转换选项及已发布分类的摘要，再输入新项目名称创建。
+模板不可覆盖原版本；配置变化后请另存新模板。模板不包含原成员、用例、需求材料、
+历史任务、转换路径或应用管理的模型凭据。新项目会重新核对安装的技能：旧技能已
+移除时拒绝应用；模板保存后才增加的技能默认关闭。旧项目删除时，其模板会一起
+删除，但已创建的新项目保留模板来源 ID 和摘要。只读成员不能保存或应用模板。
 
 ## 用例导入和审核
 
@@ -90,11 +141,12 @@ Web 镜像直接以前台 Nginx 进程启动，避免官方 shell entrypoint 的
 
 ## 需求分析与用例编写
 
-项目技能由 `/Users/lazy/huangsheng/project/qa-doc-skills/` 提供。Skill Runner
-先加载 `skills/hub/SKILL.md`，再按任务选择唯一子 Skill；规则、记忆和 XMind
-生成脚本均以该仓库为准。项目管理员可在“项目技能”中停用不需要的 Skill。
+项目技能由独立的 `qa-doc-skills` 仓库提供。开发环境会自动查找 Test Atelier
+同级 checkout 或 `~/qa-doc-skills`；其他位置请设置 `TEST_ATELIER_SKILL_ROOT`。
+Skill Runner 先加载 `skills/hub/SKILL.md`，再按任务选择唯一子 Skill；规则、记忆和
+XMind 生成脚本均以该仓库为准。项目管理员可在“项目技能”中停用不需要的 Skill。
 
-1. 在“需求分析”上传 Markdown、文本、图片、PDF、`.doc` 或 `.docx`
+1. 在“需求分析”上传 Markdown、文本、`.json`/`.yaml`/`.yml`、图片、PDF、`.doc` 或 `.docx`
 2. 检查提取文本和警告，再选择文档提交分析任务
 3. 任务完成后逐项确认关键歧义；未确认项会阻断草稿生成
 4. 编辑报告或生成用例草稿，逐条修订后保存
@@ -104,7 +156,7 @@ Web 镜像直接以前台 Nginx 进程启动，避免官方 shell entrypoint 的
 
 大文件策略参考 OpenAI Codex 开源实现（Apache-2.0）：Codex 将原文件留在工作目录，按需读取并对项目指令设置总预算，而不是把整个文件一次性放进 prompt。本项目在远程模型和技能适配层使用等价的有界窗口、来源偏移和分层聚合；技能上下文超预算时只截断注入内容，原始技能文件与上传材料仍保留在受控存储中。实现参考：[agents_md.rs](https://github.com/openai/codex/blob/main/codex-rs/core/src/agents_md.rs)、[history.rs](https://github.com/openai/codex/blob/main/codex-rs/core/src/context_manager/history.rs)。
 
-图片和扫描 PDF 需要 Tesseract 的 `chi_sim`、`eng` 语言包；`.doc` 需要 LibreOffice。需求材料单文件默认上限为 100 MiB，可用 `AI_STUDIO_MAX_DOCUMENT_BYTES` 调低或提高；multipart 请求上限由 `AI_STUDIO_MAX_DOCUMENT_REQUEST_BYTES`（默认 110 MiB）控制，边缘 Nginx 也必须同步放宽。Skill Runner 不把大文件全文塞入一次模型上下文，而是按 12000 字符窗口分段执行 requirement-analysis，再以 `AI_STUDIO_ANALYSIS_MERGE_BATCH_SIZE`（默认 16）和 `AI_STUDIO_ANALYSIS_MERGE_BATCH_CHARS`（默认 48000）做分层来源聚合；Hub、子 Skill 和 references 的共享总上下文受 `AI_STUDIO_SKILL_CONTEXT_MAX_CHARS`（默认 120000）限制，超预算文件会被标注截断。提取文本默认不截断（`AI_STUDIO_MAX_EXTRACTED_TEXT_CHARS=0`），可设置正数启用硬上限并返回截断警告；浏览器预览默认最多返回 200000 字符，可用 `AI_STUDIO_DOCUMENT_PREVIEW_CHARS` 调整，不影响完整提取文本或原始下载；`AI_STUDIO_MAX_ANALYSIS_CHUNKS`（默认 128）用于防止模型调用失控，超出时应拆分材料。PDF 最多 100 页；`.docx` 会在解析前检查压缩包路径、条目数和解压后大小，拒绝疑似 ZIP 炸弹或路径穿越文件。OCR 和 LibreOffice 转换均有硬超时，超时会终止整个子进程组，避免解析器子进程残留；解析器子进程不会继承应用会话密钥、数据库地址、指标令牌或云服务凭据。AI 生成只提供候选，不替代人工审核；云端模型暂时不可用时可稍后重试，规则候选和手工审核不受影响。
+`.json`、`.yaml`、`.yml` 仅接受 UTF-8（可带 BOM）的原始文本，不解析或执行内容，也不验证 OpenAPI、Postman 或 YAML 语法。项目技能的 `api-parsing` 可读取这些已授权上传材料；模型解析质量和完整性仍需人工核对，上传成功不等于解析验收。图片和扫描 PDF 需要 Tesseract 的 `chi_sim`、`eng` 语言包；`.doc` 需要 LibreOffice。需求材料单文件默认上限为 100 MiB，可用 `AI_STUDIO_MAX_DOCUMENT_BYTES` 调低或提高；multipart 请求上限由 `AI_STUDIO_MAX_DOCUMENT_REQUEST_BYTES`（默认 110 MiB）控制，边缘 Nginx 也必须同步放宽。Skill Runner 不把大文件全文塞入一次模型上下文，而是按 12000 字符窗口分段执行 requirement-analysis，再以 `AI_STUDIO_ANALYSIS_MERGE_BATCH_SIZE`（默认 16）和 `AI_STUDIO_ANALYSIS_MERGE_BATCH_CHARS`（默认 48000）做分层来源聚合；Hub、子 Skill 和 references 的共享总上下文受 `AI_STUDIO_SKILL_CONTEXT_MAX_CHARS`（默认 120000）限制，超预算文件会被标注截断。提取文本默认不截断（`AI_STUDIO_MAX_EXTRACTED_TEXT_CHARS=0`），可设置正数启用硬上限并返回截断警告；浏览器预览默认最多返回 200000 字符，可用 `AI_STUDIO_DOCUMENT_PREVIEW_CHARS` 调整，不影响完整提取文本或原始下载；`AI_STUDIO_MAX_ANALYSIS_CHUNKS`（默认 128）用于防止模型调用失控，超出时应拆分材料。PDF 最多 100 页；`.docx` 会在解析前检查压缩包路径、条目数和解压后大小，拒绝疑似 ZIP 炸弹或路径穿越文件。OCR 和 LibreOffice 转换均有硬超时，超时会终止整个子进程组，避免解析器子进程残留；解析器子进程不会继承应用会话密钥、数据库地址、指标令牌或云服务凭据。AI 生成只提供候选，不替代人工审核；云端模型暂时不可用时可稍后重试，规则候选和手工审核不受影响。
 
 ### 模型选择
 
@@ -119,7 +171,7 @@ Web 镜像直接以前台 Nginx 进程启动，避免官方 shell entrypoint 的
 `ai.settings.secret_unavailable` 并拒绝继续使用失效配置，请在确认新密钥后
 重新保存远程模型配置，不要把旧密文直接复制到新环境。
 
-本机 CLI provider 由 API 进程使用无 shell 的参数数组启动，并在临时目录内以只读沙箱请求结构化 JSON；页面接受单个可执行文件名或已存在的绝对路径（绝对路径可以包含空格），但不接受带空格的 shell 命令。CLI 子进程和技能仓库内的辅助脚本都不会继承应用会话密钥、数据库地址、远程 API Key、指标令牌或技能仓路径；同时会移除 `AI_STUDIO_*` 以及 Codex 桌面 app-server 的 `CODEX_*` 管道和会话变量，避免后台任务接入交互式桌面会话；CLI 仍会保留自身所需的用户目录、PATH 和认证环境变量。技能仓库辅助脚本受 `AI_STUDIO_SKILL_SCRIPT_TIMEOUT` 限制，worker 停止或租约失效时会终止脚本进程组，不把脚本卡死带入关闭宽限期。空数据库首次启动时会读取 `AI_STUDIO_*` provider 环境变量作为初始配置，后续以“模型配置”页面保存的数据库配置为准。请先在 API 所属用户环境中安装并登录对应 CLI，再在“模型配置”中启用、测试连接，最后在需求分析或用例建议的模型下拉框选择。CLI 的本地账号权限、费用和数据留存策略仍由 CLI 自身控制，启用前应单独审计。
+本机 CLI provider 由 API 进程使用无 shell 的参数数组启动，并在临时目录内以只读沙箱请求结构化 JSON；页面接受单个可执行文件名或已存在的绝对路径（绝对路径可以包含空格），但不接受带空格的 shell 命令。CLI 子进程和技能仓库内的辅助脚本都不会继承应用会话密钥、数据库地址、远程 API Key、指标令牌或技能仓路径；同时会移除 `AI_STUDIO_*` 以及 Codex 桌面 app-server 的 `CODEX_*` 管道和会话变量，避免后台任务接入交互式桌面会话；CLI 仍会保留自身所需的用户目录、PATH 和认证环境变量。技能仓库辅助脚本受 `AI_STUDIO_SKILL_SCRIPT_TIMEOUT` 限制，worker 停止或租约失效时会终止脚本进程组，不把脚本卡死带入关闭宽限期。生产部署的 provider 初始配置写入 `config/runtime.json`，后续以“模型配置”页面保存的数据库配置为准，不要求导出 `AI_STUDIO_*` 环境变量。请先在 API 所属用户环境中安装并登录对应 CLI，再在“模型配置”中启用、测试连接，最后在需求分析或用例建议的模型下拉框选择。CLI 的本地账号权限、费用和数据留存策略仍由 CLI 自身控制，启用前应单独审计。
 
 ### Codex 工作台
 
@@ -140,7 +192,7 @@ Web 镜像直接以前台 Nginx 进程启动，避免官方 shell entrypoint 的
 
 “用例转换”保留原转换工程的四种模式：Excel/CSV → Excel、XMind → Excel（7 列或 15 列）、Excel → XMind。页面支持配置、预览、表格/XMind 结构画布/并排查看、全文搜索、导出以及项目级历史；Excel → XMind 会在导出前展示可缩放、平移的思维导图预览。
 
-转换结果先写临时文件，再原子替换到 `AI_STUDIO_DATA_DIR`；数据库只保存预览和元数据。历史按项目保留 30、60 或 180 天，清理后文件不可恢复。
+转换结果和新版记录的原始上传文件分别原子写入 `AI_STUDIO_DATA_DIR/conversions/<项目 ID>/`；数据库保存预览、来源文件大小及 SHA-256，而不把原始文件存入 JSON。历史可以按项目下载并校验原始上传文件，旧记录没有原件时显示“未留存”，不按同名文件补造关联。历史按项目保留 30、60 或 180 天，清理后输入与输出文件均不可恢复。
 
 ## 数据、备份和安全
 
@@ -204,11 +256,11 @@ Compose 启动后可运行只读部署 smoke，不会上传文档、调用模型
 python scripts/production_smoke.py \
   --base-url http://127.0.0.1:8080 \
   --metrics-token "$METRICS_TOKEN" \
-  --require-worker --require-web \
+  --require-worker --require-web --expected-harness-mode off \
   --expected-release "${AI_STUDIO_RELEASE:-}" --jsonl
 ```
 
-smoke 会检查 live、ready、metrics、worker（启用时）、`X-Request-ID`、`no-store`、数据库连接池与 CLI 可用性指标和基础安全响应头；设置 `--metrics-token` 时还会验证未授权 metrics 请求被拒绝。传入 `--expected-release` 后还会核对 live/ready/worker 的发布标识（worker 使用心跳中的 `worker_release`），确认实际流量和任务消费者命中的构建版本。`--json` 保留详细检查列表，`--jsonl` 输出可直接采集的单行日志事件。HTTPS 入口可加 `--require-https`，额外校验 HTTPS 和 HSTS；失败时返回非零退出码。
+smoke 会检查 live、ready、metrics、worker（启用时）、`X-Request-ID`、`no-store`、数据库连接池与 CLI 可用性指标和基础安全响应头；设置 `--metrics-token` 时还会验证未授权 metrics 请求被拒绝。传入 `--expected-release` 后还会核对 live/ready/worker 的发布标识（worker 使用心跳中的 `worker_release`），确认实际流量和任务消费者命中的构建版本。切换到 Harness-only 时把 `--expected-harness-mode off` 改为 `on`，强制核对 API/worker 一致的模式标记；缺少 `--require-worker` 会失败。`--json` 保留详细检查列表，`--jsonl` 输出可直接采集的单行日志事件。HTTPS 入口可加 `--require-https`，额外校验 HTTPS 和 HSTS；失败时返回非零退出码。
 
 ## 常见问题
 
@@ -216,7 +268,7 @@ smoke 会检查 live、ready、metrics、worker（启用时）、`X-Request-ID`�
 | --- | --- |
 | 启动提示 `AI_STUDIO_SESSION_SECRET` 无效 | 设置至少 32 个字符，并在后续启动中保持不变 |
 | 首次启动提示管理员密码 | 首次创建运行环境时可输入至少 6 个字符；直接回车使用默认密码 123456。已有环境会跳过密码配置；生产环境仍建议使用密码管理器生成并轮换强密码 |
-| 页面提示无法连接 API | 检查 `data/config/settings.json` 的 `server.port`，并确认前端使用同一 API 端口；手动启动前端时设置 `AI_STUDIO_API_TARGET` |
+| 页面提示无法连接 API | 检查 `config/runtime.json` 的 `server.api_port`，确认 API 和 Vite 使用同一配置；修改后重启启动器 |
 | 分析任务失败 | 检查云端模型地址、模型名称和 API Key；修复后在页面重试 |
 | 测试 Codex CLI 提示远程模型缺少 API Key | 远程模型的密钥已保存时页面不会回显原文；不需要重新输入，更新到包含 CLI provider 修复的 API 后重新加载页面再测试 |
 | Codex CLI 测试失败 | 在运行 API 的同一用户环境执行 `codex --version` 和一次最小结构化请求；确认 `PATH`、Codex 登录状态和页面中的命令路径一致 |

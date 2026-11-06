@@ -12,7 +12,9 @@ services:
     environment:
       POSTGRES_DB: ai_studio
       POSTGRES_USER: ai_studio
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
@@ -46,56 +48,19 @@ services:
     build:
       context: .
       dockerfile: api/Dockerfile
-    environment:
-      DATABASE_URL: postgresql+psycopg://ai_studio:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db:5432/ai_studio
-      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
-      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
-      AI_STUDIO_SESSION_SECRET: ${AI_STUDIO_SESSION_SECRET:?Set AI_STUDIO_SESSION_SECRET}
-      AI_STUDIO_ENV: ${AI_STUDIO_ENV:-production}
-      AI_STUDIO_RELEASE: ${AI_STUDIO_RELEASE:-}
-      AI_STUDIO_ADMIN_PASSWORD: ${AI_STUDIO_ADMIN_PASSWORD:?Set AI_STUDIO_ADMIN_PASSWORD}
-      AI_STUDIO_DATA_DIR: /app/data
-      TEST_ATELIER_SKILL_ROOT: /app/qa-doc-skills
-      AI_STUDIO_REQUIRE_MIGRATIONS: ${AI_STUDIO_REQUIRE_MIGRATIONS:-1}
-      AI_STUDIO_MIGRATION_HEAD: ${AI_STUDIO_MIGRATION_HEAD:-20261032_case_timestamps}
-      AI_STUDIO_MIGRATION_TIMEOUT: ${AI_STUDIO_MIGRATION_TIMEOUT:-120}
-      AI_STUDIO_SHUTDOWN_TIMEOUT: ${AI_STUDIO_SHUTDOWN_TIMEOUT:-25}
-      AI_STUDIO_MAX_SUBMITTED_JOBS: ${AI_STUDIO_MAX_SUBMITTED_JOBS:-100}
-      AI_STUDIO_LOGIN_FAILURE_LIMIT: ${AI_STUDIO_LOGIN_FAILURE_LIMIT:-8}
-      AI_STUDIO_LOGIN_FAILURE_WINDOW_SECONDS: ${AI_STUDIO_LOGIN_FAILURE_WINDOW_SECONDS:-60}
-      AI_STUDIO_SESSION_MAX_AGE: ${AI_STUDIO_SESSION_MAX_AGE:-28800}
-      AI_STUDIO_MAX_REQUEST_BYTES: ${AI_STUDIO_MAX_REQUEST_BYTES:-26214400}
-      AI_STUDIO_MAX_DOCUMENT_BYTES: ${AI_STUDIO_MAX_DOCUMENT_BYTES:-104857600}
-      AI_STUDIO_MAX_DOCUMENT_REQUEST_BYTES: ${AI_STUDIO_MAX_DOCUMENT_REQUEST_BYTES:-115343360}
-      AI_STUDIO_TRUST_PROXY_HEADERS: ${AI_STUDIO_TRUST_PROXY_HEADERS:-1}
-      AI_STUDIO_EXTERNAL_WORKER: ${AI_STUDIO_EXTERNAL_WORKER:-1}
-      AI_STUDIO_WORKER_HEARTBEAT: /app/data/.worker-heartbeat
-      AI_STUDIO_WORKER_HEARTBEAT_SECONDS: ${AI_STUDIO_WORKER_HEARTBEAT_SECONDS:-5}
-      AI_STUDIO_REMOTE_ENABLED: ${AI_STUDIO_REMOTE_ENABLED:-0}
-      AI_STUDIO_REMOTE_URL: ${AI_STUDIO_REMOTE_URL:-}
-      AI_STUDIO_REMOTE_MODEL: ${AI_STUDIO_REMOTE_MODEL:-}
-      AI_STUDIO_REMOTE_API_KEY: ${AI_STUDIO_REMOTE_API_KEY:-}
-      AI_STUDIO_CODEX_ENABLED: ${AI_STUDIO_CODEX_ENABLED:-0}
-      AI_STUDIO_CODEX_COMMAND: ${AI_STUDIO_CODEX_COMMAND:-codex}
-      AI_STUDIO_CODEX_MODEL: ${AI_STUDIO_CODEX_MODEL:-}
-      AI_STUDIO_CLAUDE_ENABLED: ${AI_STUDIO_CLAUDE_ENABLED:-0}
-      AI_STUDIO_CLAUDE_COMMAND: ${AI_STUDIO_CLAUDE_COMMAND:-claude}
-      AI_STUDIO_CLAUDE_MODEL: ${AI_STUDIO_CLAUDE_MODEL:-}
-      AI_STUDIO_CLI_TIMEOUT: ${AI_STUDIO_CLI_TIMEOUT:-600}
-      AI_STUDIO_CLI_TEST_TIMEOUT: ${AI_STUDIO_CLI_TEST_TIMEOUT:-45}
-      AI_STUDIO_SKILL_SCRIPT_TIMEOUT: ${AI_STUDIO_SKILL_SCRIPT_TIMEOUT:-120}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      LOG_FORMAT: ${LOG_FORMAT:-json}
-      LOG_INCLUDE_TRACEBACK: ${LOG_INCLUDE_TRACEBACK:-0}
-      METRICS_ENABLED: ${METRICS_ENABLED:-1}
-      METRICS_TOKEN: ${METRICS_TOKEN:-}
-      COOKIE_SECURE: ${COOKIE_SECURE:-0}
     extra_hosts:
       - host.docker.internal:host-gateway
     volumes:
       - files_data:/app/data
-      - ${TEST_ATELIER_SKILL_ROOT:?Set TEST_ATELIER_SKILL_ROOT}:/app/qa-doc-skills:ro
+      - ./config/runtime.json:/app/config/runtime.json:ro
+      - ../qa-doc-skills:/app/qa-doc-skills:ro
+    secrets:
+      - postgres_password
+      - atelier_session_secret
+      - atelier_admin_password
+      - atelier_metrics_token
+      - harness_scope_secret
+      - harness_host_api_token
     depends_on:
       db:
         condition: service_healthy
@@ -128,50 +93,64 @@ services:
     build:
       context: .
       dockerfile: api/Dockerfile
-    environment:
-      DATABASE_URL: postgresql+psycopg://ai_studio:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db:5432/ai_studio
-      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
-      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
-      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
-      AI_STUDIO_SESSION_SECRET: ${AI_STUDIO_SESSION_SECRET:?Set AI_STUDIO_SESSION_SECRET}
-      AI_STUDIO_ENV: ${AI_STUDIO_ENV:-production}
-      AI_STUDIO_RELEASE: ${AI_STUDIO_RELEASE:-}
-      AI_STUDIO_DATA_DIR: /app/data
-      TEST_ATELIER_SKILL_ROOT: /app/qa-doc-skills
-      AI_STUDIO_EXTERNAL_WORKER: "1"
-      AI_STUDIO_MAX_SUBMITTED_JOBS: ${AI_STUDIO_MAX_SUBMITTED_JOBS:-100}
-      AI_STUDIO_REQUIRE_MIGRATIONS: "1"
-      AI_STUDIO_MIGRATION_HEAD: ${AI_STUDIO_MIGRATION_HEAD:-20261032_case_timestamps}
-      AI_STUDIO_WORKER_POLL_SECONDS: ${AI_STUDIO_WORKER_POLL_SECONDS:-1}
-      AI_STUDIO_WORKER_HEARTBEAT_SECONDS: ${AI_STUDIO_WORKER_HEARTBEAT_SECONDS:-5}
-      AI_STUDIO_WORKER_LEASE_SECONDS: ${AI_STUDIO_WORKER_LEASE_SECONDS:-900}
-      AI_STUDIO_WORKER_ERROR_LOG_INTERVAL_SECONDS: ${AI_STUDIO_WORKER_ERROR_LOG_INTERVAL_SECONDS:-30}
-      AI_STUDIO_WORKER_HEARTBEAT: /app/data/.worker-heartbeat
-      AI_STUDIO_REMOTE_ENABLED: ${AI_STUDIO_REMOTE_ENABLED:-0}
-      AI_STUDIO_REMOTE_URL: ${AI_STUDIO_REMOTE_URL:-}
-      AI_STUDIO_REMOTE_MODEL: ${AI_STUDIO_REMOTE_MODEL:-}
-      AI_STUDIO_CODEX_ENABLED: ${AI_STUDIO_CODEX_ENABLED:-0}
-      AI_STUDIO_CODEX_COMMAND: ${AI_STUDIO_CODEX_COMMAND:-codex}
-      AI_STUDIO_CODEX_MODEL: ${AI_STUDIO_CODEX_MODEL:-}
-      AI_STUDIO_CLAUDE_ENABLED: ${AI_STUDIO_CLAUDE_ENABLED:-0}
-      AI_STUDIO_CLAUDE_COMMAND: ${AI_STUDIO_CLAUDE_COMMAND:-claude}
-      AI_STUDIO_CLAUDE_MODEL: ${AI_STUDIO_CLAUDE_MODEL:-}
-      AI_STUDIO_CLI_TIMEOUT: ${AI_STUDIO_CLI_TIMEOUT:-600}
-      AI_STUDIO_SKILL_SCRIPT_TIMEOUT: ${AI_STUDIO_SKILL_SCRIPT_TIMEOUT:-120}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      LOG_FORMAT: ${LOG_FORMAT:-json}
-      LOG_INCLUDE_TRACEBACK: ${LOG_INCLUDE_TRACEBACK:-0}
     extra_hosts:
       - host.docker.internal:host-gateway
     volumes:
       - files_data:/app/data
-      - ${TEST_ATELIER_SKILL_ROOT:?Set TEST_ATELIER_SKILL_ROOT}:/app/qa-doc-skills:ro
+      - ./config/runtime.json:/app/config/runtime.json:ro
+      - ../qa-doc-skills:/app/qa-doc-skills:ro
+    secrets:
+      - postgres_password
+      - atelier_session_secret
+      - harness_scope_secret
+      - harness_host_api_token
     depends_on:
       api:
         condition: service_healthy
-    command: ["python", "-m", "api.worker_entrypoint"]
+    command: ["python", "-u", "-m", "api.worker_entrypoint"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import os,stat,time; p=os.environ.get('AI_STUDIO_WORKER_HEARTBEAT','/app/data/.worker-heartbeat'); s=os.lstat(p); threshold=max(30.0,float(os.environ.get('AI_STUDIO_WORKER_HEARTBEAT_SECONDS','5'))*3); assert stat.S_ISREG(s.st_mode) and time.time()-s.st_mtime<threshold"]
+      test: ["CMD", "python", "-c", "import os,stat,time,urllib.request; p='/app/data/.worker-heartbeat'; s=os.lstat(p); assert stat.S_ISREG(s.st_mode) and time.time()-s.st_mtime<30; urllib.request.urlopen('http://api:8000/api/v1/health/worker',timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    stop_grace_period: 30s
+
+  harness-projector:
+    init: true
+    restart: unless-stopped
+    # The projector only reads the Harness event stream and writes the shared
+    # database; it has no HTTP listener or provider credentials of its own.
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=64m
+      - /home/app:rw,nosuid,nodev,size=64m
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "3"
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    volumes:
+      - files_data:/app/data
+      - ./config/runtime.json:/app/config/runtime.json:ro
+    secrets:
+      - postgres_password
+      - atelier_session_secret
+      - harness_scope_secret
+      - harness_host_api_token
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["python", "-u", "-m", "api.harness_projector"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,stat,time; p='/app/data/.harness-projector-heartbeat'; s=os.lstat(p); assert stat.S_ISREG(s.st_mode) and time.time()-s.st_mtime<30"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -205,6 +184,8 @@ services:
         condition: service_healthy
       worker:
         condition: service_healthy
+      harness-projector:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1"]
       interval: 10s
@@ -216,3 +197,17 @@ services:
 volumes:
   db_data:
   files_data:
+
+secrets:
+  postgres_password:
+    file: ./config/secrets/postgres_password
+  atelier_session_secret:
+    file: ./config/secrets/atelier_session_secret
+  atelier_admin_password:
+    file: ./config/secrets/atelier_admin_password
+  atelier_metrics_token:
+    file: ./config/secrets/atelier_metrics_token
+  harness_scope_secret:
+    file: ./config/secrets/harness_scope_secret
+  harness_host_api_token:
+    file: ./config/secrets/harness_host_api_token

@@ -168,6 +168,51 @@ def test_claimed_job_is_requeued_when_provider_reload_fails(tmp_path, monkeypatc
         assert (job.status, job.lease_owner, job.lease_until, job.lease_heartbeat) == ("queued", "", 0.0, 0.0)
 
 
+def test_harness_cutover_does_not_reload_legacy_provider_before_failing_job(tmp_path, monkeypatch):
+    session_factory = _session_factory(tmp_path)
+    with session_factory.begin() as db:
+        db.add(AiJob(id="job", project_id=1, user_id=1, analysis_id="analysis", kind="analysis",
+                     status="running", lease_owner="worker-test", lease_until=time.time() + 60))
+    monkeypatch.setenv("TEST_ATELIER_HARNESS_ONLY", "1")
+    monkeypatch.setattr(worker, "SessionLocal", session_factory)
+    monkeypatch.setattr(worker, "WORKER_ID", "worker-test")
+    monkeypatch.setattr(worker, "_lease_loop", lambda *_args: None)
+    monkeypatch.setattr(worker, "_load_ai_config", lambda **_kwargs: pytest.fail("legacy provider loaded"))
+    processed = []
+    monkeypatch.setattr(worker.ai_jobs, "process_job", lambda *args, **kwargs: processed.append((args, kwargs)))
+
+    worker._run_claimed("ai", "job")
+
+    assert processed == [(("job",), {"lease_owner": "worker-test"})]
+
+
+def test_harness_cutover_worker_startup_does_not_require_legacy_provider(monkeypatch):
+    monkeypatch.setenv("TEST_ATELIER_HARNESS_ONLY", "1")
+    monkeypatch.setattr(worker, "_production_preflight", lambda: None)
+    monkeypatch.setattr(worker, "_check_migrations", lambda: None)
+    monkeypatch.setattr(worker, "_load_ai_config", lambda **_kwargs: pytest.fail("legacy provider loaded"))
+    monkeypatch.setattr(worker, "_recover_running", lambda: 3)
+
+    assert worker._startup() == 3
+
+
+def test_harness_cutover_keeps_suggestion_provider_reload(tmp_path, monkeypatch):
+    session_factory = _session_factory(tmp_path)
+    with session_factory.begin() as db:
+        db.add(SuggestionJob(id="suggestion", project_id=1, created_by=1, provider="remote",
+                             case_ids=[1], total=1, status="running", lease_owner="worker-test"))
+    monkeypatch.setenv("TEST_ATELIER_HARNESS_ONLY", "1")
+    monkeypatch.setattr(worker, "SessionLocal", session_factory)
+    monkeypatch.setattr(worker, "_lease_loop", lambda *_args: None)
+    loaded = []
+    monkeypatch.setattr(worker, "_load_ai_config", lambda **kwargs: loaded.append(kwargs))
+    monkeypatch.setattr(worker.suggestion_jobs, "process_job", lambda *_args, **_kwargs: None)
+
+    worker._run_claimed("suggestion", "suggestion")
+
+    assert loaded == [{"log_availability": False}]
+
+
 def test_heartbeat_pauses_while_database_claims_are_degraded(tmp_path, monkeypatch):
     heartbeat = tmp_path / "worker-heartbeat"
     monkeypatch.setattr(worker, "HEARTBEAT_PATH", heartbeat)
@@ -194,7 +239,17 @@ def test_heartbeat_records_bounded_worker_release(tmp_path, monkeypatch):
     payload = json.loads(heartbeat.read_text(encoding="utf-8"))
     assert payload["release"] == "release-2026.10.18"
     assert payload["worker_id"] == "worker-test"
+    assert payload["harness_only"] is False
     assert isinstance(payload["timestamp"], float)
+
+
+def test_heartbeat_records_harness_cutover_mode(tmp_path, monkeypatch):
+    monkeypatch.setattr(worker, "HEARTBEAT_PATH", tmp_path / "worker-heartbeat")
+    monkeypatch.setenv("TEST_ATELIER_HARNESS_ONLY", "1")
+
+    worker._heartbeat()
+
+    assert json.loads(worker.HEARTBEAT_PATH.read_text(encoding="utf-8"))["harness_only"] is True
 
 
 def test_worker_shutdown_does_not_delete_shared_heartbeat(tmp_path, monkeypatch):

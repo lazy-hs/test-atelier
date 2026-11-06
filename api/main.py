@@ -11,7 +11,7 @@ import threading
 import tempfile
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -19,24 +19,32 @@ from argon2 import PasswordHasher
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, exists, func, select, text, update
+from sqlalchemy import delete, exists, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 from openpyxl import Workbook
 
-from .db import (Base, AiQueueState, AiSettings, AiModel, AiTool, AiJob, AnalysisRun, Case, CaseComment, CaseDraft, CaseSuggestion, CodexMessage, CodexSession, ConversionRecord, ConversionSettings, ExecutionRun, ImportBatch,
+from .runtime_config import install_runtime_config
+
+# The deployment JSON is authoritative.  This compatibility install runs
+# before importing modules whose constants historically read os.environ.
+install_runtime_config()
+
+from .db import (Base, AiQueueState, AiSettings, AiModel, AiTool, AiJob, AnalysisRun, Case, CaseComment, CaseDraft, CaseSuggestion, CodexMessage, CodexSession, ConversionRecord, ConversionSettings, ExecutionDefect, ExecutionDefectEvent, ExecutionReport, ExecutionRun, ImportBatch, KnowledgeEntry, KnowledgeRevision,
                  GovernanceChangeLog, GovernanceDirectory, GovernanceDuplicateGroup, GovernanceDuplicateMember, GovernanceExportJob, GovernanceMetricSnapshot, GovernanceValidationRun,
-                 Membership, MembershipEvent, Project, ReviewEvent, RunCase, SessionLocal,
-                 ProjectSkill, SmokeItem, SmokeSuite, SourceDocument, SuggestionJob, TaxonomyVersion, User,
-                 ExecutionEvent, WorkItem, database_kind, engine, utcnow)
+                 HarnessTask, HarnessTaskEvent, Membership, MembershipEvent, Project, ReviewEvent, RunCase, SessionLocal,
+                 ProjectSkill, ProjectTemplate, ProjectTemplateApplication, SmokeItem, SmokeSuite, SourceDocument, SuggestionJob, TaxonomyVersion, User,
+                 ExecutionEvent, SessionRevocation, WorkItem, database_kind, engine, utcnow)
 from .skill_runner import SkillRunnerError, discover_skills, skill_root
 from .importers import ImportErrorDetail, parse
 from .governance_core import source_case_timestamps
 from .observability import (FailureWindow, configure_logging, deployment_release, env_float, env_int,
-                            monotonic, new_request_id, redact_sensitive_text, reset_request_id, set_request_id)
-from .storage import ensure_private_directory, open_private_regular_file
+                            monotonic, new_request_id, redact_sensitive_text, request_id as current_request_id,
+                            reset_request_id, set_request_id)
+from .storage import ensure_private_directory, is_link_like, open_private_regular_file, remove_private_file
 from . import config_file, metrics
+from scripts.deployment_secret_file import configured_secret
 
 
 logger = configure_logging()
@@ -46,7 +54,10 @@ class SessionSecretRequired(RuntimeError):
     """Raised when the application session secret is missing or too short."""
 
 
-secret = os.getenv("AI_STUDIO_SESSION_SECRET")
+try:
+    secret = configured_secret("AI_STUDIO_SESSION_SECRET")
+except ValueError:
+    secret = ""
 if not secret or len(secret) < 32:
     logger.error("application.import_failed", extra={
         "event": "application.import_failed", "component": "configuration",
@@ -111,6 +122,12 @@ def _login_failure_keys(request: Request, username: str) -> tuple[str, ...]:
     )
 
 
+def _session_nonce_hash(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _client_address(request: Request) -> str:
     """Resolve a client address only when proxy headers are explicitly trusted.
 
@@ -155,7 +172,11 @@ def _validate_runtime_security() -> None:
         return
     if os.getenv("COOKIE_SECURE", "0").strip() != "1":
         raise CookieSecureRequired("生产环境必须启用 COOKIE_SECURE=1")
-    if len(os.getenv("METRICS_TOKEN", "").strip()) < 16:
+    try:
+        metrics_token = configured_secret("METRICS_TOKEN")
+    except ValueError as exc:
+        raise MetricsTokenRequired("生产环境必须配置有效的 METRICS_TOKEN") from exc
+    if len(metrics_token) < 16:
         raise MetricsTokenRequired("生产环境必须配置至少 16 个字符的 METRICS_TOKEN")
     if os.getenv("LOG_FORMAT", "json").strip().lower() != "json":
         # The normal container entrypoint catches this in preflight. Keep the
@@ -265,6 +286,22 @@ def _heartbeat_release(path: str | Path) -> str:
     return release if isinstance(release, str) and _HEARTBEAT_RELEASE_PATTERN.fullmatch(release) else ""
 
 
+def _heartbeat_harness_only(path: str | Path) -> bool | None:
+    """Read the worker cutover mode; old or invalid heartbeats are unknown."""
+    heartbeat = Path(path)
+    stream, _ = open_private_regular_file(heartbeat, root=heartbeat.parent)
+    try:
+        raw = stream.read(4096)
+    finally:
+        stream.close()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    mode = payload.get("harness_only") if isinstance(payload, dict) else None
+    return mode if type(mode) is bool else None
+
+
 def _log_readiness_failure(event: str, *, level: int = logging.ERROR, **fields) -> None:
     """Rate-limit repeated probe failures without hiding the 503 response.
 
@@ -288,8 +325,9 @@ def _configured_skill_root_missing() -> list[str]:
     A mounted directory can exist while the actual workflow files are absent
     (for example after an incorrect Docker volume mount).  Readiness must fail
     before traffic reaches an otherwise healthy-looking API in that case.
-    Development keeps the historical implicit default path, so this stricter
-    check is only applied when ``TEST_ATELIER_SKILL_ROOT`` is explicitly set.
+    Development keeps the implicit sibling/home fallback resolved by
+    ``skill_runner.skill_root``; this stricter check is only applied when
+    ``TEST_ATELIER_SKILL_ROOT`` is explicitly set.
     """
     configured = os.getenv("TEST_ATELIER_SKILL_ROOT", "").strip()
     if not configured:
@@ -410,7 +448,9 @@ def initialize():
     from . import ai_engine
 
     with SessionLocal() as db:
-        expected_head = os.getenv("AI_STUDIO_MIGRATION_HEAD", "20261032_case_timestamps")
+        expected_head = os.getenv("AI_STUDIO_MIGRATION_HEAD", "20261047_auth_session_revocations")
+        if require_migrations and expected_head != "20261047_auth_session_revocations":
+            raise RuntimeError("迁移目标版本已过期，请将 AI_STUDIO_MIGRATION_HEAD 更新到当前版本")
         try:
             migration_head = db.execute(text("SELECT version_num FROM alembic_version")).scalar()
         except SQLAlchemyError as exc:
@@ -434,8 +474,11 @@ def initialize():
                 "expected_revision": expected_head, "database_kind": database_kind,
             })
             raise RuntimeError(f"数据库迁移版本不匹配：当前 {migration_head or '空'}，需要 {expected_head}")
+        if require_migrations:
+            from .project_write_fence import assert_project_write_fence
+            assert_project_write_fence(db)
         if not db.scalar(select(User.id).limit(1)):
-            password = os.getenv("AI_STUDIO_ADMIN_PASSWORD", "").strip()
+            password = configured_secret("AI_STUDIO_ADMIN_PASSWORD")
             # Local one-click startup may leave the prompt empty; keep a
             # predictable six-character bootstrap password for that case.
             if not password:
@@ -868,9 +911,9 @@ def health_ready(db: Session = Depends(get_db)):
                                required=len(missing_skill_files))
         raise HTTPException(503, "技能仓工作流文件不可用")
     data_dir = Path(os.getenv("AI_STUDIO_DATA_DIR", "data")).expanduser()
-    if data_dir.is_symlink() or not data_dir.is_dir() or not os.access(data_dir, os.W_OK):
+    if is_link_like(data_dir) or not data_dir.is_dir() or not os.access(data_dir, os.W_OK):
         _log_readiness_failure("readiness.failed", component="storage",
-                               error_type="StorageSymlink" if data_dir.is_symlink() else "StorageUnavailable")
+                               error_type="StorageSymlink" if is_link_like(data_dir) else "StorageUnavailable")
         raise HTTPException(503, "数据目录不可写")
     payload = {"status": "ready", "service": "test-atelier", "version": app.version}
     release = deployment_release()
@@ -911,6 +954,7 @@ def health_worker():
                "heartbeat_age_seconds": round(age, 3)}
     try:
         worker_release = _heartbeat_release(heartbeat)
+        worker_harness_only = _heartbeat_harness_only(heartbeat)
     except OSError as exc:
         # The heartbeat can be replaced during a restart. Treat a vanished or
         # unsafe metadata file as the same unavailable dependency as a stale
@@ -919,6 +963,16 @@ def health_worker():
         _log_readiness_failure("worker.readiness.failed", component="external-worker",
                                error_type=type(exc).__name__)
         raise HTTPException(503, "AI worker 心跳元数据不可用") from exc
+    api_harness_only = ai_jobs.harness_only_mode()
+    if (worker_harness_only is None and api_harness_only) or (
+        worker_harness_only is not None and worker_harness_only != api_harness_only
+    ):
+        metrics.set_worker_health(False, age)
+        _log_readiness_failure("worker.readiness.mode_mismatch", component="external-worker",
+                               error_type="UnknownWorkerMode" if worker_harness_only is None else "CutoverModeMismatch")
+        raise HTTPException(503, "AI worker 与 API 的 Harness-only 模式不一致或不可确认")
+    if worker_harness_only is not None:
+        payload["harness_only"] = worker_harness_only
     if worker_release:
         payload["worker_release"] = worker_release
     release = deployment_release()
@@ -969,7 +1023,10 @@ def metrics_endpoint(request: Request):
     """Expose low-cardinality Prometheus metrics for internal scrapers."""
     if not metrics.enabled():
         raise HTTPException(404, "Not found")
-    configured_token = os.getenv("METRICS_TOKEN", "").strip()
+    try:
+        configured_token = configured_secret("METRICS_TOKEN")
+    except ValueError as exc:
+        raise HTTPException(503, "Metrics token unavailable") from exc
     if configured_token:
         supplied = request.headers.get("x-metrics-token", "")
         authorization = request.headers.get("authorization", "")
@@ -1017,7 +1074,41 @@ def current_user(request: Request, db: Session = Depends(get_db)):
     user = db.get(User, user_id) if user_id else None
     if not user:
         raise HTTPException(401, "请先登录")
+    nonce_hash = _session_nonce_hash(request.session.get("session_nonce"))
+    if nonce_hash and db.scalar(select(SessionRevocation.nonce_hash).where(
+        SessionRevocation.nonce_hash == nonce_hash,
+        SessionRevocation.expires_at > utcnow(),
+    )):
+        raise HTTPException(401, "登录会话已失效，请重新登录")
     return user
+
+
+@app.get("/api/v1/harness/web-access", include_in_schema=False)
+def harness_web_access(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Authorize the restricted Web Shell without widening project APIs.
+
+    The upstream Shell is not project scoped, so member access is only a
+    coarse entry gate.  Every project/document/task request still passes
+    through the normal Test Atelier project ACL.  Keep member access opt-in
+    until the restricted Web Profile is deployed; administrators remain the
+    only pilot users under the default setting.
+    """
+    if os.getenv("TEST_ATELIER_WEB_SHELL_PILOT", "0") != "1":
+        raise HTTPException(404, "Harness Web Shell 未启用")
+    if user.role == "admin":
+        return {"allowed": True}
+    if (os.getenv("TEST_ATELIER_WEB_SHELL_MEMBER_ACCESS", "0") != "1"
+            or os.getenv("TEST_ATELIER_WEB_SHELL_RESTRICTED_PROFILE", "0") != "1"):
+        raise HTTPException(403, "Harness Web Shell 试点仅对管理员开放")
+    has_active_membership = db.scalar(select(exists().where(
+        Membership.user_id == user.id,
+        Membership.project_id == Project.id,
+        Project.archived_at.is_(None),
+        Project.deletion_pending_at.is_(None),
+    )))
+    if not has_active_membership:
+        raise HTTPException(403, "当前账号没有可访问的项目")
+    return {"allowed": True}
 
 
 def csrf(request: Request):
@@ -1027,12 +1118,21 @@ def csrf(request: Request):
         raise HTTPException(403, "CSRF 校验失败")
 
 
-def project_access(project_id: int, user: User, db: Session):
+def project_access(project_id: int, user: User, db: Session, *, fence: bool = False):
     project = db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "项目不存在")
     if user.role != "admin" and not db.get(Membership, (project_id, user.id)):
         raise HTTPException(403, "无项目访问权限")
+    if fence:
+        # Hold the row lock through the following local write and commit.
+        # Never use this around an external process or a second DB session.
+        locked = db.execute(update(Project).where(Project.id == project_id).values(name=Project.name))
+        if locked.rowcount != 1:
+            raise HTTPException(404, "项目不存在")
+        db.refresh(project)
+    if project.deletion_pending_at:
+        raise HTTPException(409, "项目正在删除，请稍后重试删除操作")
     return project
 
 
@@ -1043,8 +1143,8 @@ def project_role(project_id: int, user: User, db: Session) -> str:
     return db.get(Membership, (project_id, user.id)).role
 
 
-def writable(user: User, project_id: int, db: Session):
-    project = project_access(project_id, user, db)
+def writable(user: User, project_id: int, db: Session, *, fence: bool = False):
+    project = project_access(project_id, user, db, fence=fence)
     if project.archived_at:
         raise HTTPException(409, "项目已归档，请先恢复后再修改")
     if project_role(project_id, user, db) == "reader":
@@ -1059,7 +1159,7 @@ def project_manager(user: User, project_id: int, db: Session):
         raise HTTPException(403, "仅项目管理员可管理成员")
 
 
-def ensure_project_skills(project_id: int, db: Session) -> list[ProjectSkill]:
+def ensure_project_skills(project_id: int, db: Session, *, user: User | None = None) -> list[ProjectSkill]:
     """Materialize the source skill registry for a project on first access."""
     try:
         specs = discover_skills()
@@ -1078,6 +1178,11 @@ def ensure_project_skills(project_id: int, db: Session) -> list[ProjectSkill]:
         })
         raise HTTPException(503, "核心配置文件不可写") from exc
     existing = {row.skill_id: row for row in db.scalars(select(ProjectSkill).where(ProjectSkill.project_id == project_id)).all()}
+    if any(spec.skill_id not in existing for spec in specs):
+        if user is None:
+            raise HTTPException(403, "需要项目访问权限才能注册技能")
+        project_access(project_id, user, db, fence=True)
+        existing = {row.skill_id: row for row in db.scalars(select(ProjectSkill).where(ProjectSkill.project_id == project_id)).all()}
     changed = False
     for spec in specs:
         if spec.skill_id not in existing:
@@ -1102,14 +1207,91 @@ def release_assignments(project_id: int, member_id: int, actor_id: int, db: Sess
                            reason="成员权限变更，负责人已清除"))
 
 
-def _require_project_manager(project_id: int, user: User, db: Session) -> Project:
+def _require_project_manager(project_id: int, user: User, db: Session, *, allow_pending: bool = False) -> Project:
     """Return a project when the actor can administer its lifecycle."""
-    project = project_access(project_id, user, db)
+    project = db.get(Project, project_id) if allow_pending else project_access(project_id, user, db)
+    if project is None:
+        raise HTTPException(404, "项目不存在")
     if user.role != "admin":
         membership = db.get(Membership, (project_id, user.id))
         if not membership or membership.role != "manager":
             raise HTTPException(403, "仅项目管理员可管理项目")
     return project
+
+
+def _cleanup_governance_files(project_id: int, db: Session) -> None:
+    root = Path(os.getenv("AI_STUDIO_DATA_DIR", "data")) / "governance-snapshots"
+    batches = db.scalars(select(ImportBatch).where(
+        ImportBatch.project_id == project_id, ImportBatch.kind == "governance")).all()
+    exports = db.scalars(select(GovernanceExportJob).where(GovernanceExportJob.project_id == project_id)).all()
+    if not batches and not exports and not (root / str(project_id)).exists():
+        return
+    try:
+        if is_link_like(root.parent) or is_link_like(root) or (root.exists() and not root.is_dir()):
+            raise OSError("invalid governance storage root")
+        base = root.resolve()
+        owned_directory = base / str(project_id)
+        project_dir = root / str(project_id)
+        if is_link_like(project_dir) or (project_dir.exists() and not project_dir.is_dir()):
+            raise OSError("invalid governance project directory")
+        references = []
+        for batch in batches:
+            if not batch.snapshot_path:
+                raise OSError("governance snapshot has no recorded path")
+            references.append((batch.snapshot_path, re.fullmatch(r"[a-f0-9]{64}\.(?:xls|xlsx|csv)", Path(batch.snapshot_path).name)))
+        for job in exports:
+            references.append((job.path, re.fullmatch(r"export-[a-f0-9]{32}\.(?:xls|xlsx)", Path(job.path).name)))
+
+        other_paths = {Path(value).resolve() for value in db.scalars(select(ImportBatch.snapshot_path).where(
+            ImportBatch.project_id != project_id, ImportBatch.snapshot_path.is_not(None))).all() if value}
+        other_paths.update(Path(value).resolve() for value in db.scalars(select(GovernanceExportJob.path).where(
+            GovernanceExportJob.project_id != project_id)).all() if value)
+        removable = []
+        for raw, filename_valid in references:
+            path = Path(raw)
+            if not filename_valid or is_link_like(path) or path.parent.resolve() not in (base, owned_directory):
+                raise OSError("governance artifact ownership is unclear")
+            if path.exists() and not path.is_file():
+                raise OSError("governance artifact is not a regular file")
+            if path.resolve() not in other_paths:
+                removable.append(path)
+        for path in removable:
+            path.unlink(missing_ok=True)
+        if project_dir.exists():
+            project_dir.rmdir()
+    except (OSError, ValueError) as exc:
+        logger.warning("project.cleanup_governance_files_failed", extra={
+            "event": "project.cleanup_governance_files_failed", "project_id": project_id,
+            "component": "project", "error_type": type(exc).__name__,
+        })
+        raise HTTPException(503, "项目治理文件清理失败，请核对存储后重试删除") from exc
+
+
+def _cleanup_codex_workspaces(project_id: int, db: Session) -> None:
+    root = Path(tempfile.gettempdir()) / "test-atelier-codex-sessions"
+    sessions = db.scalars(select(CodexSession).where(CodexSession.project_id == project_id)).all()
+    try:
+        for session in sessions:
+            stored = Path(session.working_directory).expanduser()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session.id):
+                raise OSError("invalid Codex session ID")
+            expected = root / session.id
+            if stored != expected:
+                # Older sessions could point to a user's checkout. Never
+                # delete an arbitrary path just because it is in the row.
+                if stored.parent == root or (stored.exists() and stored.resolve() == expected.resolve()):
+                    raise OSError("Codex workspace ownership is unclear")
+                continue
+            if is_link_like(root) or is_link_like(expected):
+                raise OSError("Codex workspace is a link or junction")
+            if expected.exists():
+                shutil.rmtree(expected)
+    except (OSError, ValueError) as exc:
+        logger.warning("project.cleanup_codex_workspaces_failed", extra={
+            "event": "project.cleanup_codex_workspaces_failed", "project_id": project_id,
+            "component": "project", "error_type": type(exc).__name__,
+        })
+        raise HTTPException(503, "项目 Codex 工作目录清理失败，请核对存储后重试删除") from exc
 
 
 def _delete_project_data(project_id: int, db: Session) -> None:
@@ -1126,7 +1308,16 @@ def _delete_project_data(project_id: int, db: Session) -> None:
         AiJob.project_id == project_id, AiJob.status.in_(("queued", "running")))) or 0
     active_suggestions = db.scalar(select(func.count()).select_from(SuggestionJob).where(
         SuggestionJob.project_id == project_id, SuggestionJob.status.in_(("queued", "running")))) or 0
-    if active_ai or active_suggestions:
+    active_harness = db.scalar(select(func.count()).select_from(HarnessTask).where(
+        HarnessTask.project_id == project_id,
+        HarnessTask.status.not_in(("completed", "failed", "cancelled")))) or 0
+    active_codex = db.scalar(select(func.count()).select_from(CodexSession).where(
+        CodexSession.project_id == project_id, CodexSession.status == "running")) or 0
+    if active_harness:
+        # Keep the project and task available for a cancellation attempt;
+        # a local terminal state alone does not prove the Host stopped.
+        raise HTTPException(409, "项目存在未结束的 Harness 任务，请先取消任务再删除")
+    if active_ai or active_suggestions or active_codex:
         raise HTTPException(409, "项目存在运行中的任务，请稍后再删除")
 
     # Keep personal board entries while detaching them from a deleted project.
@@ -1139,28 +1330,37 @@ def _delete_project_data(project_id: int, db: Session) -> None:
     try:
         from . import ai_routes
         document_dir = ai_routes.DOCUMENT_DIR / str(project_id)
+        if (is_link_like(ai_routes.DOCUMENT_DIR.parent) or is_link_like(ai_routes.DOCUMENT_DIR)
+                or is_link_like(document_dir)):
+            raise OSError("document directory is a link or junction")
         for document in db.scalars(select(SourceDocument).where(SourceDocument.project_id == project_id)).all():
-            (document_dir / f"{document.id}.bin").unlink(missing_ok=True)
-        document_dir.rmdir()
-    except (OSError, ValueError):
+            remove_private_file(document_dir / f"{document.id}.bin", root=ai_routes.DOCUMENT_DIR)
+        if document_dir.exists():
+            document_dir.rmdir()
+    except (OSError, ValueError) as exc:
         logger.warning("project.cleanup_document_files_failed", extra={
             "event": "project.cleanup_document_files_failed", "project_id": project_id,
             "component": "project", "error_type": "OSError",
         })
+        raise HTTPException(503, "项目文件清理失败，请核对存储后重试删除") from exc
     try:
-        from .conversion_routes import DATA_DIR, output_path
-        for record in db.scalars(select(ConversionRecord).where(ConversionRecord.project_id == project_id)).all():
-            output_path(record).unlink(missing_ok=True)
+        from .conversion_routes import DATA_DIR, remove_output
         conversion_dir = DATA_DIR / str(project_id)
+        if is_link_like(DATA_DIR.parent) or is_link_like(DATA_DIR) or is_link_like(conversion_dir):
+            raise OSError("conversion directory is a link or junction")
+        for record in db.scalars(select(ConversionRecord).where(ConversionRecord.project_id == project_id)).all():
+            remove_output(record)
         if conversion_dir.exists():
             conversion_dir.rmdir()
-    except OSError:
-        # Database deletion remains safe even if an old output file is already
-        # gone or the configured data directory is read-only.
+    except OSError as exc:
         logger.warning("project.cleanup_file_failed", extra={
             "event": "project.cleanup_file_failed", "project_id": project_id,
             "component": "project", "error_type": "OSError",
         })
+        raise HTTPException(503, "项目转换文件清理失败，请核对存储后重试删除") from exc
+
+    _cleanup_governance_files(project_id, db)
+    _cleanup_codex_workspaces(project_id, db)
 
     def ids(model, column):
         return list(db.scalars(select(model.id).where(column == project_id)).all())
@@ -1170,8 +1370,29 @@ def _delete_project_data(project_id: int, db: Session) -> None:
     case_ids = ids(Case, Case.project_id)
     analysis_ids = ids(AnalysisRun, AnalysisRun.project_id)
     suggestion_job_ids = ids(SuggestionJob, SuggestionJob.project_id)
+    group_ids = ids(GovernanceDuplicateGroup, GovernanceDuplicateGroup.project_id)
+
+    db.execute(delete(KnowledgeRevision).where(KnowledgeRevision.entry_id.in_(
+        select(KnowledgeEntry.id).where(KnowledgeEntry.project_id == project_id))))
+    db.execute(delete(KnowledgeEntry).where(KnowledgeEntry.project_id == project_id))
+    db.execute(delete(ProjectTemplateApplication).where(ProjectTemplateApplication.project_id == project_id))
+    db.execute(delete(ProjectTemplate).where(ProjectTemplate.project_id == project_id))
+
+    if group_ids or case_ids:
+        db.execute(delete(GovernanceDuplicateMember).where(or_(
+            GovernanceDuplicateMember.group_id.in_(group_ids), GovernanceDuplicateMember.case_id.in_(case_ids))))
+    db.execute(delete(GovernanceMetricSnapshot).where(GovernanceMetricSnapshot.project_id == project_id))
+    db.execute(delete(GovernanceDuplicateGroup).where(GovernanceDuplicateGroup.project_id == project_id))
+    db.execute(delete(GovernanceValidationRun).where(GovernanceValidationRun.project_id == project_id))
+    db.execute(delete(GovernanceDirectory).where(GovernanceDirectory.project_id == project_id))
+    db.execute(delete(GovernanceChangeLog).where(GovernanceChangeLog.project_id == project_id))
+    db.execute(delete(GovernanceExportJob).where(GovernanceExportJob.project_id == project_id))
 
     if run_ids:
+        db.execute(delete(ExecutionDefectEvent).where(ExecutionDefectEvent.defect_id.in_(
+            select(ExecutionDefect.id).where(ExecutionDefect.project_id == project_id))))
+        db.execute(delete(ExecutionDefect).where(ExecutionDefect.project_id == project_id))
+        db.execute(delete(ExecutionReport).where(ExecutionReport.run_id.in_(run_ids)))
         db.execute(delete(ExecutionEvent).where(ExecutionEvent.run_case_id.in_(
             select(RunCase.id).where(RunCase.run_id.in_(run_ids)))))
         db.execute(delete(RunCase).where(RunCase.run_id.in_(run_ids)))
@@ -1198,21 +1419,18 @@ def _delete_project_data(project_id: int, db: Session) -> None:
     db.execute(delete(SuggestionJob).where(SuggestionJob.project_id == project_id))
     db.execute(delete(Case).where(Case.project_id == project_id))
     db.execute(delete(ImportBatch).where(ImportBatch.project_id == project_id))
+    task_ids = select(HarnessTask.id).where(HarnessTask.project_id == project_id)
+    db.execute(delete(HarnessTaskEvent).where(HarnessTaskEvent.task_id.in_(task_ids)))
+    db.execute(delete(HarnessTask).where(HarnessTask.project_id == project_id))
     db.execute(delete(AnalysisRun).where(AnalysisRun.project_id == project_id))
     db.execute(delete(SourceDocument).where(SourceDocument.project_id == project_id))
     db.execute(delete(ConversionRecord).where(ConversionRecord.project_id == project_id))
     db.execute(delete(ConversionSettings).where(ConversionSettings.project_id == project_id))
     db.execute(delete(TaxonomyVersion).where(TaxonomyVersion.project_id == project_id))
     db.execute(delete(ProjectSkill).where(ProjectSkill.project_id == project_id))
-    codex_sessions = db.scalars(select(CodexSession).where(CodexSession.project_id == project_id)).all()
     codex_session_ids = select(CodexSession.id).where(CodexSession.project_id == project_id)
     db.execute(delete(CodexMessage).where(CodexMessage.session_id.in_(codex_session_ids)))
     db.execute(delete(CodexSession).where(CodexSession.project_id == project_id))
-    session_root = (Path(tempfile.gettempdir()) / "test-atelier-codex-sessions").resolve()
-    for session in codex_sessions:
-        workspace = Path(session.working_directory).resolve()
-        if workspace.parent == session_root and workspace.name == session.id:
-            shutil.rmtree(workspace, ignore_errors=True)
     db.execute(delete(MembershipEvent).where(MembershipEvent.project_id == project_id))
     db.execute(delete(Membership).where(Membership.project_id == project_id))
 
@@ -1347,14 +1565,27 @@ def login(payload: Login, request: Request, db: Session = Depends(get_db)):
     _login_failures.clear(failure_keys)
     request.session.clear()
     request.session["uid"] = user.id
+    request.session["session_nonce"] = secrets.token_urlsafe(32)
     request.session["csrf"] = secrets.token_urlsafe(32)
     logger.info("auth.login.succeeded", extra={"event": "auth.login.succeeded", "actor_id": user.id, "role": user.role})
     return {"id": user.id, "username": user.username, "role": user.role, "csrf": request.session["csrf"]}
 
 
 @app.post("/api/v1/auth/logout", dependencies=[Depends(csrf)])
-def logout(request: Request):
+def logout(request: Request, db: Session = Depends(get_db)):
     actor_id = request.session.get("uid")
+    nonce_hash = _session_nonce_hash(request.session.get("session_nonce"))
+    if nonce_hash:
+        # Keep revocations bounded by the session lifetime while preserving
+        # the old signed cookie long enough for Web Shell rechecks to reject it.
+        db.execute(delete(SessionRevocation).where(SessionRevocation.expires_at <= utcnow()))
+        if db.get(SessionRevocation, nonce_hash) is None:
+            db.add(SessionRevocation(
+                nonce_hash=nonce_hash,
+                user_id=actor_id if isinstance(actor_id, int) else None,
+                expires_at=(datetime.now(timezone.utc) + timedelta(seconds=SESSION_MAX_AGE)).isoformat(),
+            ))
+        db.commit()
     request.session.clear()
     if actor_id is not None:
         logger.info("auth.logout.succeeded", extra={"event": "auth.logout.succeeded", "actor_id": actor_id})
@@ -1498,18 +1729,20 @@ def delete_work_item(item_id: int, user: User = Depends(current_user), db: Sessi
 @app.get("/api/v1/projects")
 def projects(include_archived: bool = Query(False), user: User = Depends(current_user), db: Session = Depends(get_db)):
     query = select(Project).order_by(Project.id.desc())
+    visible = or_(Project.archived_at.is_(None), Project.deletion_pending_at.is_not(None))
     if not include_archived:
-        query = query.where(Project.archived_at.is_(None))
+        query = query.where(visible)
     if user.role == "admin":
         rows = ((item, "admin") for item in db.scalars(query))
     else:
         rows = db.execute(select(Project, Membership.role).join(Membership).where(
             Membership.user_id == user.id,
-            *([Project.archived_at.is_(None)] if not include_archived else []),
+            *([visible] if not include_archived else []),
         ).order_by(Project.id.desc()))
     return [{"id": project.id, "name": project.name, "role": role,
              "created_at": project.created_at, "archived": project.archived_at is not None,
-             "archived_at": project.archived_at} for project, role in rows]
+             "archived_at": project.archived_at,
+             "deletion_pending_at": project.deletion_pending_at} for project, role in rows]
 
 
 @app.post("/api/v1/projects", dependencies=[Depends(csrf)])
@@ -1553,6 +1786,8 @@ def create_project(payload: Named, user: User = Depends(current_user), db: Sessi
 
 @app.patch("/api/v1/projects/{project_id}", dependencies=[Depends(csrf)])
 def update_project(project_id: int, payload: ProjectUpdate, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    from .harness_projection import cancel_active_tasks
+
     project = _require_project_manager(project_id, user, db)
     if payload.name is None and payload.archived is None:
         raise HTTPException(422, "至少提供项目名称或归档状态")
@@ -1561,9 +1796,12 @@ def update_project(project_id: int, payload: ProjectUpdate, user: User = Depends
         if not name:
             raise HTTPException(422, "项目名称不能为空")
         project.name = name
+    archiving = payload.archived is True and project.archived_at is None
     if payload.archived is not None:
         project.archived_at = utcnow() if payload.archived else None
+    cancelled = cancel_active_tasks(db, project_id, reason="project_archived") if archiving else []
     db.commit()
+    _cancel_remote_harness_tasks(project_id, cancelled)
     return {"id": project.id, "name": project.name,
             "role": "admin" if user.role == "admin" else "manager",
             "created_at": project.created_at, "archived": project.archived_at is not None,
@@ -1614,7 +1852,59 @@ def duplicate_project(project_id: int, payload: ProjectDuplicate | None = None,
 
 @app.delete("/api/v1/projects/{project_id}", dependencies=[Depends(csrf)])
 def delete_project(project_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    project = _require_project_manager(project_id, user, db)
+    project = _require_project_manager(project_id, user, db, allow_pending=True)
+    # A harmless UPDATE obtains a project-row lock on PostgreSQL and a writer
+    # lock on SQLite. Task creation takes the same lock before insertion.
+    locked = db.execute(update(Project).where(Project.id == project_id).values(name=Project.name))
+    if locked.rowcount != 1:
+        raise HTTPException(404, "项目不存在")
+    db.refresh(project)
+    new_intent = not project.deletion_pending_at
+    if not project.deletion_pending_at:
+        active_harness = db.scalar(select(func.count()).select_from(HarnessTask).where(
+            HarnessTask.project_id == project_id,
+            HarnessTask.status.not_in(("completed", "failed", "cancelled")))) or 0
+        active_ai = db.scalar(select(func.count()).select_from(AiJob).where(
+            AiJob.project_id == project_id, AiJob.status.in_(("queued", "running")))) or 0
+        active_suggestions = db.scalar(select(func.count()).select_from(SuggestionJob).where(
+            SuggestionJob.project_id == project_id, SuggestionJob.status.in_(("queued", "running")))) or 0
+        active_codex = db.scalar(select(func.count()).select_from(CodexSession).where(
+            CodexSession.project_id == project_id, CodexSession.status == "running")) or 0
+        if active_harness or active_ai or active_suggestions or active_codex:
+            raise HTTPException(409, "项目存在未结束的任务，请先取消任务再删除")
+        project.deletion_pending_at = utcnow()
+    intent_at = project.deletion_pending_at
+    db.commit()
+    if new_intent:
+        logger.info("project.deletion_pending", extra={"event": "project.deletion_pending",
+                    "project_id": project_id, "actor_id": user.id, "component": "project"})
+    task_owners = db.execute(select(HarnessTask.id, HarnessTask.user_id).where(
+        HarnessTask.project_id == project_id).order_by(HarnessTask.id)).all()
+    db.rollback()  # Release the read transaction before contacting the independent Host.
+    if task_owners:
+        from . import harness_bridge
+        bridge = harness_bridge.HarnessBridge()
+        for task_id, owner_id in task_owners:
+            try:
+                bridge.delete_task(task_id, current_request_id() or new_request_id(), {
+                    "subject_user_id": owner_id, "project_id": project_id,
+                    "task_id": task_id, "allowed_operation": "task.delete",
+                })
+            except harness_bridge.HarnessBridgeHTTPError as exc:
+                logger.warning("project.cleanup_host_failed", extra={"event": "project.cleanup_host_failed",
+                               "project_id": project_id, "component": "project", "error_type": type(exc).__name__})
+                raise HTTPException(409 if exc.status_code == 409 else 503,
+                                    "Harness 历史尚未安全清理，请检查 Host 后重试") from exc
+            except harness_bridge.HarnessBridgeError as exc:
+                logger.warning("project.cleanup_host_failed", extra={"event": "project.cleanup_host_failed",
+                               "project_id": project_id, "component": "project", "error_type": type(exc).__name__})
+                raise HTTPException(503, "Harness Host 不可用，请恢复后重试项目删除") from exc
+    locked = db.execute(update(Project).where(Project.id == project_id).values(name=Project.name))
+    if locked.rowcount != 1:
+        raise HTTPException(404, "项目不存在")
+    db.refresh(project)
+    if project.deletion_pending_at != intent_at:
+        raise HTTPException(409, "项目删除状态已变化，请刷新后重试")
     _delete_project_data(project_id, db)
     db.delete(project)
     db.commit()
@@ -1626,7 +1916,7 @@ def delete_project(project_id: int, user: User = Depends(current_user), db: Sess
 @app.get("/api/v1/projects/{project_id}/skills")
 def list_project_skills(project_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     project_access(project_id, user, db)
-    rows = ensure_project_skills(project_id, db)
+    rows = ensure_project_skills(project_id, db, user=user)
     return [{"skill_id": row.skill_id, "name": row.name, "label": row.label,
              "source_path": row.source_path, "description": row.description,
              "enabled": row.enabled, "updated_at": row.updated_at} for row in rows]
@@ -1635,15 +1925,41 @@ def list_project_skills(project_id: int, user: User = Depends(current_user), db:
 @app.patch("/api/v1/projects/{project_id}/skills/{skill_id}", dependencies=[Depends(csrf)])
 def update_project_skill(project_id: int, skill_id: str, payload: SkillUpdate,
                          user: User = Depends(current_user), db: Session = Depends(get_db)):
+    from .harness_projection import cancel_tasks_for_disabled_skill
+
     project_manager(user, project_id, db)
-    rows = ensure_project_skills(project_id, db)
+    rows = ensure_project_skills(project_id, db, user=user)
     row = next((item for item in rows if item.skill_id == skill_id), None)
     if row is None:
         raise HTTPException(404, "技能不存在")
+    project_access(project_id, user, db, fence=True)
+    disabling = row.enabled and not payload.enabled
     row.enabled = payload.enabled
     row.updated_at = utcnow()
+    cancelled = cancel_tasks_for_disabled_skill(db, project_id, skill_id) if disabling else []
     db.commit()
+    _cancel_remote_harness_tasks(project_id, cancelled)
     return {"skill_id": row.skill_id, "enabled": row.enabled, "updated_at": row.updated_at}
+
+
+def _cancel_remote_harness_tasks(project_id: int, cancelled: list[tuple[str, int]]) -> None:
+    from . import harness_bridge
+
+    for task_id, owner_id in cancelled:
+        try:
+            harness_bridge.HarnessBridge().cancel_task(task_id, current_request_id() or new_request_id(), {
+                "subject_user_id": owner_id,
+                "project_id": project_id,
+                "task_id": task_id,
+                "allowed_operation": "task.cancel",
+            })
+        except harness_bridge.HarnessBridgeError as exc:
+            # Local cancellation is committed even if the Host cannot be
+            # reached; late results must not publish revoked work.
+            logger.warning("harness.task.cancel_unavailable", extra={
+                "event": "harness.task.cancel_unavailable", "component": "harness",
+                "project_id": project_id, "task_id": task_id, "error_type": type(exc).__name__,
+            })
 
 
 @app.get("/api/v1/projects/{project_id}/overview")
@@ -1790,6 +2106,8 @@ def list_members(project_id: int, user: User = Depends(current_user), db: Sessio
 @app.patch("/api/v1/projects/{project_id}/members/{member_id}", dependencies=[Depends(csrf)])
 def change_member_role(project_id: int, member_id: int, payload: MembershipRoleUpdate,
                        user: User = Depends(current_user), db: Session = Depends(get_db)):
+    from .harness_projection import cancel_active_tasks
+
     project_manager(user, project_id, db)
     member = db.get(Membership, (project_id, member_id))
     target = db.get(User, member_id)
@@ -1800,16 +2118,21 @@ def change_member_role(project_id: int, member_id: int, payload: MembershipRoleU
     if member.role != payload.role:
         before = member.role
         member.role = payload.role
+        cancelled = []
         if payload.role == "reader":
             release_assignments(project_id, member_id, user.id, db)
+            cancelled = cancel_active_tasks(db, project_id, reason="project_member_readonly", user_id=member_id)
         db.add(MembershipEvent(project_id=project_id, user_id=member_id, actor_id=user.id,
                                action="role_changed", before_role=before, after_role=payload.role))
         db.commit()
+        _cancel_remote_harness_tasks(project_id, cancelled)
     return {"id": target.id, "username": target.username, "role": member.role}
 
 
 @app.delete("/api/v1/projects/{project_id}/members/{member_id}", dependencies=[Depends(csrf)])
 def remove_member(project_id: int, member_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    from .harness_projection import cancel_active_tasks
+
     project_manager(user, project_id, db)
     member = db.get(Membership, (project_id, member_id))
     target = db.get(User, member_id)
@@ -1820,8 +2143,10 @@ def remove_member(project_id: int, member_id: int, user: User = Depends(current_
     db.add(MembershipEvent(project_id=project_id, user_id=member_id, actor_id=user.id,
                            action="removed", before_role=member.role))
     release_assignments(project_id, member_id, user.id, db)
+    cancelled = cancel_active_tasks(db, project_id, reason="project_access_revoked", user_id=member_id)
     db.delete(member)
     db.commit()
+    _cancel_remote_harness_tasks(project_id, cancelled)
     return {"ok": True}
 
 
@@ -2015,6 +2340,10 @@ def delete_case_rows(case_ids: list[int], db: Session) -> None:
     """Remove a case and all review/smoke snapshots that reference it."""
     if not case_ids:
         return
+    active = db.scalar(select(RunCase.id).join(ExecutionRun, RunCase.run_id == ExecutionRun.id)
+                       .where(RunCase.case_id.in_(case_ids), ExecutionRun.status == "active").limit(1))
+    if active:
+        raise HTTPException(409, "用例属于进行中的执行，请先结束执行再删除")
     run_case_ids = db.scalars(select(RunCase.id).where(RunCase.case_id.in_(case_ids))).all()
     if run_case_ids:
         db.execute(delete(ExecutionEvent).where(ExecutionEvent.run_case_id.in_(run_case_ids)))
@@ -2251,10 +2580,22 @@ from .ai_routes import build_router as build_ai_router  # noqa: E402
 from .suggestion_routes import build_router as build_suggestion_router  # noqa: E402
 from .smoke_routes import build_router as build_smoke_router  # noqa: E402
 from .governance_routes import build_router as build_governance_router  # noqa: E402
+from .harness_routes import build_router as build_harness_router  # noqa: E402
+from .execution_defect_routes import build_router as build_execution_defect_router  # noqa: E402
+from .knowledge_routes import build_router as build_knowledge_router  # noqa: E402
+from .artifact_routes import build_router as build_artifact_router  # noqa: E402
+from .project_export_routes import build_router as build_project_export_router  # noqa: E402
+from .project_template_routes import build_router as build_project_template_router  # noqa: E402
 
 app.include_router(build_router(get_db, current_user, csrf, project_access, writable))
 app.include_router(build_ai_router(get_db, current_user, csrf, project_access, writable))
 app.include_router(build_suggestion_router(get_db, current_user, csrf, project_access, writable,
                                            project_manager, project_role, case_dict, case_assignee))
 app.include_router(build_smoke_router(get_db, current_user, csrf, project_access, writable))
+app.include_router(build_execution_defect_router(get_db, current_user, csrf, project_access, writable))
+app.include_router(build_knowledge_router(get_db, current_user, csrf, project_access, writable))
+app.include_router(build_artifact_router(get_db, current_user, project_access))
+app.include_router(build_project_export_router(get_db, current_user, project_access))
+app.include_router(build_project_template_router(get_db, current_user, csrf, project_access, writable, project_manager))
 app.include_router(build_governance_router(get_db, current_user, csrf, project_access, writable, project_role))
+app.include_router(build_harness_router(get_db, current_user, csrf, project_access, writable))

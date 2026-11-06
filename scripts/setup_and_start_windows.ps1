@@ -10,8 +10,12 @@ $RootDir = (Resolve-Path (Join-Path $PSScriptRoot ".."))
 $EnvName = "test-atelier"
 $LogDir = Join-Path $RootDir ".test-atelier-logs"
 $DepMarker = Join-Path $LogDir "dependencies-$EnvName.sha256"
+$ApiPidFile = Join-Path $LogDir "api.pid"
+$ProjectorPidFile = Join-Path $LogDir "harness-projector.pid"
 $BootstrapMarker = Join-Path $LogDir "admin-initialized"
 $ApiProcess = $null
+$ProjectorProcess = $null
+$RuntimeConfig = Join-Path $RootDir "config\runtime.json"
 
 function Fail([string]$Message) {
     Write-Error $Message
@@ -21,6 +25,7 @@ function Fail([string]$Message) {
 if (-not (Test-Path (Join-Path $RootDir "api")) -or -not (Test-Path (Join-Path $RootDir "web"))) {
     Fail "请从 test-atelier 工程目录运行此脚本"
 }
+if (-not (Test-Path $RuntimeConfig -PathType Leaf)) { Fail "未找到配置文件 $RuntimeConfig，请先运行 scripts\configure_full_runtime.py" }
 
 $Npm = Get-Command npm -ErrorAction SilentlyContinue
 if (-not $Npm) { Fail "未找到 npm，请先安装 Node.js 20+" }
@@ -63,7 +68,7 @@ $dependencyFingerprint = [BitConverter]::ToString(
     )
 ).Replace('-', '').ToLowerInvariant()
 $markerValue = if (Test-Path $DepMarker) { (Get-Content -Raw $DepMarker).Trim() } else { "" }
-$needsInstall = $envCreated -or $env:TEST_ATELIER_FORCE_INSTALL -eq "1" -or $markerValue -ne $dependencyFingerprint -or -not (Test-Path (Join-Path $RootDir "web\node_modules"))
+$needsInstall = $envCreated -or $markerValue -ne $dependencyFingerprint -or -not (Test-Path (Join-Path $RootDir "web\node_modules"))
 
 if (-not $SkipConfigure -and -not $SkipInstall -and $needsInstall) {
     Write-Host "安装 Python 依赖 ..."
@@ -78,8 +83,9 @@ if (-not $SkipConfigure -and -not $SkipInstall -and $needsInstall) {
     Fail "未找到前端依赖，请先运行 configure_environment_windows.ps1"
 }
 
-$ConfigDir = Join-Path $env:USERPROFILE ".config\ai-studio"
-$SecretFile = Join-Path $ConfigDir "session-secret"
+$runtimeDocument = Get-Content -Raw -Path $RuntimeConfig | ConvertFrom-Json
+$ConfigDir = Split-Path -Parent ([Environment]::ExpandEnvironmentVariables([string]$runtimeDocument.test_atelier.session_secret_file))
+$SecretFile = [Environment]::ExpandEnvironmentVariables([string]$runtimeDocument.test_atelier.session_secret_file)
 New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 if ($SkipConfigure -and -not (Test-Path $SecretFile)) {
     Fail "未找到会话密钥，请先运行 configure_environment_windows.ps1"
@@ -89,23 +95,9 @@ if (-not $SkipConfigure -and -not (Test-Path $SecretFile)) {
     [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
     ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant() | Set-Content -NoNewline -Path $SecretFile
 }
-$env:AI_STUDIO_SESSION_SECRET = (Get-Content -Raw $SecretFile).Trim()
-$env:AI_STUDIO_REQUIRE_MIGRATIONS = "1"
-$env:AI_STUDIO_MIGRATION_HEAD = "20261032_case_timestamps"
-# This launcher starts only the API and Vite. Do not inherit a production
-# external-worker flag or queued AI jobs would have no consumer.
-$env:AI_STUDIO_EXTERNAL_WORKER = "0"
-$env:AI_STUDIO_ENV = "development"
-
 if (-not $ConfigureOnly -and ($envCreated -or -not (Test-Path $BootstrapMarker))) {
-    if (-not $env:AI_STUDIO_ADMIN_PASSWORD) {
-        $securePassword = Read-Host "管理员密码（至少 6 位，直接回车使用默认密码 123456）" -AsSecureString
-        $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
-        try { $env:AI_STUDIO_ADMIN_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
-        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
-    }
-    if (-not $env:AI_STUDIO_ADMIN_PASSWORD) { $env:AI_STUDIO_ADMIN_PASSWORD = "123456" }
-    if ($env:AI_STUDIO_ADMIN_PASSWORD.Length -lt 6) { Fail "管理员密码至少需要 6 位" }
+    $adminPasswordFile = [Environment]::ExpandEnvironmentVariables([string]$runtimeDocument.test_atelier.admin_password_file)
+    if (-not (Test-Path $adminPasswordFile -PathType Leaf)) { Fail "未找到管理员密码文件，请运行 scripts\configure_full_runtime.py" }
 }
 
 if (-not $SkipConfigure) {
@@ -129,7 +121,13 @@ $WebPort = [int]$ports[1]
 if ($ApiPort -lt 1 -or $ApiPort -gt 65535 -or $WebPort -lt 1 -or $WebPort -gt 65535) {
     Fail "settings.json 中的端口配置无效"
 }
-if (-not $env:AI_STUDIO_API_TARGET) { $env:AI_STUDIO_API_TARGET = "http://127.0.0.1:$ApiPort" }
+$runtimeValues = & $CondaExe run --no-capture-output -n $EnvName python -c "from api.runtime_config import runtime_environment; import json; print(json.dumps(runtime_environment()))" | ConvertFrom-Json
+if ($runtimeValues.TEST_ATELIER_HARNESS_URL) {
+    & $CondaExe run --no-capture-output -n $EnvName python (Join-Path $RootDir "scripts/harness_secret_file.py") --config $RuntimeConfig
+    if ($LASTEXITCODE -ne 0) { Fail "已配置 Harness Host，但作用域密钥无效或不可读取" }
+} elseif ($runtimeValues.TEST_ATELIER_HARNESS_ONLY -eq "1") {
+    Fail "Harness-only 模式必须先配置 TEST_ATELIER_HARNESS_URL"
+}
 
 $apiLog = Join-Path $LogDir "api.log"
 $apiErrorLog = Join-Path $LogDir "api-error.log"
@@ -143,6 +141,7 @@ $ApiProcess = Start-Process -FilePath $CondaExe -ArgumentList @(
     "run", "--no-capture-output", "-n", $EnvName, "python", "-m", "api.uvicorn_entrypoint",
     "--host", "127.0.0.1", "--port", "$ApiPort"
 ) -WorkingDirectory $RootDir -RedirectStandardOutput $apiLog -RedirectStandardError $apiErrorLog -PassThru
+$ApiProcess.Id | Set-Content -NoNewline -Path $ApiPidFile
 
 $apiReady = $false
 for ($i = 0; $i -lt 20; $i++) {
@@ -158,19 +157,61 @@ for ($i = 0; $i -lt 20; $i++) {
 if (-not $apiReady) {
     if (Test-Path $apiLog) { Get-Content $apiLog }
     if (Test-Path $apiErrorLog) { Get-Content $apiErrorLog }
+    if ($ApiProcess -and -not $ApiProcess.HasExited) {
+        & taskkill.exe /PID $ApiProcess.Id /T /F | Out-Null
+    }
+    Remove-Item -Force -ErrorAction SilentlyContinue $ApiPidFile
     Fail "API 未在 20 秒内就绪"
 }
 New-Item -ItemType File -Force -Path $BootstrapMarker | Out-Null
 
 try {
+    if ($runtimeValues.TEST_ATELIER_HARNESS_URL) {
+        # Use runtime.json rather than assuming the legacy harness-projector-heartbeat log location.
+        $projectorHeartbeat = [Environment]::ExpandEnvironmentVariables([string]$runtimeValues.TEST_ATELIER_HARNESS_PROJECTOR_HEARTBEAT)
+        if (-not $projectorHeartbeat) { throw "runtime.json 未配置 Projector 心跳路径" }
+        $projectorHeartbeat = [System.IO.Path]::GetFullPath($projectorHeartbeat)
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $projectorHeartbeat) | Out-Null
+        Remove-Item -Force -ErrorAction SilentlyContinue $projectorHeartbeat
+        $projectorLog = Join-Path $LogDir "harness-projector.log"
+        $projectorErrorLog = Join-Path $LogDir "harness-projector-error.log"
+        foreach ($logPath in @($projectorLog, $projectorErrorLog)) {
+            if ((Test-Path $logPath) -and ((Get-Item $logPath).Length -gt 50MB)) {
+                Move-Item -Force $logPath "$logPath.1"
+            }
+        }
+        Write-Host "启动 Harness Projector（日志：$projectorLog）..."
+        $ProjectorProcess = Start-Process -FilePath $CondaExe -ArgumentList @(
+            "run", "--no-capture-output", "-n", $EnvName, "python", "-m", "api.harness_projector"
+        ) -WorkingDirectory $RootDir -RedirectStandardOutput $projectorLog -RedirectStandardError $projectorErrorLog -PassThru
+        $ProjectorProcess.Id | Set-Content -NoNewline -Path $ProjectorPidFile
+        for ($i = 0; $i -lt 20; $i++) {
+            if (Test-Path $projectorHeartbeat) { break }
+            if ($ProjectorProcess.HasExited) { break }
+            Start-Sleep -Seconds 1
+        }
+        if ($ProjectorProcess.HasExited -or -not (Test-Path $projectorHeartbeat)) {
+            throw "Harness Projector 未在 20 秒内就绪，请查看 $projectorLog 和 $projectorErrorLog"
+        }
+    }
     Write-Host "启动前端：http://127.0.0.1:$WebPort"
-    Write-Host "关闭此窗口可停止前端；API 进程会在脚本退出时停止"
+    Write-Host "关闭此窗口可停止前端；API 与 Harness Projector 会在脚本退出时停止"
+    # Keep Vite's development proxy aligned with the API process port.
+    $env:AI_STUDIO_API_TARGET = "http://127.0.0.1:$ApiPort"
     Push-Location (Join-Path $RootDir "web")
-    & npm run dev -- --host 127.0.0.1 --port $WebPort
+    try { & npm run dev -- --host 127.0.0.1 --port $WebPort }
+    finally { Pop-Location }
 }
 finally {
-    Pop-Location
+    if ($projectorHeartbeat) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $projectorHeartbeat
+    }
+    if ($ProjectorProcess -and -not $ProjectorProcess.HasExited) {
+        & taskkill.exe /PID $ProjectorProcess.Id /T /F | Out-Null
+    }
+    Remove-Item -Force -ErrorAction SilentlyContinue $ProjectorPidFile
     if ($ApiProcess -and -not $ApiProcess.HasExited) {
         & taskkill.exe /PID $ApiProcess.Id /T /F | Out-Null
     }
+    Remove-Item -Force -ErrorAction SilentlyContinue $ApiPidFile
 }

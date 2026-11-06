@@ -1,8 +1,11 @@
 """Project-scoped HTTP adapter for the ecxel_check conversion engine."""
 
 import io
+import hashlib
 import logging
 import os
+import re
+import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,7 +20,7 @@ from sqlalchemy.orm import Session
 from .conversion import service
 from .conversion.converter import ConversionError
 from .db import ConversionRecord, ConversionSettings, User
-from .storage import open_private_regular_file, write_private_atomic
+from .storage import open_private_regular_file, remove_private_file, write_private_atomic
 from .observability import monotonic
 from starlette.background import BackgroundTask
 
@@ -26,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("AI_STUDIO_DATA_DIR", str(Path(__file__).resolve().parents[1] / "data"))) / "conversions"
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class ConfigUpdate(BaseModel):
@@ -58,14 +62,51 @@ def public_config(settings: ConversionSettings) -> dict:
 
 
 def record_dict(record: ConversionRecord) -> dict:
-    return {key: getattr(record, key) for key in (
+    result = {key: getattr(record, key) for key in (
         "id", "created_at", "source_filename", "output_filename", "conversion_mode",
         "output_mode", "media_type", "app_version", "row_count", "file_size",
     )}
+    result["source"] = source_metadata(record)
+    return result
+
+
+def source_metadata(record: ConversionRecord) -> dict | None:
+    if not isinstance(record.preview, dict):
+        raise HTTPException(409, "转换来源记录损坏，请核对数据")
+    metadata = record.preview.get("_source")
+    if metadata is None:
+        return None  # Old conversion history did not retain the uploaded bytes.
+    if (not isinstance(metadata, dict) or metadata.get("schema_version") != "conversion-upload.v1"
+            or not isinstance(metadata.get("sha256"), str) or not SHA256.fullmatch(metadata["sha256"])
+            or type(metadata.get("size")) is not int or not 0 <= metadata["size"] <= MAX_UPLOAD_BYTES):
+        raise HTTPException(409, "转换来源记录损坏，请核对数据")
+    return metadata
 
 
 def output_path(record: ConversionRecord) -> Path:
     return DATA_DIR / str(record.project_id) / f"{record.id}.bin"
+
+
+def source_path(record: ConversionRecord) -> Path:
+    return DATA_DIR / str(record.project_id) / f"{record.id}.source.bin"
+
+
+def remove_output(record: ConversionRecord) -> None:
+    try:
+        metadata = source_metadata(record)
+        if metadata is not None:
+            for path in (output_path(record), source_path(record)):
+                try:
+                    stream, _ = open_private_regular_file(path, root=DATA_DIR)
+                except FileNotFoundError:
+                    # A previous delete may have removed one owned file before
+                    # another failed; missing leaves are safe to retry.
+                    continue
+                stream.close()
+            remove_private_file(source_path(record), root=DATA_DIR)
+        remove_private_file(output_path(record), root=DATA_DIR)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(503, "项目转换文件清理失败，请核对存储后重试") from exc
 
 
 def prune(db: Session, project_id: int, days: int) -> None:
@@ -78,7 +119,7 @@ def prune(db: Session, project_id: int, days: int) -> None:
         except ValueError:
             continue
         if created < cutoff:
-            output_path(record).unlink(missing_ok=True)
+            remove_output(record)
             db.delete(record)
     db.commit()
 
@@ -86,8 +127,8 @@ def prune(db: Session, project_id: int, days: int) -> None:
 def build_router(get_db, current_user, csrf, project_access, writable) -> APIRouter:
     router = APIRouter(prefix="/api/v1/projects/{project_id}/conversion", tags=["conversion"])
 
-    def scope(project_id: int, user: User, db: Session):
-        project_access(project_id, user, db)
+    def scope(project_id: int, user: User, db: Session, *, fence: bool = False):
+        project_access(project_id, user, db, fence=fence)
 
     def find_record(project_id: int, record_id: str, db: Session) -> ConversionRecord:
         record = db.get(ConversionRecord, record_id)
@@ -114,7 +155,7 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
     @router.patch("/config", dependencies=[Depends(csrf)])
     def patch_config(project_id: int, payload: ConfigUpdate, user: User = Depends(current_user), db: Session = Depends(get_db)):
         scope(project_id, user, db)
-        writable(user, project_id, db)
+        writable(user, project_id, db, fence=True)
         settings = settings_for(db, project_id)
         if payload.default_prefix_path is not None:
             settings.default_prefix_path = payload.default_prefix_path
@@ -183,16 +224,34 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             id=uuid.uuid4().hex, project_id=project_id, user_id=user.id,
             source_filename=name, output_filename=output_name, conversion_mode=conversion_mode,
             output_mode=result["output_mode"], media_type=media_type, app_version=service.APP_VERSION,
-            row_count=result["row_count"], file_size=len(output), preview=result,
+            row_count=result["row_count"], file_size=len(output),
+            output_sha256=hashlib.sha256(output).hexdigest(),
+            preview={**result, "_source": {"schema_version": "conversion-upload.v1",
+                                          "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}},
         )
         path = output_path(record)
+        writable(user, project_id, db, fence=True)
         try:
             write_private_atomic(path, output, root=DATA_DIR)
+            write_private_atomic(source_path(record), data, root=DATA_DIR)
             db.add(record)
             db.commit()
         except Exception as exc:
-            path.unlink(missing_ok=True)
             db.rollback()
+            try:
+                remove_private_file(path, root=DATA_DIR)
+            except OSError:
+                logger.warning("conversion.export.cleanup_failed", extra={
+                    "event": "conversion.export.cleanup_failed", "project_id": project_id,
+                    "component": "conversion-storage", "error_type": "OSError",
+                })
+            try:
+                remove_private_file(source_path(record), root=DATA_DIR)
+            except OSError:
+                logger.warning("conversion.export.source_cleanup_failed", extra={
+                    "event": "conversion.export.source_cleanup_failed", "project_id": project_id,
+                    "component": "conversion-storage", "error_type": "OSError",
+                })
             logger.exception("conversion.export.persist_failed", extra={
                 "event": "conversion.export.persist_failed", "project_id": project_id,
                 "actor_id": user.id, "error_type": type(exc).__name__,
@@ -205,7 +264,8 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             "conversion_mode": conversion_mode, "output_mode": result["output_mode"],
             "duration_ms": round((monotonic() - conversion_started) * 1000, 2),
         })
-        prune(db, project_id, settings_for(db, project_id).history_retention_days)
+        # History reads perform retention cleanup. Do not start a second
+        # write transaction after this export has already committed.
         return StreamingResponse(io.BytesIO(output), media_type=media_type,
                                  headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(output_name)}"})
 
@@ -213,8 +273,11 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
     def history(project_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
         scope(project_id, user, db)
         settings = settings_for(db, project_id)
-        prune(db, project_id, settings.history_retention_days)
         records = db.scalars(select(ConversionRecord).where(ConversionRecord.project_id == project_id).order_by(ConversionRecord.created_at.desc())).all()
+        if records:
+            scope(project_id, user, db, fence=True)
+            prune(db, project_id, settings.history_retention_days)
+            records = db.scalars(select(ConversionRecord).where(ConversionRecord.project_id == project_id).order_by(ConversionRecord.created_at.desc())).all()
         return {"retention_days": settings.history_retention_days, "records": [record_dict(item) for item in records]}
 
     @router.get("/history/{record_id}")
@@ -230,29 +293,109 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         path = output_path(record)
         try:
             stream, size = open_private_regular_file(path, root=DATA_DIR)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             logger.warning("conversion.download.rejected", extra={
                 "event": "conversion.download.rejected", "project_id": project_id,
                 "actor_id": user.id, "error_type": type(exc).__name__,
                 "component": "conversion-storage",
             })
             raise HTTPException(404, "历史结果文件不存在。") from exc
+        output = None
+        try:
+            if record.output_sha256 is not None and not SHA256.fullmatch(record.output_sha256):
+                raise HTTPException(409, "历史结果摘要记录损坏，请核对数据")
+            with stream:
+                if size != record.file_size:
+                    raise HTTPException(409, "历史结果大小与保存的记录不一致")
+                output = tempfile.TemporaryFile(mode="w+b")
+                digest = hashlib.sha256()
+                copied = 0
+                while chunk := stream.read(1024 * 1024):
+                    copied += len(chunk)
+                    if copied > size:
+                        raise HTTPException(409, "历史结果在下载准备期间发生变化")
+                    digest.update(chunk)
+                    output.write(chunk)
+                if copied != size or record.output_sha256 is not None and digest.hexdigest() != record.output_sha256:
+                    raise HTTPException(409, "历史结果与生成时内容不一致")
+                output.seek(0)
+        except Exception:
+            stream.close()
+            if output is not None:
+                output.close()
+            raise
+
+        def chunks():
+            try:
+                while chunk := output.read(1024 * 1024):
+                    yield chunk
+            finally:
+                output.close()
+
         return StreamingResponse(
-            iter(lambda: stream.read(1024 * 1024), b""),
+            chunks(),
             media_type=record.media_type,
             headers={
                 "Content-Disposition": f"attachment; filename*=UTF-8''{quote(record.output_filename)}",
                 "Content-Length": str(size),
+                "X-Output-Integrity": "verified" if record.output_sha256 else "unverified",
             },
-            background=BackgroundTask(stream.close),
+            background=BackgroundTask(output.close),
         )
+
+    @router.get("/history/{record_id}/source")
+    def history_source(project_id: int, record_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+        scope(project_id, user, db)
+        record = find_record(project_id, record_id, db)
+        metadata = source_metadata(record)
+        if metadata is None:
+            raise HTTPException(404, "旧版转换记录未保留原始上传文件")
+        try:
+            stream, size = open_private_regular_file(source_path(record), root=DATA_DIR)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(409, "转换来源文件缺失或不安全") from exc
+        output = None
+        try:
+            with stream:
+                if size != metadata["size"]:
+                    raise HTTPException(409, "转换来源文件与保存的摘要不一致")
+                output = tempfile.TemporaryFile(mode="w+b")
+                digest = hashlib.sha256()
+                copied = 0
+                while chunk := stream.read(1024 * 1024):
+                    copied += len(chunk)
+                    if copied > size:
+                        raise HTTPException(409, "转换来源文件在下载准备期间发生变化")
+                    digest.update(chunk)
+                    output.write(chunk)
+                if copied != size or digest.hexdigest() != metadata["sha256"]:
+                    raise HTTPException(409, "转换来源文件与保存的摘要不一致")
+                output.seek(0)
+        except Exception:
+            stream.close()
+            if output is not None:
+                output.close()
+            raise
+
+        def chunks():
+            try:
+                while chunk := output.read(1024 * 1024):
+                    yield chunk
+            finally:
+                output.close()
+
+        return StreamingResponse(chunks(),
+                                 media_type="application/octet-stream",
+                                 headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(record.source_filename)}",
+                                          "Content-Length": str(size)},
+                                 background=BackgroundTask(output.close))
 
     @router.delete("/history/{record_id}", dependencies=[Depends(csrf)])
     def history_delete(project_id: int, record_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
         scope(project_id, user, db)
-        writable(user, project_id, db)
+        writable(user, project_id, db, fence=True)
         record = find_record(project_id, record_id, db)
-        output_path(record).unlink(missing_ok=True)
+        remove_output(record)
         db.delete(record)
         db.commit()
         return history(project_id, user, db)
@@ -260,10 +403,10 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
     @router.delete("/history", dependencies=[Depends(csrf)])
     def history_clear(project_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
         scope(project_id, user, db)
-        writable(user, project_id, db)
+        writable(user, project_id, db, fence=True)
         records = db.scalars(select(ConversionRecord).where(ConversionRecord.project_id == project_id)).all()
         for record in records:
-            output_path(record).unlink(missing_ok=True)
+            remove_output(record)
             db.delete(record)
         db.commit()
         return {**history(project_id, user, db), "deleted_count": len(records)}

@@ -22,9 +22,15 @@ import sys
 import tarfile
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
+
+if __package__:
+    from .deployment_secret_file import database_url as configured_database_url
+else:
+    from deployment_secret_file import database_url as configured_database_url
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +38,13 @@ DEFAULT_DATABASE_URL = "sqlite:///./data/ai_studio.db"
 ARCHIVE_PREFIX = "test-atelier-"
 TRANSIENT_DATA_FILES = {".worker-heartbeat", ".worker-heartbeat.tmp"}
 MANIFEST_FORMAT = 1
+
+
+def is_link_like(path: Path) -> bool:
+    """Treat Windows junctions as directory links throughout backup/restore."""
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
+
 MAX_ARCHIVE_MEMBERS = 100_000
 MAX_MANIFEST_PATH_LENGTH = 1_024
 # Keep restore/verify bounded against decompression bombs or an accidentally
@@ -48,7 +61,7 @@ _ERROR_SECRET_PATTERN = re.compile(
 _ERROR_ENV_PATTERN = re.compile(
     r"(?i)\b(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|AZURE_OPENAI_API_KEY|AWS_ACCESS_KEY_ID|"
     r"AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|GOOGLE_API_KEY|HF_TOKEN|GITHUB_TOKEN|NPM_TOKEN|"
-    r"DOCKER_AUTH_CONFIG|DATABASE_URL|POSTGRES_PASSWORD|METRICS_TOKEN|AI_STUDIO_SESSION_SECRET|"
+    r"DOCKER_AUTH_CONFIG|DATABASE_URL|POSTGRES_PASSWORD(?:_FILE)?|AI_STUDIO_DATABASE_PASSWORD_FILE|METRICS_TOKEN(?:_FILE)?|AI_STUDIO_SESSION_SECRET|TEST_ATELIER_SCOPE_SECRET|"
     r"AI_STUDIO_ADMIN_PASSWORD)\s*=\s*[^\s,;&}]+"
 )
 _ERROR_COOKIE_PATTERN = re.compile(
@@ -101,6 +114,7 @@ def manifest_summary(manifest: dict) -> dict[str, object]:
         "database_kind": manifest.get("database_kind", "unknown"),
         "schema_revision": manifest.get("schema_revision", "unknown"),
         "data_file_count": manifest.get("data_file_count", 0),
+        "harness_storage": manifest.get("harness_storage", "none"),
         "file_count": len(entries) if isinstance(entries, list) else 0,
     }
 
@@ -130,7 +144,7 @@ def safe_error_message(value: str) -> str:
 
 _EVENT_FIELDS = {
     "archive", "archive_size", "removed", "removed_count", "duration_ms",
-    "database_kind", "schema_revision", "data_file_count", "file_count",
+    "database_kind", "schema_revision", "data_file_count", "harness_storage", "file_count",
     "target_name", "data_dir_name", "error_type", "message",
 }
 
@@ -207,7 +221,9 @@ def _fsync_directory(path: Path) -> None:
 
 def _remove_path(path: Path) -> None:
     """Remove a staged file or directory without ever following a link."""
-    if path.is_symlink() or path.is_file():
+    if getattr(path, "is_junction", lambda: False)():
+        path.rmdir()
+    elif path.is_symlink() or path.is_file():
         path.unlink(missing_ok=True)
     elif path.is_dir():
         shutil.rmtree(path)
@@ -226,11 +242,11 @@ def _best_effort_remove(path: Path) -> None:
 
 def _private_tree(path: Path) -> None:
     """Apply private permissions to every restored directory and file."""
-    if path.is_symlink() or not path.is_dir():
+    if is_link_like(path) or not path.is_dir():
         raise ValueError(f"恢复目录不是普通目录：{path}")
     path.chmod(0o700)
     for item in path.rglob("*"):
-        if item.is_symlink():
+        if is_link_like(item):
             raise ValueError(f"恢复目录不允许包含符号链接：{item}")
         if item.is_dir():
             item.chmod(0o700)
@@ -314,8 +330,9 @@ def postgres_environment(parsed) -> dict[str, str]:
     # child environment where diagnostics and process inspection may expose
     # them.
     secret_names = {
-        "DATABASE_URL", "POSTGRES_PASSWORD", "AI_STUDIO_SESSION_SECRET",
-        "AI_STUDIO_ADMIN_PASSWORD", "METRICS_TOKEN", "OPENAI_API_KEY",
+        "DATABASE_URL", "POSTGRES_PASSWORD", "POSTGRES_PASSWORD_FILE", "AI_STUDIO_DATABASE_PASSWORD_FILE",
+        "AI_STUDIO_SESSION_SECRET", "AI_STUDIO_SESSION_SECRET_FILE", "TEST_ATELIER_SCOPE_SECRET", "TEST_ATELIER_SCOPE_SECRET_FILE",
+        "AI_STUDIO_ADMIN_PASSWORD", "AI_STUDIO_ADMIN_PASSWORD_FILE", "METRICS_TOKEN", "METRICS_TOKEN_FILE", "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
         "GITHUB_TOKEN",
     }
@@ -357,7 +374,7 @@ def redacted_url(database_url: str) -> str:
 
 
 def sqlite_snapshot(source: Path, target: Path) -> str:
-    if source.is_symlink() or not source.is_file():
+    if is_link_like(source) or not source.is_file():
         raise FileNotFoundError(f"SQLite 数据库不存在：{source}")
     source_db = sqlite3.connect(str(source), timeout=10)
     target_db = sqlite3.connect(str(target))
@@ -405,7 +422,21 @@ def postgres_dump(database_url: str, target: Path) -> None:
         raise RuntimeError(f"pg_dump 失败：{detail}")
 
 
-def postgres_restore(archive: Path, database_url: str, data_dir: Path, force: bool) -> None:
+def postgres_restore(archive: Path, database_url: str, data_dir: Path, force: bool,
+                     task_dir: Path | None = None, session_dir: Path | None = None,
+                     services_stopped: bool = False) -> None:
+    roots = harness_paths(task_dir, session_dir, services_stopped, restoring=True)
+    if roots:
+        check_disjoint_roots([safe_data_root(data_dir), *roots])
+        with installed_harness_roots(archive, roots, force):
+            _postgres_restore_core(archive, database_url, data_dir, force)
+    else:
+        if verify_archive(archive).get("harness_storage") == "task-session-v1":
+            raise ValueError("归档包含 Harness 数据；必须指定任务与 Session 目标目录")
+        _postgres_restore_core(archive, database_url, data_dir, force)
+
+
+def _postgres_restore_core(archive: Path, database_url: str, data_dir: Path, force: bool) -> None:
     """Restore a PostgreSQL custom dump and the uploaded-file directory.
 
     The target URL is required explicitly because backup manifests redact the
@@ -417,7 +448,7 @@ def postgres_restore(archive: Path, database_url: str, data_dir: Path, force: bo
         raise ValueError("该归档不是 PostgreSQL 备份")
     if not database_url or database_kind(database_url) != "postgresql":
         raise ValueError("PostgreSQL 恢复必须提供 postgresql 数据库地址")
-    if data_dir.is_symlink():
+    if is_link_like(data_dir):
         raise ValueError(f"目标数据目录不允许是符号链接：{data_dir}")
     if data_dir.exists() and not data_dir.is_dir():
         raise ValueError(f"目标数据路径不是目录：{data_dir}")
@@ -459,7 +490,7 @@ def postgres_restore(archive: Path, database_url: str, data_dir: Path, force: bo
             # --single-transaction asks PostgreSQL to roll its changes back.
             shutil.copytree(stage / "data", staged_data)
             _private_tree(staged_data)
-            if data_dir.exists() or data_dir.is_symlink():
+            if data_dir.exists() or is_link_like(data_dir):
                 old_data = Path(tempfile.mkdtemp(
                     prefix=f".{data_dir.name}.backup-", dir=data_dir.parent
                 ))
@@ -494,7 +525,7 @@ def postgres_restore(archive: Path, database_url: str, data_dir: Path, force: bo
                 _best_effort_remove(old_data)
 
 
-def copy_data(source: Path, target: Path) -> int:
+def copy_data(source: Path, target: Path, excluded: set[Path] | None = None) -> int:
     if not source.exists():
         target.mkdir(parents=True)
         return 0
@@ -502,11 +533,13 @@ def copy_data(source: Path, target: Path) -> int:
         raise ValueError(f"数据目录不是目录：{source}")
     count = 0
     for item in source.rglob("*"):
-        if item.is_symlink():
+        if is_link_like(item):
             # Uploaded artifacts must stay inside the configured data root;
             # following a symlink here could silently copy unrelated secrets.
             raise ValueError(f"数据目录不允许包含符号链接：{item}")
         if item.is_file():
+            if excluded and item.resolve() in excluded:
+                continue
             relative = item.relative_to(source)
             # A restored heartbeat must never make the API report a worker as
             # healthy before a real worker has started and renewed it.
@@ -522,14 +555,108 @@ def copy_data(source: Path, target: Path) -> int:
 def safe_data_root(path: Path) -> Path:
     """Resolve a data root only after rejecting a symlinked root."""
     candidate = path.expanduser()
-    if candidate.is_symlink():
+    if is_link_like(candidate):
         raise ValueError(f"数据目录不允许是符号链接：{candidate}")
     if candidate.exists() and not candidate.is_dir():
         raise ValueError(f"数据目录不是目录：{candidate}")
     return candidate.resolve()
 
 
-def build_manifest(stage: Path, database_url: str, kind: str, revision: str, data_count: int) -> dict:
+def harness_paths(task_dir: Path | None, session_dir: Path | None,
+                  stopped: bool, *, restoring: bool = False) -> tuple[Path, Path] | None:
+    """Require an explicit stop boundary and both persistent Host volumes."""
+    if (task_dir is None) != (session_dir is None):
+        raise ValueError("Harness 恢复/备份必须同时提供任务与 Session 目录")
+    if task_dir is None:
+        return None
+    if not stopped:
+        raise ValueError("Harness 备份/恢复必须在所有写入方停机后显式传入 --services-stopped")
+    roots = (safe_data_root(task_dir), safe_data_root(session_dir))
+    if roots[0] == roots[1] or any(a in b.parents for a, b in (roots, roots[::-1])):
+        raise ValueError("Harness 任务与 Session 目录不能重叠")
+    if not restoring and not all(root.is_dir() for root in roots):
+        raise FileNotFoundError("Harness 持久目录不存在；不能创建不完整的备份")
+    return roots
+
+
+def check_disjoint_roots(roots: list[Path]) -> None:
+    for index, root in enumerate(roots):
+        if any(root == other or root in other.parents or other in root.parents
+               for other in roots[index + 1:]):
+            raise ValueError("备份/恢复的持久目录不能相互嵌套或重叠")
+
+
+def restore_harness_targets(manifest: dict, stage: Path, roots: tuple[Path, Path] | None
+                            ) -> list[tuple[Path, Path]]:
+    if manifest.get("harness_storage") == "task-session-v1":
+        if roots is None:
+            raise ValueError("归档包含 Harness 数据；必须指定任务与 Session 目标目录")
+        targets = []
+        for name, root in zip(("tasks", "sessions"), roots):
+            source = stage / "harness" / name
+            source.mkdir(parents=True, exist_ok=True)
+            targets.append((source, root))
+        return targets
+    if roots is not None:
+        raise ValueError("旧归档没有 Harness 数据；拒绝恢复或清空 Harness 目标")
+    return []
+
+
+@contextmanager
+def installed_harness_roots(archive: Path, roots: tuple[Path, Path] | None,
+                            force: bool):
+    """Keep both Host volumes reversible until the DB and uploads commit."""
+    manifest = verify_archive(archive)
+    with tempfile.TemporaryDirectory(prefix="test-atelier-harness-restore-") as temporary:
+        stage = Path(temporary)
+        extract_verified_archive(archive, stage, manifest)
+        targets = restore_harness_targets(manifest, stage, roots)
+        if roots:
+            for _, target in targets:
+                if is_link_like(target) or (target.exists() and not target.is_dir()):
+                    raise ValueError("Harness 恢复目标必须是普通目录且不能是符号链接")
+                if target.exists() and not force:
+                    raise FileExistsError("Harness 目标已存在；请显式传入 --force")
+        staged: list[tuple[Path, Path, Path]] = []
+        old: list[tuple[Path, Path]] = []
+        installed: list[Path] = []
+        committed = False
+        try:
+            for source, target in targets:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                check_disjoint_roots([target, *(other for _, other in targets if other != target)])
+                parent = Path(tempfile.mkdtemp(prefix=f".{target.name}.restore-", dir=target.parent))
+                staged_target = parent / target.name
+                staged.append((parent, staged_target, target))
+                shutil.copytree(source, staged_target)
+                _private_tree(staged_target)
+            for _, staged_target, target in staged:
+                if target.exists():
+                    previous = Path(tempfile.mkdtemp(prefix=f".{target.name}.backup-", dir=target.parent))
+                    previous.rmdir()
+                    os.replace(target, previous)
+                    old.append((previous, target))
+                os.replace(staged_target, target)
+                installed.append(target)
+                _fsync_directory(target.parent)
+            yield
+            committed = True
+        finally:
+            if not committed:
+                for target in reversed(installed):
+                    _remove_path(target)
+                for previous, target in reversed(old):
+                    os.replace(previous, target)
+                    _fsync_directory(target.parent)
+            for parent, _, _ in staged:
+                _best_effort_remove(parent)
+            if committed:
+                for previous, _ in old:
+                    _best_effort_remove(previous)
+
+
+def build_manifest(stage: Path, database_url: str, kind: str, revision: str, data_count: int,
+                   include_harness: bool = False) -> dict:
     files = []
     for item in sorted(stage.rglob("*")):
         if not item.is_file() or item.name == "manifest.json":
@@ -538,7 +665,7 @@ def build_manifest(stage: Path, database_url: str, kind: str, revision: str, dat
         files.append({"path": relative, "size": item.stat().st_size, "sha256": sha256(item)})
     if sum(item["size"] for item in files) > max_archive_uncompressed_bytes():
         raise ValueError("备份解压后大小超过限制")
-    return {
+    manifest = {
         "format": MANIFEST_FORMAT,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "database_kind": kind,
@@ -547,10 +674,13 @@ def build_manifest(stage: Path, database_url: str, kind: str, revision: str, dat
         "data_file_count": data_count,
         "files": files,
     }
+    if include_harness:
+        manifest["harness_storage"] = "task-session-v1"
+    return manifest
 
 
 def verify_archive(archive: Path) -> dict:
-    if archive.is_symlink() or not archive.is_file():
+    if is_link_like(archive) or not archive.is_file():
         raise FileNotFoundError(f"备份不存在：{archive}")
     with tarfile.open(archive, "r:gz") as stream:
         members = stream.getmembers()
@@ -579,6 +709,8 @@ def verify_archive(archive: Path) -> dict:
             raise ValueError("备份清单版本不受支持")
         if manifest.get("database_kind") not in {"sqlite", "postgresql"}:
             raise ValueError("备份清单缺少有效的数据库类型")
+        if manifest.get("harness_storage", "none") not in {"none", "task-session-v1"}:
+            raise ValueError("备份清单包含不支持的 Harness 存储版本")
         if (not isinstance(manifest.get("schema_revision"), str)
                 or len(manifest["schema_revision"]) > 128):
             raise ValueError("备份清单包含无效迁移版本")
@@ -609,6 +741,13 @@ def verify_archive(archive: Path) -> dict:
         database_member = "database.sqlite3" if manifest["database_kind"] == "sqlite" else "database.dump"
         if database_member not in listed or listed[database_member]["size"] <= 0:
             raise ValueError(f"备份缺少有效数据库文件：{database_member}")
+        harness_entries = {name for name in listed if name.startswith("harness/")}
+        if manifest.get("harness_storage") == "task-session-v1":
+            if any(not name.startswith(("harness/tasks/", "harness/sessions/"))
+                   for name in harness_entries):
+                raise ValueError("备份包含未知 Harness 数据路径")
+        elif harness_entries:
+            raise ValueError("备份含 Harness 数据但未声明存储版本")
         actual = {member.name for member in members if member.isfile() and member.name != "manifest.json"}
         if actual != set(listed):
             raise ValueError("备份清单与归档文件不一致")
@@ -678,12 +817,17 @@ def extract_verified_archive(archive: Path, stage: Path, manifest: dict | None =
     return manifest
 
 
-def create_backup(database_url: str, data_dir: Path, output_dir: Path) -> Path:
+def create_backup(database_url: str, data_dir: Path, output_dir: Path,
+                  task_dir: Path | None = None, session_dir: Path | None = None,
+                  services_stopped: bool = False) -> Path:
     kind = database_kind(database_url)
+    roots = harness_paths(task_dir, session_dir, services_stopped)
     # A symlinked output root could redirect an otherwise trusted backup or
     # prune operation to an unrelated directory. Resolve only after rejecting
     # the root itself as a link, matching the uploaded-data safety boundary.
     output_dir = safe_data_root(output_dir)
+    data_dir = safe_data_root(data_dir)
+    check_disjoint_roots([output_dir, data_dir, *(roots or ())])
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
         output_dir.chmod(0o700)
@@ -702,8 +846,15 @@ def create_backup(database_url: str, data_dir: Path, output_dir: Path) -> Path:
         else:
             postgres_dump(database_url, stage / "database.dump")
             revision = "external-pg-dump"
-        data_count = copy_data(safe_data_root(data_dir), stage / "data")
-        manifest = build_manifest(stage, database_url, kind, revision, data_count)
+        excluded: set[Path] = set()
+        if kind == "sqlite":
+            db_path = sqlite_path(database_url).resolve()
+            excluded = {db_path, *(Path(str(db_path) + suffix) for suffix in ("-wal", "-shm", "-journal"))}
+        data_count = copy_data(data_dir, stage / "data", excluded)
+        if roots:
+            for name, root in zip(("tasks", "sessions"), roots):
+                copy_data(root, stage / "harness" / name)
+        manifest = build_manifest(stage, database_url, kind, revision, data_count, bool(roots))
         (stage / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=f".{final.name}.", suffix=".tmp", dir=output_dir
@@ -737,7 +888,7 @@ def prune_backups(output_dir: Path, keep: int) -> list[str]:
         raise ValueError("--keep 必须至少为 1")
     output_dir = safe_data_root(output_dir)
     archives = [item for item in output_dir.glob(f"{ARCHIVE_PREFIX}*.tar.gz")
-                if item.is_file() and not item.is_symlink()]
+                if item.is_file() and not is_link_like(item)]
     archives.sort(key=lambda item: item.stat().st_mtime, reverse=True)
     removed = []
     for archive in archives[keep:]:
@@ -746,17 +897,74 @@ def prune_backups(output_dir: Path, keep: int) -> list[str]:
     return removed
 
 
-def restore_sqlite(archive: Path, database_path: Path, data_dir: Path, force: bool) -> None:
+def restore_sqlite(archive: Path, database_path: Path, data_dir: Path, force: bool,
+                   task_dir: Path | None = None, session_dir: Path | None = None,
+                   services_stopped: bool = False) -> None:
+    if database_path.resolve() == data_dir.resolve() or database_path.resolve() in data_dir.resolve().parents:
+        raise ValueError("SQLite 数据库目标必须是数据目录内的文件或独立文件，不能包含数据目录")
+    roots = harness_paths(task_dir, session_dir, services_stopped, restoring=True)
+    if roots:
+        check_disjoint_roots([safe_data_root(data_dir), *roots])
+        if any(database_path.resolve() == root or database_path.resolve() in root.parents
+               or root in database_path.resolve().parents for root in roots):
+            raise ValueError("数据库目标不能与 Harness 持久目录重叠")
+        with installed_harness_roots(archive, roots, force):
+            _restore_sqlite_core(archive, database_path, data_dir, force)
+    else:
+        if verify_archive(archive).get("harness_storage") == "task-session-v1":
+            raise ValueError("归档包含 Harness 数据；必须指定任务与 Session 目标目录")
+        _restore_sqlite_core(archive, database_path, data_dir, force)
+
+
+def _restore_nested_sqlite(snapshot: Path, source_data: Path, database_path: Path,
+                           data_dir: Path) -> None:
+    """Install a DB nested inside the uploads tree as one directory rename."""
+    staged_parent = Path(tempfile.mkdtemp(prefix=f".{data_dir.name}.restore-", dir=data_dir.parent))
+    staged_data = staged_parent / data_dir.name
+    old_data: Path | None = None
+    committed = False
+    installed = False
+    try:
+        shutil.copytree(source_data, staged_data)
+        destination = staged_data / database_path.relative_to(data_dir)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(snapshot, destination)
+        for suffix in ("-wal", "-shm", "-journal"):
+            Path(str(destination) + suffix).unlink(missing_ok=True)
+        _private_tree(staged_data)
+        with destination.open("rb") as stream:
+            os.fsync(stream.fileno())
+        if data_dir.exists():
+            old_data = Path(tempfile.mkdtemp(prefix=f".{data_dir.name}.backup-", dir=data_dir.parent))
+            old_data.rmdir()
+            os.replace(data_dir, old_data)
+        os.replace(staged_data, data_dir)
+        installed = True
+        _fsync_directory(data_dir.parent)
+        committed = True
+    except Exception:
+        if installed:
+            _remove_path(data_dir)
+        if old_data is not None and old_data.exists():
+            os.replace(old_data, data_dir)
+        _fsync_directory(data_dir.parent)
+        raise
+    finally:
+        _best_effort_remove(staged_parent)
+        if committed and old_data is not None and old_data.exists():
+            _best_effort_remove(old_data)
+
+
+def _restore_sqlite_core(archive: Path, database_path: Path, data_dir: Path, force: bool) -> None:
     manifest = verify_archive(archive)
     if manifest.get("database_kind") != "sqlite":
         raise ValueError("restore 目前只支持 SQLite 归档；PostgreSQL 请使用 pg_restore")
-    if database_path.is_symlink():
+    if is_link_like(database_path):
         raise ValueError(f"目标数据库不允许是符号链接：{database_path}")
-    if data_dir.is_symlink():
+    if is_link_like(data_dir):
         raise ValueError(f"目标数据目录不允许是符号链接：{data_dir}")
     if (database_path.exists() or data_dir.exists()) and not force:
         raise FileExistsError("目标已存在；恢复会覆盖数据，请显式传入 --force")
-    database_path.parent.mkdir(parents=True, exist_ok=True)
     data_dir.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="test-atelier-restore-") as temporary:
         stage = Path(temporary)
@@ -771,6 +979,12 @@ def restore_sqlite(archive: Path, database_path: Path, data_dir: Path, force: bo
                 raise ValueError("恢复前 SQLite integrity_check 失败")
         finally:
             check.close()
+
+        if data_dir.resolve() in database_path.resolve().parents:
+            _restore_nested_sqlite(snapshot, stage / "data", database_path.resolve(), data_dir.resolve())
+            return
+
+        database_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Stage both outputs beside their final destinations.  A temporary
         # directory under /tmp can be on a different filesystem, making an
@@ -800,13 +1014,13 @@ def restore_sqlite(archive: Path, database_path: Path, data_dir: Path, force: bo
 
             # Move current targets out of the way first.  If the second
             # install fails, the rollback below restores both old targets.
-            if database_path.exists() or database_path.is_symlink():
+            if database_path.exists() or is_link_like(database_path):
                 old_db = Path(tempfile.mkdtemp(
                     prefix=f".{database_path.name}.backup-", dir=database_path.parent
                 ))
                 old_db.rmdir()
                 os.replace(database_path, old_db)
-            if data_dir.exists() or data_dir.is_symlink():
+            if data_dir.exists() or is_link_like(data_dir):
                 old_data = Path(tempfile.mkdtemp(
                     prefix=f".{data_dir.name}.backup-", dir=data_dir.parent
                 ))
@@ -836,7 +1050,7 @@ def restore_sqlite(archive: Path, database_path: Path, data_dir: Path, force: bo
             _fsync_directory(data_dir.parent)
             raise
         finally:
-            if staged_db.exists() or staged_db.is_symlink():
+            if staged_db.exists() or is_link_like(staged_db):
                 _best_effort_remove(staged_db)
             if staged_data_parent.exists():
                 _best_effort_remove(staged_data_parent)
@@ -852,18 +1066,25 @@ def main() -> int:
     parser = _ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="action", required=True)
     backup = subparsers.add_parser("backup", help="创建并校验备份")
-    backup.add_argument("--database-url", default=os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL))
+    backup.add_argument("--database-url")
     backup.add_argument("--data-dir", type=Path, default=Path(os.getenv("AI_STUDIO_DATA_DIR", ROOT / "data")))
     backup.add_argument("--output-dir", type=Path, default=ROOT / "backups")
     backup.add_argument("--keep", type=int, default=7, help="保留最近的备份数量")
+    backup.add_argument("--harness-task-dir", type=Path, help="已停机的 Host 任务持久卷挂载目录")
+    backup.add_argument("--harness-session-dir", type=Path, help="已停机的 Host Session 持久卷挂载目录")
+    backup.add_argument("--services-stopped", action="store_true", help="确认所有 API/worker/Projector/Host 写入方已停机")
     verify = subparsers.add_parser("verify", help="校验已有备份")
     verify.add_argument("archive", type=Path)
     restore = subparsers.add_parser("restore", help="恢复 SQLite 或 PostgreSQL 备份")
     restore.add_argument("archive", type=Path)
     restore.add_argument("--database-path", type=Path, help="SQLite 目标文件")
     restore.add_argument("--database-url", default="", help="PostgreSQL 目标地址")
+    restore.add_argument("--database-name", help="使用数据库口令文件连接独立 PostgreSQL 恢复目标库")
     restore.add_argument("--data-dir", type=Path, required=True)
     restore.add_argument("--force", action="store_true")
+    restore.add_argument("--harness-task-dir", type=Path)
+    restore.add_argument("--harness-session-dir", type=Path)
+    restore.add_argument("--services-stopped", action="store_true")
     try:
         args = parser.parse_args()
     except (argparse.ArgumentError, ValueError) as exc:
@@ -878,7 +1099,11 @@ def main() -> int:
 
     try:
         if args.action == "backup":
-            archive = create_backup(args.database_url, args.data_dir, args.output_dir)
+            database_url = args.database_url or configured_database_url()
+            options = ({"task_dir": args.harness_task_dir, "session_dir": args.harness_session_dir,
+                        "services_stopped": args.services_stopped}
+                       if args.harness_task_dir or args.harness_session_dir else {})
+            archive = create_backup(database_url, args.data_dir, args.output_dir, **options)
             removed = prune_backups(args.output_dir, args.keep)
             manifest = verify_archive(archive)
             removed_names = [archive_name(Path(item)) for item in removed]
@@ -895,14 +1120,22 @@ def main() -> int:
             ), ensure_ascii=False))
         else:
             manifest = verify_archive(args.archive)
+            options = ({"task_dir": args.harness_task_dir, "session_dir": args.harness_session_dir,
+                        "services_stopped": args.services_stopped}
+                       if args.harness_task_dir or args.harness_session_dir else {})
             if manifest.get("database_kind") == "sqlite":
                 if args.database_path is None:
                     raise ValueError("SQLite 恢复必须提供 --database-path")
-                restore_sqlite(args.archive, args.database_path, args.data_dir, args.force)
+                restore_sqlite(args.archive, args.database_path, args.data_dir, args.force, **options)
                 database_target = str(args.database_path)
             else:
-                postgres_restore(args.archive, args.database_url, args.data_dir, args.force)
-                database_target = redacted_url(args.database_url)
+                database_url = args.database_url
+                if args.database_name:
+                    if database_url or args.database_name == "ai_studio" or not os.getenv("AI_STUDIO_DATABASE_PASSWORD_FILE"):
+                        raise ValueError("文件密钥恢复只能指定独立目标库，不得同时提供数据库 URL")
+                    database_url = configured_database_url(database=args.database_name)
+                postgres_restore(args.archive, database_url, args.data_dir, args.force, **options)
+                database_target = redacted_url(database_url)
             print(json.dumps(event_payload(
                 "backup.restored", archive=archive_name(args.archive),
                 database_kind=manifest.get("database_kind", "unknown"),

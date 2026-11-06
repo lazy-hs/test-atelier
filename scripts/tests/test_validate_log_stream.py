@@ -30,6 +30,13 @@ def test_validate_lines_accepts_api_worker_and_nginx_entries():
     assert errors == []
 
 
+def test_validate_lines_rejects_secret_file_paths_in_message():
+    count, errors = validate_lines([json.dumps(_entry(message="AI_STUDIO_SESSION_SECRET_FILE=/private/session"))])
+    assert count == 1 and errors
+    count, errors = validate_lines([json.dumps(_entry(message="AI_STUDIO_DATABASE_PASSWORD_FILE=/private/db"))])
+    assert count == 1 and errors
+
+
 def test_validate_lines_rejects_missing_envelope_field():
     payload = _entry()
     del payload["request_id"]
@@ -129,6 +136,25 @@ def test_validate_lines_rejects_uppercase_environment_credentials():
         "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz AWS_SECRET_ACCESS_KEY=secret"
     )))])
 
+    assert count == 1
+    assert errors == ["line 1: possible credential in log text"]
+
+
+def test_validate_lines_rejects_harness_host_token():
+    count, errors = validate_lines([json.dumps(_entry(message="TEST_ATELIER_HARNESS_TOKEN=host-token-123456"))])
+
+    assert count == 1
+    assert errors == ["line 1: possible credential in log text"]
+
+
+def test_validate_lines_rejects_host_token_file_path():
+    count, errors = validate_lines([json.dumps(_entry(message="TEST_ATELIER_HARNESS_TOKEN_FILE=/run/secrets/harness_host_api_token"))])
+    assert count == 1
+    assert errors == ["line 1: possible credential in log text"]
+
+
+def test_validate_lines_rejects_metrics_file_path():
+    count, errors = validate_lines([json.dumps(_entry(message="METRICS_TOKEN_FILE=/run/secrets/atelier_metrics_token"))])
     assert count == 1
     assert errors == ["line 1: possible credential in log text"]
 

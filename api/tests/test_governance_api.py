@@ -14,7 +14,8 @@ from api.main import app
 
 
 @pytest.fixture
-def governance_client():
+def governance_client(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_STUDIO_DATA_DIR", str(tmp_path))
     Base.metadata.drop_all(engine)
     with TestClient(app) as client:
         csrf = client.get("/api/v1/auth/csrf").json()["token"]

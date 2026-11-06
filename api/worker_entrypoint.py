@@ -7,7 +7,10 @@ import os
 import sys
 from datetime import datetime, timezone
 
+from .runtime_config import install_runtime_config
 from .observability import deployment_release, sanitize_log_fields
+
+install_runtime_config()
 
 
 def _log(event: str, level: str, **fields: object) -> None:

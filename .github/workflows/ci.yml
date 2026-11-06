@@ -14,6 +14,56 @@ permissions:
   contents: read
 
 jobs:
+  platform-contract:
+    name: Platform contract (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install -r api/requirements-dev.txt
+      - name: Validate native launcher and preflight contracts
+        run: python -m pytest -q scripts/tests/test_launchers.py scripts/tests/test_harness_secret_file.py scripts/tests/test_deployment_secret_file.py scripts/tests/test_verify_harness_compose.py scripts/tests/test_verify_artifact_snapshot_pg.py scripts/tests/test_verify_project_export_pg.py scripts/tests/test_verify_harness_case_context_pg.py scripts/tests/test_preflight_production.py scripts/tests/test_harness_backup_platform.py scripts/tests/test_audit_harness_project_storage.py scripts/tests/test_migrate_legacy_harness_session.py scripts/tests/test_remediate_harness_runner.py scripts/tests/test_evaluate_harness_quality.py api/tests/test_deployment_secret_files.py
+      - name: Validate scoped Harness API projection on this platform
+        run: python -m pytest -q api/tests/test_harness_bridge.py api/tests/test_harness_chunking.py api/tests/test_harness_contracts.py api/tests/test_harness_projector.py api/tests/test_harness_routes.py scripts/tests/test_harness_real_smoke.py scripts/tests/test_harness_smoke_process.py
+      - name: Validate project evidence export and direct artifact references
+        run: python -m pytest -q api/tests/test_project_export.py api/tests/test_artifact_routes.py api/tests/test_knowledge.py api/tests/test_migrations.py::test_source_document_upload_identity_keeps_legacy_rows_unverified_and_downgrades api/tests/test_migrations.py::test_conversion_output_creation_identity_preserves_legacy_rows_and_downgrades api/tests/test_conversion.py::test_original_upload_streams_verified_bytes_when_file_changes_after_validation
+      - name: Check full synthetic project snapshot capacity on this platform
+        run: python -m pytest -q scripts/tests/test_benchmark_artifact_relations.py::test_project_snapshot_covers_the_synthetic_project_without_partial_edges
+      - name: Validate CLI process-tree termination and Codex workspace lifecycle
+        run: python -m pytest -q api/tests/test_cli_provider.py api/tests/test_codex_workbench.py api/tests/test_storage.py
+      - name: Reject redirected project files during deletion
+        run: python -m pytest -q api/tests/test_project_management.py::test_project_delete_rejects_junction_in_owned_file_directory api/tests/test_project_management.py::test_project_delete_rejects_real_windows_document_junction api/tests/test_conversion.py::test_history_delete_rejects_junction_project_directory
+      - name: Reject Windows junctions during stopped backup and restore
+        run: python -m pytest -q scripts/tests/test_backup_data.py -k junction
+      - name: Parse POSIX local lifecycle scripts
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bash -n scripts/setup_and_start_linux.sh scripts/stop_linux.sh
+          if [ "$RUNNER_OS" = macOS ]; then
+            zsh -n scripts/setup_and_start_macos.command scripts/stop_macos.command
+          fi
+      - name: Parse native Windows lifecycle scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($name in @('setup_and_start_windows.ps1', 'start_windows.ps1', 'stop_windows.ps1')) {
+            $tokens = $null
+            $parseErrors = $null
+            $path = (Resolve-Path (Join-Path 'scripts' $name)).Path
+            [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            if ($parseErrors.Count -gt 0) { $parseErrors | Out-String | Write-Error; exit 1 }
+          }
+
   api:
     runs-on: ubuntu-latest
     env:
@@ -39,6 +89,9 @@ jobs:
           set -euo pipefail
           runtime_dir="$(mktemp -d)"
           log_file="$runtime_dir/api.log"
+          metrics_file="$runtime_dir/metrics-token"
+          # Exercise the deployed file-backed path, including Windows-style CRLF.
+          (umask 077; printf '%s\r\n' 'ci-runtime-metrics-token-1234' > "$metrics_file")
           AI_STUDIO_ENV=development \
           AI_STUDIO_REQUIRE_MIGRATIONS=0 \
           AI_STUDIO_SESSION_SECRET=ci-runtime-session-secret-32-characters-long \
@@ -46,7 +99,7 @@ jobs:
           AI_STUDIO_RELEASE=ci-${GITHUB_SHA} \
           DATABASE_URL="sqlite:///$runtime_dir/runtime.db" \
           AI_STUDIO_DATA_DIR="$runtime_dir/data" \
-          METRICS_TOKEN=ci-runtime-metrics-token-1234 \
+          METRICS_TOKEN_FILE="$metrics_file" \
           LOG_FORMAT=json \
           python -m api.uvicorn_entrypoint --host 127.0.0.1 --port 8765 >"$log_file" 2>&1 &
           api_pid=$!
@@ -61,7 +114,7 @@ jobs:
           done
           python scripts/production_smoke.py \
             --base-url http://127.0.0.1:8765 \
-            --metrics-token ci-runtime-metrics-token-1234 \
+            --metrics-token-file "$metrics_file" \
             --expected-release "ci-${GITHUB_SHA}" --jsonl \
             | python scripts/validate_log_stream.py
           # Include the graceful-shutdown lifecycle records in the contract
@@ -79,7 +132,7 @@ jobs:
           worker_log="$runtime_dir/worker.log"
           export AI_STUDIO_ENV=development
           export AI_STUDIO_REQUIRE_MIGRATIONS=1
-          export AI_STUDIO_MIGRATION_HEAD=20261024_queue_capacity
+          export AI_STUDIO_MIGRATION_HEAD=20261047_auth_session_revocations
           export AI_STUDIO_SESSION_SECRET=ci-worker-session-secret-32-characters-long
           export AI_STUDIO_ADMIN_PASSWORD=ci-worker-admin-password-123
           export DATABASE_URL="sqlite:///$runtime_dir/worker.db"
@@ -197,13 +250,17 @@ jobs:
       - run: python -m pip install -r api/requirements.txt
       - name: Prepare minimal read-only skill fixture
         run: |
-          mkdir -p "$TEST_ATELIER_SKILL_ROOT/skills/hub" \
-            "$TEST_ATELIER_SKILL_ROOT/skills/requirement-analysis" \
-            "$TEST_ATELIER_SKILL_ROOT/skills/test-cases"
-          printf '# CI rules\n' > "$TEST_ATELIER_SKILL_ROOT/AGENTS.md"
-          printf '# CI hub\n' > "$TEST_ATELIER_SKILL_ROOT/skills/hub/SKILL.md"
-          printf '# CI requirement analysis\n' > "$TEST_ATELIER_SKILL_ROOT/skills/requirement-analysis/SKILL.md"
-          printf '# CI test cases\n' > "$TEST_ATELIER_SKILL_ROOT/skills/test-cases/SKILL.md"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from scripts.preflight_production import HARNESS_SKILL_FILES
+
+          root = Path(os.environ['TEST_ATELIER_SKILL_ROOT'])
+          for name in HARNESS_SKILL_FILES:
+              path = root / name
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text('# CI source fixture\n', encoding='utf-8')
+          PY
       - name: Validate production preflight
         run: |
           set -o pipefail
@@ -217,38 +274,77 @@ jobs:
           python scripts/production_smoke.py \
             --base-url http://127.0.0.1:8080 \
             --metrics-token "$METRICS_TOKEN" \
-            --require-worker --require-web --attempts 30 --retry-seconds 2 \
+            --require-worker --require-web --expected-harness-mode off --attempts 30 --retry-seconds 2 \
             --expected-release "$AI_STUDIO_RELEASE" --jsonl \
             | python scripts/validate_log_stream.py
+      - name: Verify document-reference triggers in PostgreSQL
+        run: docker compose exec -T api python -m scripts.verify_document_references_pg
+      - name: Verify artifact-directory indexes in PostgreSQL
+        run: docker compose exec -T api python -m scripts.verify_artifact_directory_pg
+      - name: Verify artifact catalogs and project graph snapshots in PostgreSQL
+        run: docker compose exec -T -e TEST_ATELIER_PG_SMOKE=1 api python -m scripts.verify_artifact_snapshot_pg
+      - name: Verify evidence ZIP snapshot in PostgreSQL
+        run: docker compose exec -T -e TEST_ATELIER_PG_SMOKE=1 api python -m scripts.verify_project_export_pg
+      - name: Verify Harness case context against a concurrent PostgreSQL decision
+        run: docker compose exec -T -e TEST_ATELIER_PG_SMOKE=1 api python -m scripts.verify_harness_case_context_pg
       - name: Validate structured log streams
         run: |
           docker compose logs --no-color --no-log-prefix api worker web \
             | python scripts/validate_log_stream.py
-      - name: Run PostgreSQL backup and restore drill
+          # The Harness projector is an independently supervised process. Keep
+          # its lifecycle in the same structured-log contract so a healthy API
+          # cannot mask a stalled or misconfigured projector.
+          docker compose logs --no-color --no-log-prefix harness-projector \
+            | python scripts/validate_log_stream.py
+          docker compose logs --no-color --no-log-prefix harness-projector \
+            | grep -q '"event":"harness.projector.started"'
+      - name: Run stopped PostgreSQL and Harness storage backup and restore drill
         run: |
           set -euo pipefail
           restore_database=ai_studio_restore
+          fixture="$GITHUB_WORKSPACE/.ci/harness-storage-fixture"
+          mkdir -p "$fixture/tasks" "$fixture/sessions" "$fixture/backups"
+          printf '{"task_id":"ci-task"}\n' > "$fixture/tasks/index.json"
+          printf '{"sequence":1,"result":"fixture"}\n' > "$fixture/tasks/ci-task.events.jsonl"
+          printf '{"session_id":"ci-session"}\n' > "$fixture/sessions/session.jsonl"
+          # The container runs as UID 10001; the synthetic fixture is private
+          # to this runner and contains no production data or secrets.
+          sudo chown -R 10001:10001 "$fixture"
           cleanup() {
             docker compose exec -T db psql -U ai_studio -d postgres \
               -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS ${restore_database}" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
+          # Keep PostgreSQL available for pg_dump, but quiesce every app-side
+          # writer before copying uploads and the Host's two persistent roots.
+          docker compose stop web api worker harness-projector
           docker compose exec -T db psql -U ai_studio -d postgres \
             -v ON_ERROR_STOP=1 -c "CREATE DATABASE ${restore_database}"
-          docker compose exec -T api python scripts/backup_data.py backup \
-            --data-dir /app/data --output-dir /app/data/.backup-drill --keep 1 \
-            | python scripts/validate_log_stream.py
-          docker compose exec -T api sh -eu -c '
-            archive="$(find /app/data/.backup-drill -maxdepth 1 -type f -name "test-atelier-*.tar.gz" -print -quit)"
+          docker compose run --rm -T --no-deps \
+            -v "$fixture/tasks:/mnt/host-tasks:ro" \
+            -v "$fixture/sessions:/mnt/host-sessions:ro" \
+            -v "$fixture/backups:/mnt/backups" api sh -eu -c '
+            python scripts/backup_data.py backup \
+              --data-dir /app/data --output-dir /mnt/backups \
+              --harness-task-dir /mnt/host-tasks \
+              --harness-session-dir /mnt/host-sessions --services-stopped
+            archive="$(find /mnt/backups -maxdepth 1 -type f -name "test-atelier-*.tar.gz" -print -quit)"
             test -n "$archive"
             python scripts/backup_data.py verify "$archive"
             DATABASE_URL="${DATABASE_URL%/*}/ai_studio_restore"
             export DATABASE_URL
             python scripts/backup_data.py restore "$archive" \
-              --database-url "$DATABASE_URL" --data-dir /tmp/restore-data --force
+              --database-url "$DATABASE_URL" --data-dir /tmp/restore-data \
+              --harness-task-dir /tmp/restored-tasks \
+              --harness-session-dir /tmp/restored-sessions \
+              --services-stopped --force
+            cmp /mnt/host-tasks/index.json /tmp/restored-tasks/index.json
+            cmp /mnt/host-tasks/ci-task.events.jsonl /tmp/restored-tasks/ci-task.events.jsonl
+            cmp /mnt/host-sessions/session.jsonl /tmp/restored-sessions/session.jsonl
           ' | python scripts/validate_log_stream.py
           docker compose exec -T db psql -U ai_studio -d "$restore_database" \
-            -v ON_ERROR_STOP=1 -tAc 'SELECT version_num FROM alembic_version' | grep -q .
+            -v ON_ERROR_STOP=1 -tAc 'SELECT version_num FROM alembic_version' \
+            | grep -qx '20261047_auth_session_revocations'
       - name: Show service logs on failure
         if: failure()
         run: docker compose logs --no-color

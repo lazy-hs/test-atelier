@@ -7,6 +7,10 @@ __pycache__/
 *.sqlite*
 .DS_Store
 .env
+config/runtime.json
+config/runtime.*.json
+config/secrets/*
+!config/secrets/.gitkeep
 web/node_modules/
 web/dist/
 web/.vite/

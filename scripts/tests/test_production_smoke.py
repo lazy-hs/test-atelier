@@ -97,6 +97,40 @@ def test_smoke_rejects_worker_release_mismatch():
     assert "worker 发布标识不匹配" in worker.detail
 
 
+def test_smoke_requires_explicit_worker_mode_during_harness_cutover():
+    for mode, expected, status in ((True, True, "ok"), (False, False, "ok"),
+                                   (False, True, "fail"), (None, True, "fail"),
+                                   (1, True, "fail")):
+        def fetch(url, _headers, _timeout):
+            if url.endswith("/health/worker"):
+                payload = {"status": "ready"}
+                if mode is not None:
+                    payload["harness_only"] = mode
+                return 200, GOOD_HEADERS, json.dumps(payload)
+            return 200, GOOD_HEADERS, ""
+
+        checks = run_smoke("http://example.test", require_worker=True,
+                           expected_harness_only=expected, attempts=1, fetch=fetch)
+        worker = next(item for item in checks if item.name == "worker")
+        assert worker.status == status
+        if status == "fail":
+            assert "Harness-only" in worker.detail
+
+
+def test_smoke_cannot_skip_worker_when_expectation_is_configured():
+    checks = run_smoke("http://example.test", expected_harness_only=True, attempts=1,
+                       fetch=lambda *_args: (_ for _ in ()).throw(AssertionError("network not needed")))
+    assert checks == [SmokeCheck("worker-mode", "fail", "核对 Harness-only 模式必须同时要求 worker 健康探针")]
+
+
+def test_smoke_rejects_non_object_worker_health():
+    def fetch(url, _headers, _timeout):
+        return 200, GOOD_HEADERS, "[]" if url.endswith("/health/worker") else ""
+
+    checks = run_smoke("http://example.test", require_worker=True, attempts=1, fetch=fetch)
+    assert next(item for item in checks if item.name == "worker").status == "fail"
+
+
 def test_smoke_reports_missing_security_header():
     def fetch(_url, _headers, _timeout):
         return 200, {"x-request-id": "smoke-request"}, ""
@@ -342,6 +376,33 @@ def test_smoke_jsonl_emits_safe_log_contract(monkeypatch, capsys):
         {"name": "metrics", "status": "warn"},
     ]
     assert "secret" not in output
+
+
+def test_smoke_cli_forwards_harness_cutover_expectation(monkeypatch, capsys):
+    seen = []
+    monkeypatch.setattr("scripts.production_smoke.run_smoke", lambda *args, **kwargs:
+                        seen.append(kwargs) or [SmokeCheck("worker", "ok", "HTTP 200")])
+
+    assert main(["--require-worker", "--expected-harness-mode", "on", "--json"]) == 0
+    capsys.readouterr()
+    assert seen[0]["require_worker"] is True
+    assert seen[0]["expected_harness_only"] is True
+
+
+def test_smoke_uses_metrics_file_without_printing_or_passing_credential_on_argv(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "metrics-token"
+    path.write_bytes(b"metrics-file-token-123456\r\n")
+    captured = []
+    monkeypatch.setattr("scripts.production_smoke.run_smoke", lambda *args, **kwargs: (
+        captured.append(kwargs["metrics_token"]) or [SmokeCheck("metrics", "ok", "HTTP 200")]))
+    assert main(["--metrics-token-file", str(path), "--jsonl"]) == 0
+    assert captured == ["metrics-file-token-123456"]
+    assert "metrics-file-token-123456" not in capsys.readouterr().out
+    path.unlink()
+    assert main(["--metrics-token-file", str(path), "--jsonl"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["failed_checks"] == ["metrics-token"]
+    assert str(path) not in json.dumps(payload)
 
 
 def test_smoke_jsonl_serializes_operator_cancellation(monkeypatch, capsys):

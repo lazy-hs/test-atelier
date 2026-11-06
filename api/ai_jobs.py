@@ -19,7 +19,10 @@ from .db import AiJob, AiQueueState, AnalysisRun, CaseDraft, SessionLocal, Sourc
 from .observability import env_int, monotonic, redact_sensitive_text, reset_request_id, set_request_id
 
 logger = logging.getLogger(__name__)
-executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ai-studio")
+# AI workflows are durable tasks.  Keep one model turn active at a time so a
+# newly submitted analysis waits in order instead of competing for the same
+# local CLI/model session; the HTTP request still returns immediately.
+executor: ThreadPoolExecutor | None = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ai-studio")
 MAX_SUBMITTED_JOBS = env_int("AI_STUDIO_MAX_SUBMITTED_JOBS", 100, 1)
 EXTERNAL_WORKER = os.getenv("AI_STUDIO_EXTERNAL_WORKER", "0").lower() in {"1", "true", "yes", "on"}
 _submission_slots = threading.BoundedSemaphore(MAX_SUBMITTED_JOBS)
@@ -29,6 +32,10 @@ _futures: dict[str, object] = {}
 _accepting = True
 _shutdown_event = threading.Event()
 metrics.set_ai_queue(0, MAX_SUBMITTED_JOBS)
+
+
+def harness_only_mode() -> bool:
+    return os.getenv("TEST_ATELIER_HARNESS_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class _PromptCapture:
@@ -80,7 +87,7 @@ def submit_worker(job_id: str, worker, correlation_id: str = "") -> bool:
         if not _accepting:
             return False
         if executor is None:
-            executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ai-studio")
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ai-studio")
         if job_id in _active_jobs:
             return True
         if not _submission_slots.acquire(blocking=False):
@@ -344,6 +351,25 @@ def _process_job(job_id: str, lease_owner: str = "") -> None:
             })
             return
         run = db.get(AnalysisRun, job.analysis_id)
+        harness_analysis = run is not None and run.provider == "harness"
+        if harness_only_mode() or harness_analysis:
+            job.status = "failed"
+            job.error = ("Harness 分析不能通过旧 AI 任务执行" if harness_analysis else
+                         "当前部署要求通过 DeepSeek Harness 执行，请创建新的 Harness 任务")
+            job.lease_owner = ""
+            job.lease_until = 0.0
+            job.lease_heartbeat = 0.0
+            if run and job.kind == "analysis" and not harness_analysis:
+                run.status = "failed"
+                run.error = job.error
+            release_external_slot_in_session(db, job)
+            db.commit()
+            logger.info("ai_job.legacy_execution_blocked", extra={
+                "event": "ai_job.legacy_execution_blocked", "job_id": job_id,
+                "project_id": job.project_id, "kind": job.kind,
+                "reason": "harness_analysis" if harness_analysis else "harness_cutover",
+            })
+            return
         job.status = "running"
         job.attempts += 1
         if lease_owner:
@@ -419,6 +445,9 @@ def _process_job(job_id: str, lease_owner: str = "") -> None:
     except Exception as exc:
         logger.warning("ai_job.failed", extra={
             "event": "ai_job.failed", "job_id": job_id, "error_type": type(exc).__name__,
+            # Keep validation IDs and bounded provider diagnostics visible to
+            # operators without ever logging a full model response or prompt.
+            "error_detail": redact_sensitive_text(str(exc), 256),
             "duration_ms": round((monotonic() - started) * 1000, 2),
         })
         if isinstance(exc, httpx.HTTPStatusError):

@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { Box, Check, CheckCircle2, ChevronRight, CircleDot, Cpu, Eye, EyeOff, FlaskConical, Globe2, GripVertical, LoaderCircle, Save, ShieldCheck, Terminal, Trash2, Plus, X } from 'lucide-react'
+import { Activity, Box, Check, CheckCircle2, ChevronRight, CircleAlert, CircleDot, Cpu, Eye, EyeOff, FlaskConical, Globe2, GripVertical, LoaderCircle, RefreshCw, Save, ShieldCheck, Terminal, Trash2, Plus, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { api, type AiConfig } from '@/lib/api'
@@ -13,6 +13,8 @@ type ManagedProvider = { id: string; kind: ProviderKind; name: string; endpoint:
 type AiTool = NonNullable<AiConfig['tools']>[number]
 type ModelOption = { id: string; name: string }
 type ProbeResult = { ok: boolean; protocol: ProviderProtocol; model?: string; status?: number; error?: string }
+type HarnessStatus = 'idle' | 'checking' | 'running' | 'unavailable' | 'unconfigured'
+type HarnessStatusResponse = { status?: string; configured?: boolean; reachable?: boolean; message?: string; checked_at?: string }
 
 const defaults: Settings = {
   local_url: '', local_model: '', local_enabled: false, remote_enabled: false, remote_url: '', remote_model: '',
@@ -54,9 +56,36 @@ export function ModelSettingsPage({ projectId }: { projectId: number }) {
   const [notice, setNotice] = useState('')
   const [testResult, setTestResult] = useState('')
   const [testProvider, setTestProvider] = useState('remote')
+  const [harnessStatus, setHarnessStatus] = useState<HarnessStatus>('idle')
+  const [harnessMessage, setHarnessMessage] = useState('尚未执行健康检查')
+  const [harnessCheckedAt, setHarnessCheckedAt] = useState('')
+  const [harnessChecking, setHarnessChecking] = useState(false)
   const base = `/projects/${projectId}`
 
   useEffect(() => { void api<SettingsResponse>(`${base}/ai/admin-config`).then(value => { const next = normalizeSettings(value); setSettings(next); setProviders(providersFromSettings(next)); setTools(next.tools ?? []); setTestProvider(current => current === 'local' ? 'remote' : current) }).catch(cause => setError((cause as Error).message)) }, [base])
+  const checkHarnessStatus = useCallback(async () => {
+    setHarnessChecking(true)
+    setHarnessStatus('checking')
+    setHarnessMessage('正在连接 DeepSeek Harness Host')
+    try {
+      const result = await api<HarnessStatusResponse>(`${base}/harness/status`)
+      const normalized = result.status === 'running' || (!result.status && result.reachable === true)
+        ? 'running'
+        : result.status === 'unconfigured' || result.configured === false
+          ? 'unconfigured'
+          : 'unavailable'
+      setHarnessStatus(normalized)
+      setHarnessMessage(result.message || (normalized === 'running' ? 'Host 健康检查可访问' : normalized === 'unconfigured' ? '尚未配置 Host 地址或作用域密钥' : 'Host 暂时无法访问'))
+      setHarnessCheckedAt(result.checked_at || new Date().toISOString())
+    } catch (cause) {
+      setHarnessStatus('unavailable')
+      setHarnessMessage((cause as Error).message || 'Host 暂时无法访问')
+      setHarnessCheckedAt(new Date().toISOString())
+    } finally {
+      setHarnessChecking(false)
+    }
+  }, [base])
+  useEffect(() => { void checkHarnessStatus() }, [checkHarnessStatus])
   function change(name: keyof Settings, value: string | boolean) {
     setSettings(previous => ({ ...previous, [name]: value }))
     if (name === 'codex_enabled' || name === 'claude_enabled') {
@@ -176,7 +205,7 @@ export function ModelSettingsPage({ projectId }: { projectId: number }) {
     <section className="provider-overview" aria-label="供应商概览"><div className="provider-overview-metric"><span>已启用供应商</span><strong>{enabledCount}<small> / {providers.length}</small></strong><em><CircleDot size={12} />实时</em></div><div className="provider-overview-metric"><span>云端接口</span><strong>{providers.filter(provider => provider.kind === 'remote').length}</strong><small>按需发送正文</small></div><div className="provider-overview-metric"><span>连接状态</span><strong className="metric-ready"><Check size={17} />待检测</strong><small>保存后可测试</small></div></section>
     <section className="provider-directory"><div className="provider-directory-head"><div><h3>模型连接</h3><p>模型连接独立保存 可明确区分云端连接</p></div><div className="provider-directory-actions"><Input aria-label="查找模型连接" value={providerQuery} onChange={event => setProviderQuery(event.target.value)} placeholder="查找连接或模型" /><Button type="button" onClick={() => setAddOpen(true)}><Plus data-icon="inline-start" />添加连接</Button></div></div><div className="provider-list" role="list">{filteredProviders.map((provider, index) => <motion.button type="button" className={`provider-row ${selected?.id === provider.id ? 'is-selected' : ''} ${!provider.enabled ? 'is-muted' : ''}`} key={provider.id} onClick={event => { if ((event.target as HTMLElement).closest('.provider-switch')) { event.stopPropagation(); toggleProvider(provider); return } setSelectedProvider(provider.id); startEdit(provider) }} initial={{ opacity: 0, y: 7 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: index * .045 }}><span className="provider-drag" aria-hidden="true"><GripVertical size={14} /></span><span className={`provider-logo kind-${provider.kind}`}>{providerIcon(provider.kind)}</span><span className="provider-row-copy"><strong>{provider.name}</strong><span>{provider.endpoint} · {provider.model}</span></span><span className="provider-row-meta"><span className="provider-scope scope-remote">云端</span><span className={`provider-status ${provider.enabled ? 'is-on' : ''}`}><i />{provider.enabled ? '运行中' : '已停用'}</span><span className="provider-detail">{provider.detail}</span></span><span className={`provider-switch ${provider.enabled ? 'is-on' : ''}`} aria-label={`${provider.name}${provider.enabled ? '已启用' : '已停用'}`} title="切换启用状态"><i /></span><ChevronRight size={17} className="provider-chevron" /></motion.button>)}{filteredProviders.length === 0 && <div className="provider-empty">没有匹配的模型连接</div>}</div></section>
     <form onSubmit={event => void save(event)} className="model-settings-grid">
-      <section className="model-settings-section cli-settings-section"><div className="model-settings-heading"><span className="model-settings-icon"><Cpu size={18} /></span><div><h3>AI 工具</h3><p>Codex CLI 与 Claude Code 独立于模型连接保存</p></div><span className="model-section-count">{tools.filter(tool => tool.enabled).length} 个已启用</span></div><div className="cli-local-note"><ShieldCheck size={14} /><span>AI 工具运行在本机 仅传入当前任务内容 不经过远程模型连接</span></div><div className="cli-provider-grid"><div className={`cli-provider-card ${settings.codex_enabled ? 'is-enabled' : ''}`}><label className="model-toggle"><input type="checkbox" checked={settings.codex_enabled} onChange={event => change('codex_enabled', event.target.checked)} /><span><strong>Codex CLI</strong><small>{settings.codex_enabled ? '已启用 AI 工具' : '当前关闭'}</small></span></label><label>命令<Input aria-label="Codex CLI 命令" value={settings.codex_command} onChange={event => change('codex_command', event.target.value)} placeholder="codex" /></label><label>模型（可选）<Input aria-label="Codex CLI 模型" value={settings.codex_model} onChange={event => change('codex_model', event.target.value)} placeholder="留空使用 CLI 默认模型" /></label></div><div className={`cli-provider-card ${settings.claude_enabled ? 'is-enabled' : ''}`}><label className="model-toggle"><input type="checkbox" checked={settings.claude_enabled} onChange={event => change('claude_enabled', event.target.checked)} /><span><strong>Claude Code</strong><small>{settings.claude_enabled ? '已启用 AI 工具' : '当前关闭'}</small></span></label><label>命令<Input aria-label="Claude Code 命令" value={settings.claude_command} onChange={event => change('claude_command', event.target.value)} placeholder="claude" /></label><label>模型（可选）<Input aria-label="Claude Code 模型" value={settings.claude_model} onChange={event => change('claude_model', event.target.value)} placeholder="留空使用 CLI 默认模型" /></label></div></div><p className="model-field-hint">保存后 新建的需求分析 用例编写和建议任务可选择对应 AI 工具</p></section>
+      <section className="model-settings-section cli-settings-section"><div className="model-settings-heading"><span className="model-settings-icon"><Cpu size={18} /></span><div><h3>AI 工具</h3><p>Codex CLI 与 Claude Code 独立于模型连接保存</p></div><span className="model-section-count">{tools.filter(tool => tool.enabled).length} 个已启用</span></div><div className="cli-local-note"><ShieldCheck size={14} /><span>AI 工具运行在本机 仅传入当前任务内容 不经过远程模型连接</span></div><div className="cli-provider-grid"><div className={`cli-provider-card ${settings.codex_enabled ? 'is-enabled' : ''}`}><label className="model-toggle"><input type="checkbox" checked={settings.codex_enabled} onChange={event => change('codex_enabled', event.target.checked)} /><span><strong>Codex CLI</strong><small>{settings.codex_enabled ? '已启用 AI 工具' : '当前关闭'}</small></span></label><label>命令<Input aria-label="Codex CLI 命令" value={settings.codex_command} onChange={event => change('codex_command', event.target.value)} placeholder="codex" /></label><label>模型（可选）<Input aria-label="Codex CLI 模型" value={settings.codex_model} onChange={event => change('codex_model', event.target.value)} placeholder="留空使用 CLI 默认模型" /></label></div><div className={`cli-provider-card ${settings.claude_enabled ? 'is-enabled' : ''}`}><label className="model-toggle"><input type="checkbox" checked={settings.claude_enabled} onChange={event => change('claude_enabled', event.target.checked)} /><span><strong>Claude Code</strong><small>{settings.claude_enabled ? '已启用 AI 工具' : '当前关闭'}</small></span></label><label>命令<Input aria-label="Claude Code 命令" value={settings.claude_command} onChange={event => change('claude_command', event.target.value)} placeholder="claude" /></label><label>模型（可选）<Input aria-label="Claude Code 模型" value={settings.claude_model} onChange={event => change('claude_model', event.target.value)} placeholder="留空使用 CLI 默认模型" /></label></div><div className={`cli-provider-card harness-status-card is-${harnessStatus}`}><div className="harness-card-heading"><span className="harness-card-icon"><Activity size={17} /></span><div><strong>DeepSeek Harness</strong><small>Extension Host 状态</small></div><span className={`harness-status-dot is-${harnessStatus}`} aria-label={`DeepSeek Harness ${harnessStatus}`} /></div><div className="harness-status-copy"><span className="harness-status-label">{harnessStatus === 'checking' ? '检查中' : harnessStatus === 'running' ? '运行中' : harnessStatus === 'unconfigured' ? '未配置' : harnessStatus === 'unavailable' ? '不可用' : '未检测'}</span><p role="status">{harnessMessage}</p></div>{harnessCheckedAt && <small className="harness-checked-at">最近检查 {new Date(harnessCheckedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</small>}<Button type="button" variant="outline" className="harness-refresh" onClick={() => void checkHarnessStatus()} disabled={harnessChecking}><RefreshCw size={14} className={harnessChecking ? 'is-spinning' : ''} />{harnessChecking ? '检查中…' : '重新检测'}</Button>{harnessStatus === 'unavailable' && <span className="harness-error-hint"><CircleAlert size={13} />请确认 Harness Host 已启动</span>}</div></div><p className="model-field-hint">保存后 新建的需求分析 用例编写和建议任务可选择对应 AI 工具</p></section>
       <footer className="model-settings-footer"><span><ShieldCheck size={15} />修改后立即影响新建 AI 任务 执行中的任务继续使用原配置</span><div><select aria-label="选择测试 provider" value={testProvider} onChange={event => setTestProvider(event.target.value)} disabled={testing || busy}><option value="remote">测试云端模型</option>{settings.remote_enabled && <option value="remote">测试远程模型</option>}{settings.codex_enabled && <option value="codex_cli">测试 Codex CLI</option>}{settings.claude_enabled && <option value="claude_code">测试 Claude Code</option>}</select><Button type="button" variant="outline" onClick={() => void testConnection()} disabled={testing || busy}><FlaskConical data-icon="inline-start" />{testing ? '测试中…' : '测试连接'}</Button><Button type="submit" disabled={busy || testing}><Save data-icon="inline-start" />{busy ? '保存中…' : '保存配置'}</Button></div></footer>
     </form>
     {testing && <div className="model-testing"><LoaderCircle size={16} />正在检查模型服务响应</div>}

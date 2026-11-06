@@ -30,8 +30,8 @@ FORBIDDEN_KEYS = {
 SECRET_PATTERN = re.compile(
     r"(?i)(?:bearer\s+[A-Za-z0-9._~+/=-]+|\\?[\"']?(?:authorization|cookie|set[-_ ]?cookie|password|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|secret|token)\\?[\"']?\s*[:=]\s*\\?[\"']?[^\\\"'\s,;&}]+\\?[\"']?|"
     r"(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|AZURE_OPENAI_API_KEY|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|"
-    r"GOOGLE_API_KEY|HF_TOKEN|GITHUB_TOKEN|NPM_TOKEN|DOCKER_AUTH_CONFIG|DATABASE_URL|POSTGRES_PASSWORD|METRICS_TOKEN|"
-    r"AI_STUDIO_SESSION_SECRET|AI_STUDIO_ADMIN_PASSWORD)\s*=\s*[^\s,;&}]+|"
+    r"GOOGLE_API_KEY|HF_TOKEN|GITHUB_TOKEN|NPM_TOKEN|DOCKER_AUTH_CONFIG|DATABASE_URL|POSTGRES_PASSWORD(?:_FILE)?|AI_STUDIO_DATABASE_PASSWORD_FILE|METRICS_TOKEN(?:_FILE)?|"
+    r"AI_STUDIO_SESSION_SECRET(?:_FILE)?|TEST_ATELIER_SCOPE_SECRET(?:_FILE)?|TEST_ATELIER_HARNESS_TOKEN(?:_FILE)?|AI_STUDIO_ADMIN_PASSWORD(?:_FILE)?)\s*=\s*[^\s,;&}]+|"
     r"(?:postgres(?:ql)?(?:\+\w+)?|mysql(?:\+\w+)?|redis(?:s)?|mongodb(?:\+srv)?)://[^\s/@]+:[^\s@]+@|"
     r"sk-[A-Za-z0-9_-]{12,}|AKIA[0-9A-Z]{16}|(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{20,}|"
     r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|"

@@ -8,10 +8,15 @@ import tempfile
 from pathlib import Path
 
 
+def is_link_like(path: Path) -> bool:
+    """Reject both symlinks and Windows directory junctions at trust boundaries."""
+    return path.is_symlink() or bool(getattr(path, "is_junction", lambda: False)())
+
+
 def ensure_private_directory(path: Path) -> Path:
     """Create a directory and remove group/other access where supported."""
-    if path.is_symlink():
-        raise OSError(f"目录不允许是符号链接：{path}")
+    if is_link_like(path) or is_link_like(path.parent):
+        raise OSError(f"目录不允许是符号链接或 junction：{path}")
     path.mkdir(parents=True, exist_ok=True)
     try:
         path.chmod(0o700)
@@ -28,8 +33,8 @@ def _reject_symlink_components(root: Path | None, path: Path, *, include_leaf: b
         return
     root = Path(root)
     path = Path(path)
-    if root.is_symlink():
-        raise OSError(f"存储根目录不允许是符号链接：{root}")
+    if is_link_like(root) or is_link_like(root.parent):
+        raise OSError(f"存储根目录不允许是符号链接或 junction：{root}")
     try:
         relative = path.relative_to(root)
     except ValueError as exc:
@@ -40,8 +45,8 @@ def _reject_symlink_components(root: Path | None, path: Path, *, include_leaf: b
     components = relative.parts if include_leaf else relative.parts[:-1]
     for component in components:
         current /= component
-        if current.is_symlink():
-            raise OSError(f"存储路径不允许包含符号链接：{current}")
+        if is_link_like(current):
+            raise OSError(f"存储路径不允许包含符号链接或 junction：{current}")
 
 
 def _fsync_directory(path: Path) -> None:
@@ -98,9 +103,17 @@ def write_private_atomic(path: Path, data: bytes, *, root: Path | None = None) -
 def is_private_regular_file(path: Path) -> bool:
     """Return whether an artifact is a regular file, not a symlink."""
     try:
-        return not path.is_symlink() and path.is_file()
+        return not is_link_like(path) and path.is_file()
     except OSError:
         return False
+
+
+def remove_private_file(path: Path, *, root: Path) -> None:
+    """Delete an owned artifact only when no path component redirects outside root."""
+    _reject_symlink_components(root, path)
+    if path.exists() and not path.is_file():
+        raise OSError("私有文件不是普通文件")
+    path.unlink(missing_ok=True)
 
 
 def open_private_regular_file(path: Path, *, root: Path | None = None):
@@ -111,8 +124,8 @@ def open_private_regular_file(path: Path, *, root: Path | None = None):
     Callers own the returned file object and must close it after streaming.
     """
     _reject_symlink_components(root, path)
-    if path.is_symlink():
-        raise OSError("私有文件不允许是符号链接")
+    if is_link_like(path):
+        raise OSError("私有文件不允许是符号链接或 junction")
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW

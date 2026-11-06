@@ -87,13 +87,16 @@ def cli_display_name(provider: str) -> str:
     }.get(provider, provider)
 
 # External workers install their stop event here so a SIGTERM can cancel a
-# long-running CLI turn instead of waiting for the full model timeout.  The
-# embedded API keeps this unset and uses the simpler ``subprocess.run`` path.
+# long-running CLI turn instead of waiting for the full model timeout.
 _cancel_event: threading.Event | None = None
 
 
 class CliCancelled(RuntimeError):
     """Raised when the owning worker is shutting down during a CLI turn."""
+
+
+class CliTerminationUncertain(RuntimeError):
+    """The CLI parent stopped, but its child process tree is not confirmed stopped."""
 
 
 class CliTimeout(RuntimeError):
@@ -111,7 +114,8 @@ def get_cancel_event():
 
 
 def _secret_key() -> bytes:
-    return base64.urlsafe_b64encode(hashlib.sha256(os.getenv("AI_STUDIO_SESSION_SECRET", "ai-studio-local-key").encode()).digest())
+    from scripts.deployment_secret_file import configured_secret
+    return base64.urlsafe_b64encode(hashlib.sha256((configured_secret("AI_STUDIO_SESSION_SECRET") or "ai-studio-local-key").encode()).digest())
 
 
 def encrypt_secret(value: str) -> str:
@@ -334,23 +338,50 @@ def _json_from_cli_output(stdout: str, schema: dict) -> dict | list:
 
 def _stop_process(process: subprocess.Popen[str]) -> None:
     """Terminate a CLI process and its descendants without leaving a child."""
+    if os.name == "nt":
+        _stop_windows_process_tree(process)
+        return
     try:
-        if os.name != "nt":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
+        os.killpg(process.pid, signal.SIGTERM)
     except (ProcessLookupError, OSError):
         return
     try:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
         try:
-            if os.name != "nt":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
+            os.killpg(process.pid, signal.SIGKILL)
         except (ProcessLookupError, OSError):
             pass
+
+
+def _stop_windows_process_tree(process: subprocess.Popen[str]) -> None:
+    # terminate()/kill() only stop the parent on Windows. Codex can spawn
+    # tool subprocesses that must not keep writing after the session ends.
+    if process.poll() is not None:
+        # A child can inherit stdout after its parent exits; taskkill can no
+        # longer target that tree by parent PID. Do not release its workspace.
+        raise CliTerminationUncertain("CLI 主进程已退出，无法确认子进程树已停止")
+    try:
+        result = subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                shell=False, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=5, check=False)
+        if result.returncode == 0:
+            process.wait(timeout=2)
+            return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    # Stopping only the parent is a best effort. Never tell the business layer
+    # that the workspace is safe to delete if tree termination was unverified.
+    try:
+        process.terminate()
+        process.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    raise CliTerminationUncertain("无法确认 Codex 子进程已停止；请核对进程后恢复会话")
 
 
 def _cli_diagnostic(value: object, limit: int = 500) -> str:
@@ -417,41 +448,46 @@ def _cli_environment() -> dict[str, str]:
     )
 
 
-def _run_cli(args: list[str], prompt: str, cwd: str, timeout: int) -> subprocess.CompletedProcess[str]:
-    """Run a CLI, allowing an external worker stop to interrupt it promptly."""
-    if _cancel_event is None:
-        return subprocess.run(args, input=prompt, text=True, capture_output=True,
-                              cwd=cwd, timeout=timeout, check=False, shell=False,
-                              start_new_session=(os.name != "nt"), env=_cli_environment())
-
+def _run_cli(args: list[str], prompt: str, cwd: str, timeout: int | None) -> subprocess.CompletedProcess[str]:
+    """Supervise CLI turns so timeout and cancellation stop the process tree."""
     process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, cwd=cwd, shell=False,
                                start_new_session=(os.name != "nt"), env=_cli_environment())
-    limit = timeout or CLI_TIMEOUT
     started = monotonic()
     sent_input = False
+    completed = False
+    stop_attempted = False
+
+    def stop_and_collect() -> tuple[str, str]:
+        nonlocal stop_attempted
+        stop_attempted = True
+        _stop_process(process)
+        try:
+            return process.communicate(timeout=2)
+        except subprocess.TimeoutExpired as exc:
+            raise CliTerminationUncertain("CLI 子进程仍持有输出管道，无法确认终止") from exc
+
     try:
         while True:
-            if _cancel_event.is_set():
-                _stop_process(process)
-                process.communicate()
+            if _cancel_event is not None and _cancel_event.is_set():
+                stop_and_collect()
                 raise CliCancelled("worker stop requested")
-            remaining = timeout - (monotonic() - started)
-            if remaining <= 0:
-                _stop_process(process)
-                stdout, stderr = process.communicate()
+            remaining = timeout - (monotonic() - started) if timeout is not None else None
+            if remaining is not None and remaining <= 0:
+                stdout, stderr = stop_and_collect()
                 raise subprocess.TimeoutExpired(args, timeout, output=stdout, stderr=stderr)
             try:
                 stdout, stderr = process.communicate(
                     input=prompt if not sent_input else None,
-                    timeout=min(0.25, remaining),
+                    timeout=min(0.25, remaining) if remaining is not None else 0.25,
                 )
                 sent_input = True
+                completed = True
                 return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
             except subprocess.TimeoutExpired:
                 sent_input = True
     finally:
-        if process.poll() is None and _cancel_event is not None and _cancel_event.is_set():
+        if not completed and not stop_attempted:
             _stop_process(process)
 
 
@@ -595,13 +631,18 @@ def _request_cli_structured(prompt: str, schema: dict, provider: str, command: s
             if model.strip():
                 args.extend(["--model", model.strip()])
         try:
-            result = _run_cli(args, prompt, workdir, timeout or CLI_TIMEOUT)
+            # Codex skill workflows can legitimately run for a long time while
+            # loading references and producing structured output.  A missing
+            # timeout means no artificial deadline; explicit timeouts remain
+            # available for connection checks and tests.
+            effective_timeout = timeout if timeout is not None else (None if provider == "codex_cli" else CLI_TIMEOUT)
+            result = _run_cli(args, prompt, workdir, effective_timeout)
         except FileNotFoundError as exc:
             raise RuntimeError(f"找不到 {cli_display_name(provider)}：{command}") from exc
         except CliCancelled:
             raise
         except subprocess.TimeoutExpired as exc:
-            limit = timeout or CLI_TIMEOUT
+            limit = timeout if timeout is not None else CLI_TIMEOUT
             # Preserve a short, redacted tail from the CLI so login/session
             # failures are diagnosable instead of surfacing as a bare timeout.
             raw_detail = getattr(exc, "stderr", None) or getattr(exc, "output", None) or ""
@@ -636,11 +677,15 @@ def request_cli_text(prompt: str, command: str, model: str = "", cwd: str | None
     args.append("-")
     workdir = cwd or os.getcwd()
     try:
-        result = _run_cli(args, prompt, workdir, timeout or CLI_TIMEOUT)
+        # Keep the interactive workbench bounded by the established default;
+        # only structured Harness/Codex runs opt into an explicit no-deadline
+        # mode when they need to load large skill contexts.
+        effective_timeout = timeout if timeout is not None else CLI_TIMEOUT
+        result = _run_cli(args, prompt, workdir, effective_timeout)
     except FileNotFoundError as exc:
         raise RuntimeError(f"找不到 Codex CLI：{command}") from exc
     except subprocess.TimeoutExpired as exc:
-        limit = timeout or CLI_TIMEOUT
+        limit = timeout if timeout is not None else CLI_TIMEOUT
         detail = _cli_diagnostic(getattr(exc, "stderr", None) or getattr(exc, "output", None) or "")
         raise CliTimeout(f"Codex CLI 执行超时（{limit} 秒）" + (f"；CLI 输出：{detail}" if detail else "")) from exc
     if result.returncode != 0:
@@ -726,8 +771,7 @@ def stream_cli_text(prompt: str, command: str, model: str = "", cwd: str | None 
     stderr_thread = threading.Thread(target=read_error, name="codex-stream-stderr", daemon=True)
     stdout_thread.start(); stderr_thread.start()
     started = monotonic()
-    limit = timeout or CLI_TIMEOUT
-    finished = False
+    limit = timeout
     try:
         if process.stdin is not None:
             try:
@@ -736,7 +780,7 @@ def stream_cli_text(prompt: str, command: str, model: str = "", cwd: str | None 
             except BrokenPipeError:
                 pass
         while True:
-            if monotonic() - started >= limit:
+            if limit is not None and monotonic() - started >= limit:
                 _stop_process(process)
                 raise CliTimeout(f"Codex CLI 执行超时（{limit} 秒）")
             try:
@@ -752,7 +796,6 @@ def stream_cli_text(prompt: str, command: str, model: str = "", cwd: str | None 
                 except queue.Empty:
                     break
             if line is None:
-                finished = True
                 break
             yield line
         returncode = process.wait(timeout=2)
@@ -762,7 +805,9 @@ def stream_cli_text(prompt: str, command: str, model: str = "", cwd: str | None 
     except FileNotFoundError as exc:
         raise RuntimeError(f"找不到 Codex CLI：{command}") from exc
     finally:
-        if not finished and process.poll() is None:
+        # stdout can close before the process exits. A failed wait must still
+        # terminate it before the workspace becomes eligible for deletion.
+        if process.poll() is None:
             _stop_process(process)
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None and not stream.closed:
@@ -882,6 +927,14 @@ def request_structured(prompt: str, schema: dict, provider: str) -> dict:
                     endpoint, headers=headers, json=body, timeout=180,
                 ))
 
+            def response_preview(response: object) -> str:
+                """Keep a bounded, redacted provider response for diagnostics."""
+                try:
+                    text = str(getattr(response, "text", "") or "")
+                except Exception:
+                    text = ""
+                return redact_sensitive_text(text, limit=500)
+
             response = send({
                 "type": "json_schema",
                 # Do not request strict mode: the configured gateway returns
@@ -895,8 +948,15 @@ def request_structured(prompt: str, schema: dict, provider: str) -> dict:
                 logger.info("model.remote.schema_fallback", extra={
                     "event": "model.remote.schema_fallback", "provider": "remote",
                     "status_code": response.status_code,
+                    "response_preview": response_preview(response),
                 })
                 response = send({"type": "json_object"})
+            if response.status_code >= 400:
+                logger.warning("model.remote.response_error", extra={
+                    "event": "model.remote.response_error", "provider": "remote",
+                    "status_code": response.status_code,
+                    "response_preview": response_preview(response),
+                })
             response.raise_for_status()
             return _remote_json_content(response.json())
         return _run_logged(provider, remote_request)
@@ -909,10 +969,35 @@ def validate_analysis(output: AnalysisOutput, source_ids: list[str]) -> dict:
     if not output.requirements:
         raise ValueError("模型未识别出需求，请核对文档或重新分析")
     allowed_methods = {"EP", "BVA", "ST", "EG"}
+
+    # Codex sometimes follows the skill's Chinese explanations instead of
+    # returning the compact method codes required by the persistence schema.
+    # Normalize common labels locally while keeping unknown values invalid.
+    method_aliases = {
+        "EP": "EP", "EQUIVALENCE PARTITIONING": "EP", "等价类": "EP", "等价类划分": "EP", "等价类划分法": "EP",
+        "BVA": "BVA", "BOUNDARY VALUE": "BVA", "BOUNDARY VALUE ANALYSIS": "BVA", "边界值": "BVA", "边界值分析": "BVA", "边界值分析法": "BVA",
+        # The skill names ST "场景法"; some providers instead use the
+        # supplemental state-transition label for the same compact code.
+        "ST": "ST", "SCENARIO": "ST", "SCENARIO TESTING": "ST", "场景": "ST", "场景法": "ST", "状态转换": "ST", "状态迁移": "ST", "状态迁移测试": "ST", "STATE TRANSITION": "ST",
+        "EG": "EG", "ERROR GUESSING": "EG", "错误推测": "EG", "错误猜测": "EG", "错误推测法": "EG", "错误猜测法": "EG",
+    }
+    for item in output.requirements:
+        item.acceptance = [value.strip() for value in item.acceptance if value.strip()]
+        normalized_methods = []
+        for method in item.methods:
+            token = str(method).strip()
+            # Accept compact combinations such as ``EP/BVA`` while keeping
+            # genuinely unknown methods invalid and visible to the caller.
+            parts = [part.strip() for part in re.split(r"[/、,，|+;；]", token) if part.strip()]
+            for part in parts or [token]:
+                normalized_methods.append(method_aliases.get(part.upper(), method_aliases.get(part, part)))
+        item.methods = list(dict.fromkeys(normalized_methods))
     if any(not item.acceptance or any(not value.strip() for value in item.acceptance)
            or not set(item.methods).issubset(allowed_methods)
            for item in output.requirements):
-        raise ValueError("模型返回了无效验收条件或设计方法")
+        invalid = [item.id for item in output.requirements
+                   if not item.acceptance or not set(item.methods).issubset(allowed_methods)]
+        raise ValueError("模型返回了无效验收条件或设计方法：" + ",".join(invalid[:10]))
     if any(not set(item.source_ids).issubset(source_ids) for item in output.requirements):
         raise ValueError("模型返回了不属于当前输入的来源 ID")
     mapped_sources = {source_id for item in output.requirements for source_id in item.source_ids}

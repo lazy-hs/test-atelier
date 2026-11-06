@@ -1,6 +1,8 @@
 import io
+import hashlib
 import os
 import zipfile
+from pathlib import Path
 
 import openpyxl
 import pytest
@@ -10,15 +12,17 @@ os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["AI_STUDIO_SESSION_SECRET"] = "test-only-session-secret-32-characters-long"
 os.environ["AI_STUDIO_ADMIN_PASSWORD"] = "test-admin-password-123"
 
-from api.db import Base, engine  # noqa: E402
+from api.db import Base, ConversionRecord, Project, SessionLocal, engine, utcnow  # noqa: E402
 from api.main import app  # noqa: E402
-from api import conversion_routes  # noqa: E402
+from api import ai_routes, conversion_routes  # noqa: E402
 from api.conversion.service import preview as convert_preview  # noqa: E402
 
 
 @pytest.fixture
 def context(tmp_path, monkeypatch):
     monkeypatch.setattr(conversion_routes, "DATA_DIR", tmp_path / "conversions")
+    monkeypatch.setattr(ai_routes, "DOCUMENT_DIR", tmp_path / "documents")
+    monkeypatch.setenv("AI_STUDIO_DATA_DIR", str(tmp_path))
     Base.metadata.drop_all(engine)
     with TestClient(app) as client:
         token = client.get("/api/v1/auth/csrf").json()["token"]
@@ -84,10 +88,222 @@ def test_conversion_modes_and_history(context, mode, output, filename, content, 
     assert overview["conversion_count"] == 1
     assert any(item["kind"] == "conversion" for item in overview["recent_activity"])
     record_id = history["records"][0]["id"]
+    assert history["records"][0]["source"] == {"schema_version": "conversion-upload.v1",
+                                                   "sha256": hashlib.sha256(content).hexdigest(), "size": len(content)}
+    with SessionLocal() as db:
+        uploaded_path = conversion_routes.source_path(db.get(ConversionRecord, record_id))
+    assert uploaded_path.is_file()
     assert client.get(url + f"/history/{record_id}").json()["preview"]["row_count"] == 1
+    assert client.get(url + f"/history/{record_id}/source").content == content
     assert client.get(url + f"/history/{record_id}/download").content == response.content
     assert client.delete(url + f"/history/{record_id}", headers=headers).status_code == 200
+    assert not uploaded_path.exists()
     assert client.get(url + "/history").json()["records"] == []
+
+
+def test_export_rechecks_deletion_intent_after_conversion(context, monkeypatch):
+    client, headers, root = context
+    project_id = int(root.rsplit("/", 1)[-1])
+    convert = conversion_routes.service.export
+
+    def delete_during_conversion(*args, **kwargs):
+        result = convert(*args, **kwargs)
+        with SessionLocal() as db:
+            db.get(Project, project_id).deletion_pending_at = utcnow()
+            db.commit()
+        return result
+
+    monkeypatch.setattr(conversion_routes.service, "export", delete_during_conversion)
+    response = client.post(root + "/conversion/export", files={"file": ("cases.xlsx", source_file())},
+                           data=form("excel_to_excel"), headers=headers)
+    assert response.status_code == 409, response.text
+    assert not (conversion_routes.DATA_DIR / str(project_id)).exists()
+    with SessionLocal() as db:
+        assert db.query(ConversionRecord).filter_by(project_id=project_id).count() == 0
+
+
+def test_original_upload_is_project_scoped_and_detects_tampering(context):
+    client, headers, root = context
+    data = source_file()
+    url = root + "/conversion"
+    assert client.post(url + "/export", files={"file": ("source.xlsx", data)},
+                       data=form("excel_to_excel"), headers=headers).status_code == 200
+    record_id = client.get(url + "/history").json()["records"][0]["id"]
+    other = client.post("/api/v1/projects", json={"name": "Private conversion"}, headers=headers).json()["id"]
+    assert client.get(f"/api/v1/projects/{other}/conversion/history/{record_id}/source").status_code == 404
+    with SessionLocal() as db:
+        path = conversion_routes.source_path(db.get(ConversionRecord, record_id))
+    path.write_bytes(b"tampered")
+    assert client.get(url + f"/history/{record_id}/source").status_code == 409
+    assert client.get(root + "/evidence/export").status_code == 409
+
+
+def test_original_upload_streams_verified_bytes_when_file_changes_after_validation(context, monkeypatch):
+    from fastapi.responses import StreamingResponse
+
+    client, headers, root = context
+    original = source_file()
+    url = root + "/conversion"
+    created = client.post(url + "/export", files={"file": ("source.xlsx", original)},
+                          data=form("excel_to_excel"), headers=headers)
+    assert created.status_code == 200, created.text
+    record_id = client.get(url + "/history").json()["records"][0]["id"]
+    with SessionLocal() as db:
+        path = conversion_routes.source_path(db.get(ConversionRecord, record_id))
+    altered = bytes([original[0] ^ 1]) + original[1:]
+
+    def replace_after_validation(content, **kwargs):
+        path.write_bytes(altered)
+        return StreamingResponse(content, **kwargs)
+
+    with monkeypatch.context() as scope:
+        scope.setattr(conversion_routes, "StreamingResponse", replace_after_validation)
+        downloaded = client.get(url + f"/history/{record_id}/source")
+    assert downloaded.status_code == 200, downloaded.text
+    assert downloaded.content == original
+    assert path.read_bytes() == altered
+    assert client.get(url + f"/history/{record_id}/source").status_code == 409
+
+
+def test_replaced_original_upload_link_blocks_source_export_and_deletion(context, tmp_path):
+    client, headers, root = context
+    url = root + "/conversion"
+    uploaded = source_file()
+    assert client.post(url + "/export", files={"file": ("source.xlsx", uploaded)},
+                       data=form("excel_to_excel"), headers=headers).status_code == 200
+    record_id = client.get(url + "/history").json()["records"][0]["id"]
+    with SessionLocal() as db:
+        record = db.get(ConversionRecord, record_id)
+        original = conversion_routes.source_path(record)
+        converted = conversion_routes.output_path(record)
+    secret = tmp_path / "outside-secret.bin"
+    secret.write_bytes(b"not a conversion source")
+    original.unlink()
+    try:
+        original.symlink_to(secret)
+    except OSError:
+        pytest.skip("Target runner does not permit symlink creation")
+
+    assert client.get(url + f"/history/{record_id}/source").status_code == 409
+    assert client.get(root + "/evidence/export").status_code == 409
+    assert client.delete(url + f"/history/{record_id}", headers=headers).status_code == 503
+    assert secret.read_bytes() == b"not a conversion source"
+    assert converted.is_file()
+    with SessionLocal() as db:
+        assert db.get(ConversionRecord, record_id) is not None
+
+    original.unlink()
+    assert client.delete(url + f"/history/{record_id}", headers=headers).status_code == 200
+    assert not converted.exists()
+
+
+def test_original_upload_junction_blocks_source_export_and_deletion(context, monkeypatch):
+    client, headers, root = context
+    url = root + "/conversion"
+    assert client.post(url + "/export", files={"file": ("source.xlsx", source_file())},
+                       data=form("excel_to_excel"), headers=headers).status_code == 200
+    record_id = client.get(url + "/history").json()["records"][0]["id"]
+    with SessionLocal() as db:
+        original = conversion_routes.source_path(db.get(ConversionRecord, record_id))
+    real_is_junction = Path.is_junction
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "is_junction", lambda self: self == original or real_is_junction(self))
+        assert client.get(url + f"/history/{record_id}/source").status_code == 409
+        assert client.get(root + "/evidence/export").status_code == 409
+        assert client.delete(url + f"/history/{record_id}", headers=headers).status_code == 503
+    with SessionLocal() as db:
+        assert db.get(ConversionRecord, record_id) is not None
+    assert original.is_file()
+    assert client.delete(url + f"/history/{record_id}", headers=headers).status_code == 200
+
+
+def test_partial_conversion_file_delete_can_be_retried(context, monkeypatch):
+    client, headers, root = context
+    url = root + "/conversion"
+    assert client.post(url + "/export", files={"file": ("source.xlsx", source_file())},
+                       data=form("excel_to_excel"), headers=headers).status_code == 200
+    record_id = client.get(url + "/history").json()["records"][0]["id"]
+    with SessionLocal() as db:
+        record = db.get(ConversionRecord, record_id)
+        original = conversion_routes.source_path(record)
+        converted = conversion_routes.output_path(record)
+    remove = conversion_routes.remove_private_file
+
+    def fail_output_once(path, *, root):
+        if path == converted:
+            raise OSError("temporary storage error")
+        return remove(path, root=root)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(conversion_routes, "remove_private_file", fail_output_once)
+        assert client.delete(url + f"/history/{record_id}", headers=headers).status_code == 503
+    assert not original.exists() and converted.is_file()
+    with SessionLocal() as db:
+        assert db.get(ConversionRecord, record_id) is not None
+    assert client.get(root + "/evidence/export").status_code == 409
+    assert client.delete(url + f"/history/{record_id}", headers=headers).status_code == 200
+    assert not converted.exists()
+    with SessionLocal() as db:
+        assert db.get(ConversionRecord, record_id) is None
+
+
+def test_project_deletion_removes_original_upload_and_conversion_output(context):
+    client, headers, root = context
+    data = source_file()
+    assert client.post(root + "/conversion/export", files={"file": ("source.xlsx", data)},
+                       data=form("excel_to_excel"), headers=headers).status_code == 200
+    record_id = client.get(root + "/conversion/history").json()["records"][0]["id"]
+    with SessionLocal() as db:
+        record = db.get(ConversionRecord, record_id)
+        original = conversion_routes.source_path(record)
+        converted = conversion_routes.output_path(record)
+    assert original.exists() and converted.exists()
+    deleted = client.delete(root, headers=headers)
+    assert deleted.status_code == 200, deleted.text
+    assert not original.exists() and not converted.exists()
+
+
+def test_history_retention_does_not_prune_after_deletion_intent(context, monkeypatch):
+    client, headers, root = context
+    project_id = int(root.rsplit("/", 1)[-1])
+    exported = client.post(root + "/conversion/export", files={"file": ("cases.xlsx", source_file())},
+                           data=form("excel_to_excel"), headers=headers)
+    assert exported.status_code == 200, exported.text
+    original = conversion_routes.settings_for
+
+    def mark_before_prune(db, current_project_id):
+        settings = original(db, current_project_id)
+        with SessionLocal() as independent:
+            independent.get(Project, project_id).deletion_pending_at = utcnow()
+            independent.commit()
+        return settings
+
+    monkeypatch.setattr(conversion_routes, "settings_for", mark_before_prune)
+    history = client.get(root + "/conversion/history", headers=headers)
+    assert history.status_code == 409, history.text
+    with SessionLocal() as db:
+        record = db.query(ConversionRecord).filter_by(project_id=project_id).one()
+        assert conversion_routes.output_path(record).is_file()
+
+
+def test_history_delete_rejects_junction_project_directory(context, monkeypatch):
+    client, headers, root = context
+    url = root + "/conversion"
+    exported = client.post(url + "/export", files={"file": ("cases.xlsx", source_file())},
+                           data=form("excel_to_excel"), headers=headers)
+    assert exported.status_code == 200, exported.text
+    record_id = client.get(url + "/history").json()["records"][0]["id"]
+    with SessionLocal() as db:
+        artifact = conversion_routes.output_path(db.get(ConversionRecord, record_id))
+    original = Path.is_junction
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "is_junction", lambda self: self == artifact.parent or original(self))
+        response = client.delete(url + f"/history/{record_id}", headers=headers)
+    assert response.status_code == 503
+    assert artifact.is_file()
+    with SessionLocal() as db:
+        assert db.get(ConversionRecord, record_id)
+    assert client.delete(url + f"/history/{record_id}", headers=headers).status_code == 200
 
 
 def test_project_config_and_isolated_history(context):

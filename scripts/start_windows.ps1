@@ -4,4 +4,4 @@ param()
 $ErrorActionPreference = "Stop"
 $launcher = Join-Path $PSScriptRoot "setup_and_start_windows.ps1"
 & $launcher -SkipConfigure
-exit $LASTEXITCODE
+if (-not $?) { exit 1 }

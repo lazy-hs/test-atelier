@@ -23,10 +23,10 @@ npm run dev -- --host 127.0.0.1
 
 生产构建会把 React、Motion 和 Lucide 拆成独立 vendor chunk，页面功能模块继续按路由懒加载；这样首屏共享入口不会因为工作台全部依赖增长到不可控的单块体积。
 
-开发服务器默认将 `/api` 转发到 `http://127.0.0.1:8000`。使用根目录平台启动脚本时，代理和 Vite 端口会读取 `data/config/settings.json` 的 `server.port` 与 `server.web_port`；手动启动且 API 端口变化时：
+开发服务器默认将 `/api` 转发到 `http://127.0.0.1:8000`。使用根目录平台启动脚本时，代理和 Vite 端口会读取 `config/runtime.json` 的 `server.api_port` 与 `server.web_port`；手动开发且没有该文件时才回退到默认端口。
 
 ```bash
-AI_STUDIO_API_TARGET=http://127.0.0.1:8010 npm run dev -- --host 127.0.0.1
+npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
 ## E2E
@@ -38,6 +38,26 @@ AI_STUDIO_E2E_PASSWORD='管理员密码' npm run test:e2e
 ```
 
 `AI_STUDIO_E2E_URL` 切换测试站点，`AI_STUDIO_E2E_SAMPLE` 指定真实 `.xls` 样本，`AI_STUDIO_E2E_MODEL_STUB=1` 用于模型替身场景。未设置前置变量的测试会主动跳过。
+
+Harness 浏览器闭环使用一次性数据库和独立 Node Host，可直接运行封装脚本：
+
+```bash
+python scripts/harness_browser_smoke.py
+```
+
+脚本使用 Fake DSH、临时 SQLite、临时 Harness Host 和临时管理员密码，覆盖 Harness
+流式结果、Session 回放、刷新恢复、历史任务切换和用例生成；停写后还会将数据库、
+文档和 Host 任务/Session 归档并恢复到新目录，通过认证接口验证回放。它不读取模型 API Key，
+不代替真实模型或其他平台实机验收。
+Harness 分析记录显示原始结构化结果，不将本地兼容报告显示为 Harness 原文；
+用例编写只展示 Harness 任务的原始结果与确认、Session、导出，不混排业务草稿。
+可编辑草稿在独立的「草稿审核」入口归 Test Atelier 管理；旧模型分析只在
+「历史分析」入口查看，旧草稿仍可审核与发布。未配置 Harness 时，
+需求分析和用例编写页均不能退回传统模型生成。直接执行
+`npm run test:e2e -- harness.spec.ts` 时仍需自行启动 API 和 Host，并设置
+`TEST_ATELIER_HARNESS_E2E=1`，以避免误连生产 Harness。
+一次性浏览器封装同时运行 `historical-boundary.spec.ts`，只在其创建的临时 SQLite
+数据库中插入历史分析与草稿夹具，核对旧数据入口、人工保存和发布。
 
 ## 目录约定
 

@@ -15,7 +15,8 @@ from PIL import Image, UnidentifiedImageError
 from pypdf import PdfReader
 from .observability import sanitized_subprocess_environment
 
-ALLOWED = {".md", ".markdown", ".txt", ".png", ".jpg", ".jpeg", ".webp", ".pdf", ".doc", ".docx"}
+STRUCTURED_TEXT = {".json", ".yaml", ".yml"}
+ALLOWED = {".md", ".markdown", ".txt", ".png", ".jpg", ".jpeg", ".webp", ".pdf", ".doc", ".docx"} | STRUCTURED_TEXT
 MAX_DOCX_ENTRIES = 4096
 MAX_DOCX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
 MAX_DOCX_MEMBER_BYTES = 64 * 1024 * 1024
@@ -131,12 +132,20 @@ def _validate_docx_archive(content: bytes) -> None:
 def extract(filename: str, content: bytes) -> tuple[str, list[str]]:
     suffix = Path(filename).suffix.lower()
     if suffix not in ALLOWED:
-        raise ValueError("仅支持 Markdown、文本、图片、PDF 和 Word 文档")
+        raise ValueError("仅支持 Markdown、文本、JSON/YAML、图片、PDF 和 Word 文档")
     warnings = []
     if suffix in {".md", ".markdown", ".txt"}:
         text = content.decode("utf-8-sig", errors="replace")
         if "\ufffd" in text:
             warnings.append("部分字符无法按 UTF-8 解码，请核对原文")
+    elif suffix in STRUCTURED_TEXT:
+        # Specs are untrusted source text, not Python/YAML objects or commands.
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError("JSON/YAML 文档须使用 UTF-8 编码") from exc
+        if "\x00" in text:
+            raise ValueError("JSON/YAML 文档包含不支持的空字符")
     elif suffix in {".png", ".jpg", ".jpeg", ".webp"}:
         try:
             image = Image.open(io.BytesIO(content))

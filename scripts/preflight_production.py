@@ -26,11 +26,51 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+if __package__:
+    from .harness_secret_file import host_token, scope_secret
+    from .deployment_secret_file import configured_secret, database_url as configured_database_url
+else:
+    from harness_secret_file import host_token, scope_secret
+    from deployment_secret_file import configured_secret, database_url as configured_database_url
+
 
 PLACEHOLDERS = {
     "", "change-me", "replace-with-at-least-32-random-characters", "replace-with-secret",
     "replace-with-strong-admin-password", "replace-with-db-password-123", "管理员密码（至少 6 位）",
 }
+# Keep the enabled-Host source set aligned with the independent Host preflight.
+HARNESS_SKILL_FILES = (
+    "AGENTS.md", "skills/hub/SKILL.md",
+    *(f"skills/{name}/SKILL.md" for name in ("requirement-analysis", "test-cases")),
+    *(f"skills/{name}/SKILL.md" for name in ("api-parsing", "dev-doc-analysis", "figma-to-prd")),
+    *(f"references/{name}.md" for name in (
+        "PARSING-RULES", "TRACEABILITY", "NIELSEN-HEURISTICS", "REQUIREMENT-SCOPE",
+        "TEST-DESIGN-METHODS", "BUSINESS-RULES", "PRD-STRUCTURE-GUIDE",
+        "INTERACTION-PATTERNS", "MEMORY-SCHEMA", "LEARNING-RULES", "TEST-PRIORITY",
+        "SKILL-REGISTRY", "TEST-CASE-RULES", "FIGMA-MCP-WORKFLOW",
+        "FIGMA-REQUIREMENT-EXTRACTION", "PRD-GENERATION-TEMPLATE",
+    )),
+)
+MAX_HARNESS_SKILL_SOURCE_BYTES = 64 * 1024
+
+
+def _unusable_harness_skill_sources(root: Path) -> list[str]:
+    try:
+        actual_root = root.resolve(strict=True)
+        if not actual_root.is_dir():
+            return list(HARNESS_SKILL_FILES)
+    except (OSError, RuntimeError):
+        return list(HARNESS_SKILL_FILES)
+    unusable = []
+    for name in HARNESS_SKILL_FILES:
+        try:
+            source = (actual_root / name).resolve(strict=True)
+            if (not source.is_relative_to(actual_root) or not source.is_file()
+                    or source.stat().st_size > MAX_HARNESS_SKILL_SOURCE_BYTES):
+                unusable.append(name)
+        except (OSError, RuntimeError, ValueError):
+            unusable.append(name)
+    return unusable
 _MIGRATION_REVISION = re.compile(r"^revision\s*=\s*[\"']([^\"']+)[\"']", re.MULTILINE)
 
 
@@ -108,6 +148,150 @@ def _check_timeout_order(results: list[Check], values: dict[str, str], short_nam
         _result(results, f"{short_name}_ORDER", "ok", "超时顺序有效")
 
 
+def _check_harness_config(results: list[Check], values: dict[str, str]) -> None:
+    """Validate the optional external Harness bridge before accepting traffic."""
+    raw_url = values.get("TEST_ATELIER_HARNESS_URL", "").strip()
+    harness_only = _truthy(values.get("TEST_ATELIER_HARNESS_ONLY", "0"))
+    _result(results, "TEST_ATELIER_HARNESS_ONLY", "ok" if harness_only else "warn",
+            "旧 AI Provider 路由已禁用" if harness_only else "兼容模式，旧 AI Provider 仍可用")
+    if not raw_url:
+        level = "fail" if harness_only else "warn"
+        detail = "Harness-only 模式必须配置 Host 地址" if harness_only else "未配置；Harness Bridge 保持关闭"
+        _result(results, "TEST_ATELIER_HARNESS_URL", level, detail)
+        _result(results, "TEST_ATELIER_SCOPE_SECRET", level, "Harness-only 模式必须配置独立作用域密钥" if harness_only else detail)
+    else:
+        parsed = urlparse(raw_url)
+        valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+        valid = valid and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment
+        _result(results, "TEST_ATELIER_HARNESS_URL", "ok" if valid else "fail",
+                "地址格式有效" if valid else "必须是无凭据、无查询参数的 HTTP(S) 地址")
+        try:
+            configured_scope = scope_secret(values)
+        except ValueError:
+            configured_scope = ""
+        _check_secret(results, {"TEST_ATELIER_SCOPE_SECRET": configured_scope}, "TEST_ATELIER_SCOPE_SECRET", 32)
+    _check_numeric(results, values, "TEST_ATELIER_HARNESS_TIMEOUT", "30", 1)
+    try:
+        if float(values.get("TEST_ATELIER_HARNESS_TIMEOUT", "30").strip()) > 300:
+            _result(results, "TEST_ATELIER_HARNESS_TIMEOUT_LIMIT", "fail", "不能超过 300 秒")
+    except ValueError:
+        pass
+    _check_numeric(results, values, "TEST_ATELIER_HARNESS_MAX_RESPONSE_BYTES", str(16 * 1024 * 1024), 64 * 1024, integer=True)
+    max_response = values.get("TEST_ATELIER_HARNESS_MAX_RESPONSE_BYTES", str(16 * 1024 * 1024)).strip()
+    try:
+        if int(max_response) > 64 * 1024 * 1024:
+            _result(results, "TEST_ATELIER_HARNESS_MAX_RESPONSE_BYTES_LIMIT", "fail", "不能超过 64 MiB")
+    except ValueError:
+        pass
+    _check_numeric(results, values, "TEST_ATELIER_HARNESS_MAX_REQUEST_BYTES", str(8 * 1024 * 1024), 64 * 1024, integer=True)
+    max_request = values.get("TEST_ATELIER_HARNESS_MAX_REQUEST_BYTES", str(8 * 1024 * 1024)).strip()
+    try:
+        if int(max_request) > 32 * 1024 * 1024:
+            _result(results, "TEST_ATELIER_HARNESS_MAX_REQUEST_BYTES_LIMIT", "fail", "不能超过 32 MiB")
+    except ValueError:
+        pass
+    _check_numeric(results, values, "TEST_ATELIER_HARNESS_CHUNK_CHARS", "12000", 1000, integer=True)
+    _check_numeric(results, values, "TEST_ATELIER_HARNESS_CHUNK_OVERLAP_CHARS", "400", 0, integer=True)
+    _check_numeric(results, values, "TEST_ATELIER_HARNESS_MAX_CHUNKS", "128", 1, integer=True)
+    _check_numeric(results, values, "HARNESS_REDUCE_BATCH_CHARS", "48000", 4000, integer=True)
+    _check_numeric(results, values, "HARNESS_REDUCE_BATCH_SIZE", "16", 2, integer=True)
+    _check_numeric(results, values, "HARNESS_MAX_OUTPUT_BYTES", str(16 * 1024 * 1024), 64 * 1024, integer=True)
+    try:
+        chunk_chars = int(values.get("TEST_ATELIER_HARNESS_CHUNK_CHARS", "12000").strip())
+        overlap_chars = int(values.get("TEST_ATELIER_HARNESS_CHUNK_OVERLAP_CHARS", "400").strip())
+        max_chunks = int(values.get("TEST_ATELIER_HARNESS_MAX_CHUNKS", "128").strip())
+        reduce_batch_chars = int(values.get("HARNESS_REDUCE_BATCH_CHARS", "48000").strip())
+        reduce_batch_size = int(values.get("HARNESS_REDUCE_BATCH_SIZE", "16").strip())
+        max_output = int(values.get("HARNESS_MAX_OUTPUT_BYTES", str(16 * 1024 * 1024)).strip())
+        if overlap_chars > chunk_chars // 2:
+            _result(results, "TEST_ATELIER_HARNESS_CHUNK_OVERLAP_LIMIT", "fail", "重叠字符数不能超过窗口的一半")
+        if max_chunks > 2000:
+            _result(results, "TEST_ATELIER_HARNESS_MAX_CHUNKS_LIMIT", "fail", "不能超过 2000 个窗口")
+        if reduce_batch_chars > 256000:
+            _result(results, "HARNESS_REDUCE_BATCH_CHARS_LIMIT", "fail", "不能超过 256000 个字符")
+        if reduce_batch_size > 128:
+            _result(results, "HARNESS_REDUCE_BATCH_SIZE_LIMIT", "fail", "不能超过 128 个结果")
+        if max_output > 64 * 1024 * 1024:
+            _result(results, "HARNESS_MAX_OUTPUT_BYTES_LIMIT", "fail", "不能超过 64 MiB")
+    except ValueError:
+        pass
+    try:
+        token = host_token(values)
+    except ValueError:
+        token = ""
+        _result(results, "TEST_ATELIER_HARNESS_TOKEN_FILE", "fail", "Host 凭据文件无效")
+    if token and token.casefold() in {item.casefold() for item in PLACEHOLDERS}:
+        _result(results, "TEST_ATELIER_HARNESS_TOKEN", "fail", "不能使用示例凭据")
+    elif token and len(token) < 16:
+        _result(results, "TEST_ATELIER_HARNESS_TOKEN", "fail", "长度不足 16 个字符")
+    else:
+        _result(results, "TEST_ATELIER_HARNESS_TOKEN", "ok" if token else "warn", "已设置" if token else "未设置（使用作用域凭据）")
+    protocol = values.get("HARNESS_DSH_PROTOCOL", "headless").strip().lower()
+    _result(results, "HARNESS_DSH_PROTOCOL", "ok" if protocol in {"headless", "acp"} else "fail",
+            protocol if protocol in {"headless", "acp"} else "必须是 headless 或 acp")
+    raw_args = values.get("HARNESS_DSH_ARGS_JSON", "").strip()
+    if raw_args and protocol == "acp":
+        try:
+            dsh_args = json.loads(raw_args)
+        except json.JSONDecodeError:
+            dsh_args = None
+        if not isinstance(dsh_args, list) or any(not isinstance(item, str) for item in dsh_args):
+            _result(results, "HARNESS_DSH_ARGS_ACP", "fail", "ACP 的 HARNESS_DSH_ARGS_JSON 必须是字符串数组")
+        elif "--json" in dsh_args:
+            _result(results, "HARNESS_DSH_ARGS_ACP", "fail", "ACP Profile 不支持 headless 专用 --json 选项")
+        elif raw_url:
+            _result(results, "HARNESS_DSH_ARGS_ACP", "ok", "ACP 参数未包含 --json")
+    input_mode = values.get("HARNESS_DSH_INPUT_MODE", "stdin").strip().lower()
+    _result(results, "HARNESS_DSH_INPUT_MODE", "ok" if input_mode in {"stdin", "argv"} else "fail",
+            input_mode if input_mode in {"stdin", "argv"} else "必须是 stdin 或 argv")
+    if raw_url and protocol == "headless" and values.get("AI_STUDIO_ENV", "development").strip().casefold() == "production" and input_mode != "stdin":
+        _result(results, "HARNESS_DSH_INPUT_MODE_PRODUCTION", "fail",
+                "生产环境必须使用 stdin 传递任务内容，避免需求正文出现在进程参数")
+    elif raw_url and values.get("AI_STUDIO_ENV", "development").strip().casefold() == "production":
+        _result(results, "HARNESS_DSH_INPUT_MODE_PRODUCTION", "ok", "ACP 使用 JSON-RPC；headless 使用 stdin" if protocol == "acp" else "生产环境使用 stdin")
+    confirmation_transport = values.get("HARNESS_CONFIRMATION_TRANSPORT", "none").strip().lower()
+    if confirmation_transport not in {"none", "stdin-lines"}:
+        _result(results, "HARNESS_CONFIRMATION_TRANSPORT", "fail", "必须是 none 或 stdin-lines")
+    elif raw_url and protocol == "headless" and confirmation_transport == "stdin-lines":
+        _result(results, "HARNESS_CONFIRMATION_TRANSPORT", "fail",
+                "一次性 headless 运行器不支持持久确认；请使用 none 或接入交互式协议")
+    elif raw_url and protocol == "acp" and confirmation_transport != "none":
+        _result(results, "HARNESS_CONFIRMATION_TRANSPORT", "fail",
+                "ACP 使用 JSON-RPC 确认；不要配置 stdin-lines")
+    else:
+        _result(results, "HARNESS_CONFIRMATION_TRANSPORT", "ok", confirmation_transport)
+
+
+def _check_web_shell_config(results: list[Check], values: dict[str, str], environment: str) -> None:
+    """Fail closed when member Web Shell access is enabled unsafely."""
+    pilot = _truthy(values.get("TEST_ATELIER_WEB_SHELL_PILOT", "0"))
+    members = _truthy(values.get("TEST_ATELIER_WEB_SHELL_MEMBER_ACCESS", "0"))
+    restricted = _truthy(values.get("TEST_ATELIER_WEB_SHELL_RESTRICTED_PROFILE", "0"))
+    if members and not pilot:
+        _result(results, "TEST_ATELIER_WEB_SHELL_MEMBER_ACCESS", "fail",
+                "普通成员 Shell 访问必须同时启用 Web Shell pilot 门禁")
+    elif members and not restricted:
+        _result(results, "TEST_ATELIER_WEB_SHELL_MEMBER_ACCESS", "fail",
+                "普通成员 Shell 访问必须声明 ta-restricted Profile")
+    elif members and environment.casefold() == "production":
+        _result(results, "TEST_ATELIER_WEB_SHELL_MEMBER_ACCESS", "fail",
+                "普通成员 Web Shell 生产代理和能力边界尚未完成验收")
+    elif members:
+        _result(results, "TEST_ATELIER_WEB_SHELL_MEMBER_ACCESS", "ok",
+                "普通成员入口已显式开启且受限 Profile 已声明")
+    else:
+        _result(results, "TEST_ATELIER_WEB_SHELL_MEMBER_ACCESS", "warn",
+                "普通成员入口关闭；仅管理员可进入已开启的试点")
+    if restricted and not members:
+        _result(results, "TEST_ATELIER_WEB_SHELL_RESTRICTED_PROFILE", "ok",
+                "受限 Profile 已声明，成员入口仍关闭")
+    elif members and restricted:
+        _result(results, "TEST_ATELIER_WEB_SHELL_RESTRICTED_PROFILE", "ok", "ta-restricted")
+    else:
+        _result(results, "TEST_ATELIER_WEB_SHELL_RESTRICTED_PROFILE", "warn",
+                "未声明受限 Web Profile")
+
+
 def _check_cryptography_baseline(results: list[Check], environment: str) -> None:
     """Surface the patched crypto baseline before a process accepts traffic."""
     try:
@@ -159,6 +343,12 @@ def run_preflight(env: dict[str, str] | None = None, *, compose: bool = False,
     """Validate deployment settings; worker-only callers can skip HTTP secrets."""
     values = dict(os.environ if env is None else env)
     results: list[Check] = []
+    platform_labels = {"darwin": "macOS", "win32": "Windows", "linux": "Linux"}
+    current_platform = platform_labels.get(sys.platform)
+    if current_platform is None:
+        _result(results, "SUPPORTED_PLATFORM", "fail", f"本次交付只支持 macOS、Windows、Linux；当前平台：{sys.platform}")
+    else:
+        _result(results, "SUPPORTED_PLATFORM", "ok", current_platform)
     environment = values.get("AI_STUDIO_ENV", "production" if compose else "development").strip()
     if compose and environment != "production":
         _result(results, "AI_STUDIO_ENV", "warn", "Compose 日志环境建议设置为 production")
@@ -174,18 +364,44 @@ def run_preflight(env: dict[str, str] | None = None, *, compose: bool = False,
     else:
         _result(results, "AI_STUDIO_RELEASE", "ok" if release else "warn", release or "开发环境未设置")
     _check_cryptography_baseline(results, environment)
-    _check_secret(results, values, "AI_STUDIO_SESSION_SECRET", 32)
+    _check_web_shell_config(results, values, environment)
+    _check_harness_config(results, values)
+    for name, minimum, required in (
+        ("AI_STUDIO_SESSION_SECRET", 32, True),
+        ("AI_STUDIO_ADMIN_PASSWORD", 6, require_admin_password),
+    ):
+        try:
+            configured = configured_secret(name, values)
+        except ValueError:
+            configured = ""
+        _check_secret(results, {name: configured}, name, minimum, required=required)
     # The API creates and authenticates the first administrator, while the
     # independent worker only needs the session secret for encrypted settings.
     # Avoid copying the administrator password into the worker container.
-    _check_secret(results, values, "AI_STUDIO_ADMIN_PASSWORD", 6, required=require_admin_password)
     if compose:
-        _check_secret(results, values, "POSTGRES_PASSWORD", 12)
-        _check_compose_password_syntax(results, values.get("POSTGRES_PASSWORD", "").strip())
+        if values.get("AI_STUDIO_DATABASE_PASSWORD_FILE", "").strip():
+            try:
+                configured_password = configured_secret("AI_STUDIO_DATABASE_PASSWORD", values)
+                if values.get("POSTGRES_PASSWORD", "").strip() or values.get("DATABASE_URL", "").strip():
+                    configured_password = ""
+            except ValueError:
+                configured_password = ""
+            _check_secret(results, {"POSTGRES_PASSWORD": configured_password}, "POSTGRES_PASSWORD", 12)
+        else:
+            _check_secret(results, values, "POSTGRES_PASSWORD", 12)
+            _check_compose_password_syntax(results, values.get("POSTGRES_PASSWORD", "").strip())
 
-    database_url = values.get("DATABASE_URL", "sqlite:///./data/ai_studio.db")
+    try:
+        database_url = configured_database_url(values)
+    except ValueError:
+        database_url = ""
+    if compose and not values.get("DATABASE_URL", "").strip() and not values.get("AI_STUDIO_DATABASE_PASSWORD_FILE", "").strip():
+        # The base Compose file constructs this URL inside each container.
+        # Only the scheme is needed here; do not construct a second URL with
+        # the database password in the operator's preflight process.
+        database_url = "postgresql://db/ai_studio"
     scheme = urlparse(database_url).scheme
-    external_worker = _truthy(values.get("AI_STUDIO_EXTERNAL_WORKER", "0"))
+    external_worker = _truthy(values.get("AI_STUDIO_EXTERNAL_WORKER", "1" if compose else "0"))
     if compose and not external_worker:
         _result(results, "AI_STUDIO_EXTERNAL_WORKER", "fail", "Compose 生产部署必须启用独立 worker")
     elif compose:
@@ -219,6 +435,14 @@ def run_preflight(env: dict[str, str] | None = None, *, compose: bool = False,
         _result(results, "TEST_ATELIER_SKILL_ROOT", "fail", "缺少技能工作流文件：" + ", ".join(missing_skill_files))
     else:
         _result(results, "TEST_ATELIER_SKILL_ROOT", "ok", str(skill_root))
+    if values.get("TEST_ATELIER_HARNESS_URL", "").strip() or _truthy(values.get("TEST_ATELIER_HARNESS_ONLY", "0")):
+        unusable_host_skills = _unusable_harness_skill_sources(skill_root)
+        if not skill_root.is_absolute():
+            _result(results, "TEST_ATELIER_HARNESS_SKILL_ROOT", "fail", "Harness 技能仓必须使用绝对路径")
+        else:
+            _result(results, "TEST_ATELIER_HARNESS_SKILL_ROOT", "fail" if unusable_host_skills else "ok",
+                    "缺少、越界或超限的 Harness 技能来源：" + ", ".join(unusable_host_skills)
+                    if unusable_host_skills else "Harness 项目技能来源齐全")
 
     _check_writable_directory(results, "AI_STUDIO_DATA_DIR", values.get("AI_STUDIO_DATA_DIR", "./data"))
     require_migrations = _truthy(values.get(
@@ -230,12 +454,14 @@ def run_preflight(env: dict[str, str] | None = None, *, compose: bool = False,
     else:
         _result(results, "AI_STUDIO_REQUIRE_MIGRATIONS", "ok" if require_migrations else "warn",
                 "已启用" if require_migrations else "开发环境允许隐式初始化")
-    migration_head = values.get("AI_STUDIO_MIGRATION_HEAD", "20261032_case_timestamps").strip()
+    migration_head = values.get("AI_STUDIO_MIGRATION_HEAD", "20261047_auth_session_revocations").strip()
     known_revisions = _known_migration_revisions()
     if not migration_head:
         _result(results, "AI_STUDIO_MIGRATION_HEAD", "fail", "未设置迁移 head")
     elif known_revisions and migration_head not in known_revisions:
         _result(results, "AI_STUDIO_MIGRATION_HEAD", "fail", f"仓库不存在迁移 revision：{migration_head}")
+    elif environment.casefold() == "production" and migration_head != "20261047_auth_session_revocations":
+        _result(results, "AI_STUDIO_MIGRATION_HEAD", "fail", "生产环境必须使用当前迁移 head：20261047_auth_session_revocations")
     else:
         _result(results, "AI_STUDIO_MIGRATION_HEAD", "ok", migration_head)
     migration_timeout = values.get("AI_STUDIO_MIGRATION_TIMEOUT", "120").strip()
@@ -289,7 +515,10 @@ def run_preflight(env: dict[str, str] | None = None, *, compose: bool = False,
                 "生产环境必须启用 HTTPS Cookie；本机 HTTP 验收请使用 development 环境")
     else:
         _result(results, "COOKIE_SECURE", "ok", "已启用")
-    metrics_token = values.get("METRICS_TOKEN", "").strip()
+    try:
+        metrics_token = configured_secret("METRICS_TOKEN", values)
+    except ValueError:
+        metrics_token = ""
     if not metrics_token:
         _result(results, "METRICS_TOKEN", "fail" if production_security else "warn",
                 "生产环境必须为指标端点设置访问令牌")
@@ -364,12 +593,25 @@ def check_compose_runtime(env: dict[str, str] | None = None) -> Check:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compose", action="store_true", help="按 Docker Compose 生产要求额外检查 PostgreSQL 密码")
+    parser.add_argument("--config", type=Path, help="从 runtime.json 读取配置，不依赖环境变量")
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true", dest="as_json", help="输出 JSON 检查结果")
     output.add_argument("--jsonl", action="store_true", help="输出一条符合日志契约的单行 JSON 事件")
     args = parser.parse_args(argv)
+    configured_values: dict[str, str] | None = None
+    if args.config:
+        try:
+            from api.runtime_config import load_runtime_config, environment_from_config
+            configured_values = environment_from_config(load_runtime_config(args.config, required=True))
+        except Exception as exc:  # noqa: BLE001 - preflight must report one bounded failure
+            configured_values = {"AI_STUDIO_ENV": "production"}
+            results = [Check("RUNTIME_CONFIG", "fail", f"runtime.json 无效：{type(exc).__name__}")]
+        else:
+            results = []
+    else:
+        results = []
     try:
-        results = run_preflight(compose=args.compose)
+        results.extend(run_preflight(env=configured_values, compose=args.compose))
         if args.compose:
             results.append(check_compose_runtime())
     except KeyboardInterrupt:

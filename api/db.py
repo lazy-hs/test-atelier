@@ -1,11 +1,14 @@
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import CheckConstraint, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, event
+from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine, event, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from sqlalchemy.pool import QueuePool
+from .runtime_config import install_runtime_config
 from .observability import env_float, env_int
+from scripts.deployment_secret_file import database_url as configured_database_url
+
+install_runtime_config()
 
 
 def utcnow():
@@ -15,7 +18,7 @@ def utcnow():
 # Keep the local SQLite file with the rest of the runtime data. Deployments
 # using PostgreSQL (or an explicit DATABASE_URL) are unaffected.
 _DEFAULT_DATABASE_URL = "sqlite:///./data/ai_studio.db"
-database_url = os.getenv("DATABASE_URL", _DEFAULT_DATABASE_URL)
+database_url = configured_database_url()
 if database_url == _DEFAULT_DATABASE_URL:
     # Alembic runs before API startup and therefore cannot rely on the API's
     # storage initialization to create the SQLite parent directory.
@@ -87,6 +90,15 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(80), unique=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(20), default="reviewer")
+
+
+class SessionRevocation(Base):
+    """Server-side revocation for the signed browser session nonce."""
+    __tablename__ = "session_revocations"
+    nonce_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    expires_at: Mapped[str] = mapped_column(String(40), index=True)
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
 
 
 class AiSettings(Base):
@@ -189,6 +201,32 @@ class Project(Base):
     # Archived projects stay available for audit/read-only access but are
     # omitted from the default project picker.
     archived_at: Mapped[str | None] = mapped_column(String(40), nullable=True, default=None)
+    # Durable intent blocks new work while the independent Host is purged.
+    deletion_pending_at: Mapped[str | None] = mapped_column(String(40), nullable=True, default=None)
+
+
+class ProjectTemplate(Base):
+    """Immutable project-owned configuration snapshot, never business data."""
+    __tablename__ = "project_templates"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    snapshot_sha256: Mapped[str] = mapped_column(String(64))
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
+class ProjectTemplateApplication(Base):
+    """Retain the origin of a new project even if its source project is deleted."""
+    __tablename__ = "project_template_applications"
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), primary_key=True)
+    source_project_id: Mapped[int] = mapped_column(Integer)
+    template_id: Mapped[int] = mapped_column(Integer)
+    template_name: Mapped[str] = mapped_column(String(120))
+    snapshot_sha256: Mapped[str] = mapped_column(String(64))
+    actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
 
 
 class WorkItem(Base):
@@ -305,6 +343,9 @@ class Case(Base):
     updated_at: Mapped[str] = mapped_column(String(40), default=utcnow, nullable=False)
 
 
+Index("ix_cases_project_directory_prefix", Case.project_id, func.substr(Case.directory, 1, 128))
+
+
 class ReviewEvent(Base):
     __tablename__ = "review_events"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -386,6 +427,10 @@ class GovernanceChangeLog(Base):
     revert_of: Mapped[int | None] = mapped_column(ForeignKey("governance_change_logs.id"), nullable=True)
 
 
+Index("ix_governance_change_project_entity_path", GovernanceChangeLog.project_id,
+      GovernanceChangeLog.entity, GovernanceChangeLog.entity_id)
+
+
 class GovernanceMetricSnapshot(Base):
     __tablename__ = "governance_metric_snapshots"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -441,6 +486,7 @@ class ConversionRecord(Base):
     app_version: Mapped[str] = mapped_column(String(40))
     row_count: Mapped[int] = mapped_column(Integer)
     file_size: Mapped[int] = mapped_column(Integer)
+    output_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     preview: Mapped[dict] = mapped_column(JSON)
 
 
@@ -451,6 +497,8 @@ class SourceDocument(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     filename: Mapped[str] = mapped_column(String(255))
     extracted_text: Mapped[str] = mapped_column(Text)
+    source_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     warnings: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
 
@@ -508,6 +556,67 @@ class AiJob(Base):
     prompt_length: Mapped[int] = mapped_column(Integer, default=0)
     prompt_calls: Mapped[int] = mapped_column(Integer, default=0)
     prompt_sha256: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
+class HarnessTask(Base):
+    """Project-owned reference to one DeepSeek Harness execution."""
+
+    __tablename__ = "harness_tasks"
+    __table_args__ = (
+        UniqueConstraint("project_id", "user_id", "idempotency_key", name="uq_harness_task_idempotency"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    task_type: Mapped[str] = mapped_column(String(40))
+    task_version: Mapped[str] = mapped_column(String(16), default="v1")
+    result_schema: Mapped[str] = mapped_column(String(64))
+    skill_id: Mapped[str] = mapped_column(String(80))
+    source_document_ids: Mapped[list] = mapped_column(JSON, default=list)
+    analysis_run_id: Mapped[str | None] = mapped_column(ForeignKey("analysis_runs.id"), nullable=True, index=True)
+    # Links a retry Attempt to the failed/cancelled task it replaces while
+    # keeping both task and Session records independently replayable.
+    retry_of: Mapped[str | None] = mapped_column(
+        ForeignKey("harness_tasks.id", name="fk_harness_tasks_retry_of", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    session_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    # A bounded map/reduce task can own several ACP sessions. ``session_id``
+    # remains the primary/final session for backwards compatibility.
+    session_ids: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    sequence: Mapped[int] = mapped_column(Integer, default=0)
+    idempotency_key: Mapped[str] = mapped_column(String(160))
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[dict] = mapped_column(JSON, default=dict)
+    # The independent Harness projector uses an expiring lease.  These fields
+    # are separate from the legacy AI worker leases so either worker can be
+    # deployed or recovered independently.
+    projector_owner: Mapped[str] = mapped_column(String(128), default="", index=True)
+    projector_lease_until: Mapped[float] = mapped_column(default=0.0, index=True)
+    projector_lease_heartbeat: Mapped[float] = mapped_column(default=0.0)
+    projector_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    projector_error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+    updated_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
+class HarnessTaskEvent(Base):
+    """Append-only local projection of Harness task events for reconnects."""
+
+    __tablename__ = "harness_task_events"
+    __table_args__ = (
+        UniqueConstraint("task_id", "sequence", name="uq_harness_task_event_sequence"),
+        UniqueConstraint("task_id", "remote_sequence", name="uq_harness_task_event_remote_sequence"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("harness_tasks.id", ondelete="CASCADE"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    remote_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    event: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
 
 
@@ -605,6 +714,7 @@ class ExecutionRun(Base):
     target_version: Mapped[str] = mapped_column(String(80))
     environment: Mapped[str] = mapped_column(String(80))
     required_chains: Mapped[list] = mapped_column(JSON)
+    frozen_case_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="active")
     started_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
     started_at: Mapped[str] = mapped_column(String(40), default=utcnow)
@@ -631,6 +741,85 @@ class RunCase(Base):
     executed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     executed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class ExecutionReport(Base):
+    """Immutable-by-API artifact independent of later case and run-case deletion."""
+    __tablename__ = "execution_reports"
+    run_id: Mapped[int] = mapped_column(ForeignKey("execution_runs.id"), primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+    completeness: Mapped[str] = mapped_column(String(24), default="verified")
+    payload_sha256: Mapped[str] = mapped_column(String(64))
+    passed_count: Mapped[int] = mapped_column(Integer)
+    failed_count: Mapped[int] = mapped_column(Integer)
+    blocked_count: Mapped[int] = mapped_column(Integer)
+    skipped_count: Mapped[int] = mapped_column(Integer)
+    not_run_count: Mapped[int] = mapped_column(Integer)
+    case_executions: Mapped[int] = mapped_column(Integer)
+    estimated_seconds: Mapped[int] = mapped_column(Integer)
+    actual_seconds: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[str] = mapped_column(String(40))
+
+
+class ExecutionDefect(Base):
+    """A human-authored defect linked to an immutable execution snapshot."""
+    __tablename__ = "execution_defects"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("execution_reports.run_id"), index=True)
+    run_case_id: Mapped[int] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(160))
+    description: Mapped[str] = mapped_column(Text, default="")
+    severity: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(24), default="open")
+    resolution: Mapped[str] = mapped_column(Text, default="")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    updated_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+    updated_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
+class ExecutionDefectEvent(Base):
+    __tablename__ = "execution_defect_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    defect_id: Mapped[int] = mapped_column(ForeignKey("execution_defects.id"), index=True)
+    actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    before: Mapped[dict] = mapped_column(JSON)
+    after: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
+class KnowledgeEntry(Base):
+    """Curated knowledge with a frozen, project-scoped provenance reference."""
+    __tablename__ = "knowledge_entries"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    source_type: Mapped[str] = mapped_column(String(32))
+    source_id: Mapped[str] = mapped_column(String(64))
+    source_snapshot: Mapped[dict] = mapped_column(JSON)
+    title: Mapped[str] = mapped_column(String(160))
+    body: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    updated_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+    updated_at: Mapped[str] = mapped_column(String(40), default=utcnow)
+
+
+class KnowledgeRevision(Base):
+    __tablename__ = "knowledge_revisions"
+    __table_args__ = (UniqueConstraint("entry_id", "version", name="uq_knowledge_entry_version"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entry_id: Mapped[int] = mapped_column(ForeignKey("knowledge_entries.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    actor_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    title: Mapped[str] = mapped_column(String(160))
+    body: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[str] = mapped_column(String(40), default=utcnow)
 
 
 class ExecutionEvent(Base):

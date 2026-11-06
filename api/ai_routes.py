@@ -1,9 +1,11 @@
 """Project-scoped document, analysis and case-authoring endpoints."""
 
 import io
+import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -19,17 +21,18 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 
 from . import ai_engine, ai_jobs, config_file
 from .skill_runner import SkillRunnerError, discover_skills, generate_xmind as generate_skill_xmind
 from .db import (AiJob, AiModel, AiSettings, AiTool, AnalysisRun, Case, CaseDraft, CodexMessage,
-                 CodexSession, ImportBatch, ProjectSkill, SessionLocal, SourceDocument, User, utcnow)
+                 CodexSession, HarnessTask, HarnessTaskEvent, ImportBatch, Project, ProjectSkill, SessionLocal,
+                 SourceDocument, User, utcnow)
 from .document_extract import extract
 from .observability import env_int, monotonic, redact_sensitive_text, request_id as current_request_id
-from .storage import open_private_regular_file, write_private_atomic
+from .storage import ensure_private_directory, is_link_like, open_private_regular_file, remove_private_file, write_private_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,11 @@ MAX_FILE_BYTES = _document_limit()
 DOCUMENT_PREVIEW_CHARS = env_int("AI_STUDIO_DOCUMENT_PREVIEW_CHARS", 200_000, 1_000)
 
 
+def _harness_only() -> bool:
+    """Return whether legacy in-process AI execution is disabled for cutover."""
+    return ai_jobs.harness_only_mode()
+
+
 def _document_preview(text: str) -> tuple[str, bool]:
     """Bound browser/API previews without truncating stored analysis input."""
     if len(text) <= DOCUMENT_PREVIEW_CHARS:
@@ -99,12 +107,9 @@ def _create_codex_session_workspace(session_id: str) -> str:
     # Keep workbench sessions outside the checkout by construction.  Do not
     # make this root configurable: pointing it at the application repository
     # would defeat the clean-session guarantee.
-    root = Path(tempfile.gettempdir()) / "test-atelier-codex-sessions"
-    root.mkdir(parents=True, exist_ok=True)
-    try:
-        root.chmod(0o700)
-    except OSError:
-        pass
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id):
+        raise OSError("Codex 会话 ID 不合法")
+    root = ensure_private_directory(Path(tempfile.gettempdir()) / "test-atelier-codex-sessions")
     workspace = root / session_id
     workspace.mkdir(mode=0o700)
     try:
@@ -117,8 +122,12 @@ def _create_codex_session_workspace(session_id: str) -> str:
 
 
 def _workspace_belongs_to_session(path: str, session_id: str) -> bool:
-    root = (Path(tempfile.gettempdir()) / "test-atelier-codex-sessions").resolve()
-    workspace = Path(path).expanduser().resolve()
+    configured_root = Path(tempfile.gettempdir()) / "test-atelier-codex-sessions"
+    candidate = Path(path).expanduser()
+    if is_link_like(configured_root) or is_link_like(candidate):
+        return False
+    root = configured_root.resolve()
+    workspace = candidate.resolve()
     return workspace.parent == root and workspace.name == session_id
 
 
@@ -322,13 +331,14 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
     def scope(project_id: int, user: User, db: Session):
         project_access(project_id, user, db)
 
-    def require_skill(project_id: int, skill_id: str, db: Session):
+    def require_skill(project_id: int, skill_id: str, user: User, db: Session):
         skill = db.get(ProjectSkill, (project_id, skill_id))
         if skill is None:
             try:
                 spec = next(item for item in discover_skills() if item.skill_id == skill_id)
             except (SkillRunnerError, StopIteration) as exc:
                 raise HTTPException(503, "项目技能仓不可用") from exc
+            writable(user, project_id, db, fence=True)
             skill = ProjectSkill(project_id=project_id, skill_id=spec.skill_id, name=spec.name,
                                  label=spec.label, source_path=spec.path, description=spec.description,
                                  enabled=spec.enabled_by_default)
@@ -374,6 +384,7 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         # Sessions created before isolated workspaces were introduced may
         # still point at the API checkout. Repair them before the next turn.
         if not _workspace_belongs_to_session(session.working_directory, session.id):
+            project_access(project_id, user, db, fence=True)
             session.working_directory = _create_codex_session_workspace(session.id)
             db.commit()
         return session
@@ -385,12 +396,11 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             CodexSession.project_id == project_id,
             CodexSession.user_id == user.id,
         ).order_by(CodexSession.updated_at.desc())).all()
-        changed = False
-        for session in sessions:
-            if not _workspace_belongs_to_session(session.working_directory, session.id):
+        stale = [session for session in sessions if not _workspace_belongs_to_session(session.working_directory, session.id)]
+        if stale:
+            project_access(project_id, user, db, fence=True)
+            for session in stale:
                 session.working_directory = _create_codex_session_workspace(session.id)
-                changed = True
-        if changed:
             db.commit()
         return [_codex_session_view(item, db) for item in sessions]
 
@@ -406,6 +416,7 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             ai_engine._validate_cli_command(command)
         except RuntimeError as exc:
             raise HTTPException(422, str(exc)) from exc
+        writable(user, project_id, db, fence=True)
         now = utcnow()
         session_id = uuid.uuid4().hex
         working_directory = _create_codex_session_workspace(session_id)
@@ -437,6 +448,8 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         if not ai_engine.CODEX_ENABLED or not enabled:
             raise HTTPException(409, "Codex CLI 未启用")
         prompt = payload.prompt.strip()
+        writable(user, project_id, db, fence=True)
+        db.refresh(session)
         with _CODEX_SESSIONS_LOCK:
             if session_id in _CODEX_RUNNING_SESSIONS or session.status == "running":
                 raise HTTPException(409, "Codex 会话正在执行任务")
@@ -445,10 +458,16 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             CodexMessage.session_id == session.id,
         ).order_by(CodexMessage.id.desc()).limit(20)).all()
         history.reverse()
-        session.status = "running"
-        session.updated_at = utcnow()
-        db.add(CodexMessage(session_id=session.id, role="user", content=prompt, created_at=utcnow()))
-        db.commit()
+        try:
+            session.status = "running"
+            session.updated_at = utcnow()
+            db.add(CodexMessage(session_id=session.id, role="user", content=prompt, created_at=utcnow()))
+            db.commit()
+        except Exception:
+            db.rollback()
+            with _CODEX_SESSIONS_LOCK:
+                _CODEX_RUNNING_SESSIONS.discard(session_id)
+            raise
         context = "\n\n".join(f"{item.role}: {item.content}" for item in history[-20:])
         # Keep repeated turns from producing an oversized subprocess stdin.
         if len(context) > 80_000:
@@ -459,6 +478,12 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             if not Path(working_directory).is_dir():
                 raise RuntimeError("Codex 工作目录不存在")
             reply = ai_engine.request_cli_text(full_prompt, command, model, working_directory)
+        except ai_engine.CliTerminationUncertain as exc:
+            logger.error("codex.turn.termination_uncertain", extra={
+                "event": "codex.turn.termination_uncertain", "component": "codex",
+                "project_id": project_id, "error_type": type(exc).__name__,
+            })
+            raise HTTPException(503, "Codex 进程未确认停止，请核对后恢复会话") from exc
         except Exception as exc:
             detail = ai_engine._cli_diagnostic(exc)
             session.status = "failed"; session.updated_at = utcnow(); db.commit()
@@ -488,6 +513,8 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         if not ai_engine.CODEX_ENABLED or not enabled:
             raise HTTPException(409, "Codex CLI 未启用")
         prompt = payload.prompt.strip()
+        writable(user, project_id, db, fence=True)
+        db.refresh(session)
         with _CODEX_SESSIONS_LOCK:
             if session_id in _CODEX_RUNNING_SESSIONS or session.status == "running":
                 raise HTTPException(409, "Codex 会话正在执行任务")
@@ -501,9 +528,15 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             context = context[-80_000:]
         full_prompt = f"{context}\n\nuser: {prompt}" if context else prompt
         now = utcnow()
-        session.status = "running"; session.updated_at = now
-        db.add(CodexMessage(session_id=session.id, role="user", content=prompt, created_at=now))
-        db.commit()
+        try:
+            session.status = "running"; session.updated_at = now
+            db.add(CodexMessage(session_id=session.id, role="user", content=prompt, created_at=now))
+            db.commit()
+        except Exception:
+            db.rollback()
+            with _CODEX_SESSIONS_LOCK:
+                _CODEX_RUNNING_SESSIONS.discard(session_id)
+            raise
         session_id_value = session.id
         working_directory = session.working_directory
         # Release the request-scoped connection while the CLI streams. The
@@ -513,11 +546,14 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
 
         def stream_events():
             collected = ""
+            cli_stream = None
+            termination_uncertain = False
             yield sse("status", {"status": "running", "phase": "starting"})
             try:
                 if not Path(working_directory).is_dir():
                     raise RuntimeError("Codex 工作目录不存在")
-                for raw in ai_engine.stream_cli_text(full_prompt, command, model, working_directory):
+                cli_stream = ai_engine.stream_cli_text(full_prompt, command, model, working_directory)
+                for raw in cli_stream:
                     if raw is None:
                         yield sse("status", {"status": "running", "phase": "waiting"})
                         continue
@@ -548,27 +584,39 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
                     snapshot = _codex_session_view(final_session, final_db)
                 yield sse("done", {"session": snapshot})
             except GeneratorExit:
-                with SessionLocal() as final_db:
-                    final_session = final_db.get(CodexSession, session_id_value)
-                    if final_session is not None and final_session.status == "running":
-                        final_session.status = "failed"; final_session.updated_at = utcnow(); final_db.commit()
+                raise
+            except ai_engine.CliTerminationUncertain:
+                termination_uncertain = True
                 raise
             except Exception as exc:
                 detail = ai_engine._cli_diagnostic(exc) or "Codex CLI 执行失败"
-                with SessionLocal() as final_db:
-                    final_session = final_db.get(CodexSession, session_id_value)
-                    if final_session is not None:
-                        final_session.status = "failed"; final_session.updated_at = utcnow(); final_db.commit()
                 yield sse("error", {"message": detail})
             finally:
-                # A browser disconnect can close the generator without
-                # entering the normal done/error branches.
-                with SessionLocal() as final_db:
-                    final_session = final_db.get(CodexSession, session_id_value)
-                    if final_session is not None and final_session.status == "running":
-                        final_session.status = "failed"; final_session.updated_at = utcnow(); final_db.commit()
-                with _CODEX_SESSIONS_LOCK:
-                    _CODEX_RUNNING_SESSIONS.discard(session_id_value)
+                try:
+                    # Do not mark the session deletable while a disconnected
+                    # stream still owns a workspace-writing CLI subprocess.
+                    if cli_stream is not None:
+                        close_stream = getattr(cli_stream, "close", None)
+                        if callable(close_stream):
+                            close_stream()
+                except Exception:
+                    termination_uncertain = True
+                    raise
+                finally:
+                    if termination_uncertain:
+                        logger.error("codex.stream.termination_uncertain", extra={
+                            "event": "codex.stream.termination_uncertain", "component": "codex",
+                            "project_id": project_id, "error_type": "CliTerminationUncertain",
+                        })
+                    else:
+                        try:
+                            with SessionLocal() as final_db:
+                                final_session = final_db.get(CodexSession, session_id_value)
+                                if final_session is not None and final_session.status == "running":
+                                    final_session.status = "failed"; final_session.updated_at = utcnow(); final_db.commit()
+                        finally:
+                            with _CODEX_SESSIONS_LOCK:
+                                _CODEX_RUNNING_SESSIONS.discard(session_id_value)
 
         return StreamingResponse(stream_events(), media_type="text/event-stream", headers={
             "Cache-Control": "no-cache", "X-Accel-Buffering": "no",
@@ -951,15 +999,23 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
             })
             raise HTTPException(422, str(exc)) from exc
         document = SourceDocument(id=uuid.uuid4().hex, project_id=project_id, user_id=user.id,
-                                  filename=filename[:255], extracted_text=text, warnings=warnings)
+                                  filename=filename[:255], extracted_text=text, warnings=warnings,
+                                  source_sha256=hashlib.sha256(data).hexdigest(), source_size=len(data))
         path = DOCUMENT_DIR / str(project_id) / f"{document.id}.bin"
+        writable(user, project_id, db, fence=True)
         try:
             write_private_atomic(path, data, root=DOCUMENT_DIR)
             db.add(document)
             db.commit()
         except Exception as exc:
             db.rollback()
-            path.unlink(missing_ok=True)
+            try:
+                remove_private_file(path, root=DOCUMENT_DIR)
+            except OSError:
+                logger.warning("document.cleanup_failed", extra={
+                    "event": "document.cleanup_failed", "project_id": project_id,
+                    "component": "document-storage", "error_type": "OSError",
+                })
             logger.exception("document.persist.failed", extra={
                 "event": "document.persist.failed", "project_id": project_id,
                 "actor_id": user.id, "error_type": type(exc).__name__,
@@ -1003,28 +1059,63 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         path = DOCUMENT_DIR / str(project_id) / f"{row.id}.bin"
         try:
             stream, size = open_private_regular_file(path, root=DOCUMENT_DIR)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             logger.warning("document.download.rejected", extra={
                 "event": "document.download.rejected", "project_id": project_id,
                 "actor_id": user.id, "error_type": type(exc).__name__,
                 "component": "document-storage",
             })
             raise HTTPException(404, "原始文件不存在")
+        output = None
+        try:
+            if ((row.source_sha256 is None) != (row.source_size is None)
+                    or row.source_sha256 is not None and not re.fullmatch(r"[a-f0-9]{64}", row.source_sha256)):
+                raise HTTPException(409, "原始文件身份记录损坏，请先核对数据")
+            with stream:
+                if row.source_size is not None and size != row.source_size:
+                    raise HTTPException(409, "原始文件大小与上传时不一致")
+                output = tempfile.TemporaryFile(mode="w+b")
+                digest = hashlib.sha256()
+                copied = 0
+                while chunk := stream.read(1024 * 1024):
+                    copied += len(chunk)
+                    if copied > size:
+                        raise HTTPException(409, "原始文件在下载准备期间发生变化")
+                    digest.update(chunk)
+                    output.write(chunk)
+                if copied != size or row.source_sha256 is not None and digest.hexdigest() != row.source_sha256:
+                    raise HTTPException(409, "原始文件与上传时内容不一致")
+                output.seek(0)
+        except Exception:
+            stream.close()
+            if output is not None:
+                output.close()
+            raise
+        def chunks():
+            try:
+                while chunk := output.read(1024 * 1024):
+                    yield chunk
+            finally:
+                output.close()
+
         return StreamingResponse(
-            iter(lambda: stream.read(1024 * 1024), b""),
+            chunks(),
             media_type="application/octet-stream",
             headers={
                 "Content-Disposition": f"attachment; filename*=UTF-8''{quote(row.filename)}",
                 "Content-Length": str(size),
+                "X-Source-Integrity": "verified" if row.source_sha256 else "unverified",
             },
-            background=BackgroundTask(stream.close),
+            background=BackgroundTask(output.close),
         )
 
     @router.post("/analyses", dependencies=[Depends(csrf)])
     def create_analysis(project_id: int, payload: AnalysisCreate, user: User = Depends(current_user), db: Session = Depends(get_db)):
         scope(project_id, user, db)
         writable(user, project_id, db)
-        require_skill(project_id, "requirement-analysis", db)
+        if _harness_only():
+            raise HTTPException(409, "当前部署要求通过 DeepSeek Harness 创建需求分析任务")
+        require_skill(project_id, "requirement-analysis", user, db)
         if payload.provider == "codex":
             payload.provider = "codex_cli"
         if payload.provider == "claude":
@@ -1062,6 +1153,78 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         rows = db.scalars(select(AnalysisRun).where(AnalysisRun.project_id == project_id).order_by(AnalysisRun.created_at.desc())).all()
         return [run_dict(row, db) for row in rows]
 
+    @router.delete("/analyses/{run_id}", dependencies=[Depends(csrf)])
+    def delete_analysis(project_id: int, run_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+        scope(project_id, user, db); writable(user, project_id, db)
+        # Task creation takes the same lock; the durable status blocks new
+        # case tasks while Host and database histories are cleaned in order.
+        locked = db.execute(update(Project).where(Project.id == project_id).values(name=Project.name))
+        if locked.rowcount != 1:
+            raise HTTPException(404, "项目不存在")
+        run = find_run(project_id, run_id, db)
+        if run.status in {"queued", "running"}:
+            raise HTTPException(409, "分析任务正在处理中，请完成或停止任务后再删除")
+        linked = db.execute(select(HarnessTask.id, HarnessTask.user_id, HarnessTask.status).where(
+            HarnessTask.project_id == project_id, HarnessTask.analysis_run_id == run.id).order_by(HarnessTask.id)).all()
+        if run.status != "deleting":
+            if any(status not in {"completed", "failed", "cancelled"} for _, _, status in linked):
+                raise HTTPException(409, "分析仍有关联的 Harness 任务，请先停止任务再删除")
+            active_job = db.scalar(select(AiJob.id).where(
+                AiJob.analysis_id == run.id, AiJob.status.in_(("queued", "running"))).limit(1))
+            if active_job is not None:
+                raise HTTPException(409, "分析仍有运行中的用例任务，请先停止任务再删除")
+            if linked:
+                run.status = "deleting"
+                run.updated_at = utcnow()
+                run.version += 1
+                db.commit()
+        if linked:
+            from . import harness_bridge
+            db.rollback()  # Do not hold a database transaction during Host I/O.
+            bridge = harness_bridge.HarnessBridge()
+            for task_id, owner_id, _ in linked:
+                try:
+                    bridge.delete_task(task_id, current_request_id(), {
+                        "subject_user_id": owner_id, "project_id": project_id,
+                        "task_id": task_id, "allowed_operation": "task.delete",
+                    })
+                except harness_bridge.HarnessBridgeHTTPError as exc:
+                    logger.warning("analysis.cleanup_host_failed", extra={"event": "analysis.cleanup_host_failed",
+                                   "project_id": project_id, "component": "analysis-history",
+                                   "error_type": type(exc).__name__})
+                    raise HTTPException(409 if exc.status_code == 409 else 503,
+                                        "Harness 历史尚未安全清理，请检查 Host 后重试") from exc
+                except harness_bridge.HarnessBridgeError as exc:
+                    logger.warning("analysis.cleanup_host_failed", extra={"event": "analysis.cleanup_host_failed",
+                                   "project_id": project_id, "component": "analysis-history",
+                                   "error_type": type(exc).__name__})
+                    raise HTTPException(503, "Harness Host 不可用，请恢复后重试分析删除") from exc
+            scope(project_id, user, db); writable(user, project_id, db)
+            locked = db.execute(update(Project).where(Project.id == project_id).values(name=Project.name))
+            if locked.rowcount != 1:
+                raise HTTPException(404, "项目不存在")
+            run = find_run(project_id, run_id, db)
+            current = db.execute(select(HarnessTask.id).where(
+                HarnessTask.project_id == project_id, HarnessTask.analysis_run_id == run.id).order_by(HarnessTask.id)).scalars().all()
+            task_ids = [task_id for task_id, _, _ in linked]
+            if run.status != "deleting" or current != task_ids:
+                raise HTTPException(409, "分析删除状态已变化，请刷新后重试")
+            db.execute(update(HarnessTask).where(HarnessTask.retry_of.in_(task_ids)).values(retry_of=None))
+            db.execute(delete(HarnessTaskEvent).where(HarnessTaskEvent.task_id.in_(task_ids)))
+            db.execute(delete(HarnessTask).where(HarnessTask.id.in_(task_ids)))
+        jobs = db.scalars(select(AiJob).where(AiJob.analysis_id == run.id)).all()
+        for job in jobs:
+            ai_jobs.release_external_slot_in_session(db, job)
+        db.execute(delete(AiJob).where(AiJob.analysis_id == run.id))
+        db.execute(delete(CaseDraft).where(CaseDraft.analysis_id == run.id))
+        db.delete(run)
+        db.commit()
+        logger.info("analysis.deleted", extra={
+            "event": "analysis.deleted", "project_id": project_id,
+            "analysis_id": run_id, "actor_id": user.id, "component": "analysis-history",
+        })
+        return {"id": run_id, "deleted": 1}
+
     @router.get("/analyses/{run_id}")
     def analysis_detail(project_id: int, run_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
         scope(project_id, user, db)
@@ -1078,6 +1241,8 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
     def edit_report(project_id: int, run_id: str, payload: ReportEdit, user: User = Depends(current_user), db: Session = Depends(get_db)):
         scope(project_id, user, db); writable(user, project_id, db)
         run = find_run(project_id, run_id, db)
+        if run.provider == "harness":
+            raise HTTPException(409, "Harness 原始报告不可编辑；请在人工澄清中记录决定")
         if run.status != "ready" or run.version != payload.version:
             raise HTTPException(409, "报告已更新，请刷新")
         run.result = {**run.result, "report_markdown": payload.report_markdown, "report_edited": True}
@@ -1100,11 +1265,18 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
         if target is None:
             raise HTTPException(404, "待澄清项不存在")
         target["decision"] = payload.decision.strip()
-        docs = [db.get(SourceDocument, doc_id) for doc_id in run.source_ids]
         result = {**run.result, "ambiguities": ambiguities}
-        if not result.get("report_edited"):
+        if run.provider != "harness" and not result.get("report_edited"):
+            docs = [db.get(SourceDocument, doc_id) for doc_id in run.source_ids]
             result["report_markdown"] = ai_engine.render_report(result, [{"id": doc.id, "filename": doc.filename} for doc in docs])
-        run.result = result; run.version += 1; run.updated_at = utcnow(); db.commit()
+        changed = db.execute(update(AnalysisRun).where(
+            AnalysisRun.id == run.id, AnalysisRun.version == payload.version,
+        ).values(result=result, version=AnalysisRun.version + 1, updated_at=utcnow()))
+        if changed.rowcount != 1:
+            db.rollback()
+            raise HTTPException(409, "分析结果已更新，请刷新")
+        db.commit()
+        db.refresh(run)
         logger.info("analysis.ambiguity.decided", extra={
             "event": "analysis.ambiguity.decided", "project_id": project_id,
             "actor_id": user.id, "component": "analysis-report",
@@ -1115,8 +1287,19 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
     def generate(project_id: int, run_id: str, payload: DraftGenerateRequest | None = None,
                  user: User = Depends(current_user), db: Session = Depends(get_db)):
         scope(project_id, user, db); writable(user, project_id, db)
-        require_skill(project_id, "test-cases", db)
+        if _harness_only():
+            raise HTTPException(409, "当前部署要求通过 DeepSeek Harness 编写用例")
         run = find_run(project_id, run_id, db)
+        if run.provider == "harness":
+            raise HTTPException(409, "Harness 分析只能通过 DeepSeek Harness 编写用例")
+        require_skill(project_id, "test-cases", user, db)
+        # Lazy skill registration may commit. Reacquire the deletion lock and
+        # re-read the analysis before deciding whether a legacy job can exist.
+        writable(user, project_id, db, fence=True)
+        db.expire_all()
+        run = find_run(project_id, run_id, db)
+        if run.provider == "harness":
+            raise HTTPException(409, "Harness 分析只能通过 DeepSeek Harness 编写用例")
         provider = (payload.provider if payload and payload.provider else run.provider).strip()
         if provider == "codex":
             provider = "codex_cli"
@@ -1233,9 +1416,21 @@ def build_router(get_db, current_user, csrf, project_access, writable) -> APIRou
     @router.post("/ai/jobs/{job_id}/retry", dependencies=[Depends(csrf)])
     def retry(project_id: int, job_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
         scope(project_id, user, db); writable(user, project_id, db)
+        if _harness_only():
+            raise HTTPException(409, "当前部署要求通过 DeepSeek Harness 重试任务")
+        # Serialize with analysis deletion before checking the durable status.
+        locked = db.execute(update(Project).where(Project.id == project_id).values(name=Project.name))
+        if locked.rowcount != 1:
+            raise HTTPException(404, "项目不存在")
+        db.expire_all()
         job = db.get(AiJob, job_id)
         if not job or job.project_id != project_id:
             raise HTTPException(404, "任务不存在")
+        run = db.get(AnalysisRun, job.analysis_id)
+        if run is None or run.project_id != project_id or run.status == "deleting":
+            raise HTTPException(409, "关联分析正在删除或已不存在，不能重试任务")
+        if run.provider == "harness":
+            raise HTTPException(409, "Harness 分析不能通过旧 AI 任务重试")
         if job.status != "failed":
             raise HTTPException(409, "只能重试失败任务")
         job.status = "queued"; job.error = ""

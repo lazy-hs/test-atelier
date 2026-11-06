@@ -39,5 +39,6 @@ export function createConverterApi(projectId) {
     createPreview: (input) => api(`${base}/preview`, { method: 'POST', body: inputForm(input) }),
     downloadResult: (input) => download(`${base}/export`, { method: 'POST', body: inputForm(input) }),
     downloadHistory: (id) => download(`${base}/history/${encodeURIComponent(id)}` + '/download'),
+    downloadSource: (id) => download(`${base}/history/${encodeURIComponent(id)}` + '/source'),
   };
 }

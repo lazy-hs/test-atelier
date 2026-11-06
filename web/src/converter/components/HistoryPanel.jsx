@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Clock3, Download, Eye, History, RefreshCw, Trash2 } from "lucide-react";
+import { Clock3, Download, Eye, FileDown, History, RefreshCw, Trash2 } from "lucide-react";
 
 const MODE_LABELS = {
   excel_to_excel: "Excel → Excel",
@@ -48,6 +48,7 @@ export default function HistoryPanel({
   onRefresh,
   onView,
   onDownload,
+  onDownloadSource,
   onDelete,
   onClear,
 }) {
@@ -58,7 +59,9 @@ export default function HistoryPanel({
   useEffect(() => {
     if (!open) return undefined;
     function handlePointerDown(event) {
-      if (panelRef.current && !panelRef.current.contains(event.target)) {
+      // Document listeners see the shadow host as the target; use the
+      // composed path so inner history actions survive their pointerdown.
+      if (panelRef.current && !event.composedPath().includes(panelRef.current)) {
         setOpen(false);
       }
     }
@@ -133,6 +136,7 @@ export default function HistoryPanel({
                     <strong title={record.output_filename}>{record.output_filename}</strong>
                     <small>{historyMeta(record)}</small>
                     <span>{formatDate(record.created_at)} · 来源：{record.source_filename}</span>
+                    {record.source ? <span title={`上传文件 SHA-256 ${record.source.sha256}`}>原始文件已留存 · SHA-256 {record.source.sha256.slice(0, 12)}…</span> : <span>旧记录未留存原始文件</span>}
                   </div>
                   <div className="history-actions">
                     <button type="button" title="查看历史预览" aria-label="查看历史预览" onClick={() => handleView(record.id)} disabled={loading}>
@@ -141,6 +145,9 @@ export default function HistoryPanel({
                     <button type="button" title="下载历史文件" aria-label="下载历史文件" onClick={() => onDownload(record.id)} disabled={loading}>
                       <Download size={15} />
                     </button>
+                    {record.source ? <button type="button" title="下载原始上传文件" aria-label={`下载原始上传文件：${record.source_filename}`} onClick={() => onDownloadSource(record.id)} disabled={loading}>
+                      <FileDown size={15} />
+                    </button> : null}
                     <button
                       className="history-delete-button"
                       type="button"

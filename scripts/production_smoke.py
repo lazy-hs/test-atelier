@@ -21,6 +21,11 @@ from datetime import datetime, timezone
 from typing import Callable
 from urllib.parse import urlparse
 
+if __package__:
+    from .deployment_secret_file import configured_secret
+else:
+    from deployment_secret_file import configured_secret
+
 
 @dataclass(frozen=True)
 class SmokeCheck:
@@ -116,6 +121,7 @@ def _validate_metrics_body(body: str, required_markers: tuple[str, ...]) -> str 
 
 def run_smoke(base_url: str, *, metrics_token: str = "", expected_release: str = "",
               require_worker: bool = False, require_web: bool = False, require_https: bool = False,
+              expected_harness_only: bool | None = None,
               timeout: float = 5.0,
               attempts: int = 3, retry_seconds: float = 1.0,
               fetch: Fetcher = http_get) -> list[SmokeCheck]:
@@ -123,6 +129,8 @@ def run_smoke(base_url: str, *, metrics_token: str = "", expected_release: str =
     checks: list[SmokeCheck] = []
     if require_https and urlparse(base).scheme.lower() != "https":
         return [SmokeCheck("https", "fail", "生产 smoke 要求 HTTPS 地址")]
+    if expected_harness_only is not None and not require_worker:
+        return [SmokeCheck("worker-mode", "fail", "核对 Harness-only 模式必须同时要求 worker 健康探针")]
 
     def check_endpoint(name: str, path: str, expected: int = 200, headers: dict[str, str] | None = None,
                        body_check: Callable[[str], str | None] | None = None) -> Response | None:
@@ -277,11 +285,15 @@ def run_smoke(base_url: str, *, metrics_token: str = "", expected_release: str =
                 payload = json.loads(body)
             except (TypeError, ValueError):
                 return "worker 健康响应不是有效 JSON"
+            if not isinstance(payload, dict):
+                return "worker 健康响应不是 JSON 对象"
             if payload.get("status") != "ready":
                 return f"worker 状态为 {payload.get('status', 'unknown')}，期望 ready"
             if expected_release and payload.get("worker_release") != expected_release:
                 observed = payload.get("worker_release") or "空"
                 return f"worker 发布标识不匹配：实际 {observed}，期望 {expected_release}"
+            if expected_harness_only is not None and payload.get("harness_only") is not expected_harness_only:
+                return "worker Harness-only 模式与预期不一致或缺少模式标记"
             return None
 
         check_endpoint("worker", "/api/v1/health/worker", body_check=worker_body_check)
@@ -291,8 +303,12 @@ def run_smoke(base_url: str, *, metrics_token: str = "", expected_release: str =
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8080")
-    parser.add_argument("--metrics-token", default="")
+    metrics = parser.add_mutually_exclusive_group()
+    metrics.add_argument("--metrics-token", default="")
+    metrics.add_argument("--metrics-token-file", default="", help="从绝对路径的单行文件读取指标令牌")
     parser.add_argument("--expected-release", default="", help="要求 live/ready/worker 返回的发布标识")
+    parser.add_argument("--expected-harness-mode", choices=("on", "off"),
+                        help="要求 worker 报告预期的 Harness-only 模式，需同时设置 --require-worker")
     parser.add_argument("--require-worker", action="store_true")
     parser.add_argument("--require-web", action="store_true", help="检查边缘层是否返回可用 SPA HTML")
     parser.add_argument("--require-https", action="store_true", help="要求 HTTPS，并校验 HSTS 响应头")
@@ -304,12 +320,20 @@ def main(argv: list[str] | None = None) -> int:
     output.add_argument("--jsonl", action="store_true", help="输出一条符合日志契约的单行 JSON 事件")
     args = parser.parse_args(argv)
     try:
-        checks = run_smoke(args.base_url, metrics_token=args.metrics_token,
-                           expected_release=args.expected_release,
-                           require_worker=args.require_worker, require_web=args.require_web,
-                           require_https=args.require_https,
-                           timeout=max(0.1, args.timeout),
-                           attempts=max(1, args.attempts), retry_seconds=max(0.0, args.retry_seconds))
+        try:
+            token = (configured_secret("METRICS_TOKEN", {"METRICS_TOKEN_FILE": args.metrics_token_file})
+                     if args.metrics_token_file else args.metrics_token)
+        except ValueError:
+            checks = [SmokeCheck("metrics-token", "fail", "指标令牌文件不可用")]
+        else:
+            checks = run_smoke(args.base_url, metrics_token=token,
+                               expected_release=args.expected_release,
+                               expected_harness_only=(args.expected_harness_mode == "on"
+                                                      if args.expected_harness_mode else None),
+                               require_worker=args.require_worker, require_web=args.require_web,
+                               require_https=args.require_https,
+                               timeout=max(0.1, args.timeout),
+                               attempts=max(1, args.attempts), retry_seconds=max(0.0, args.retry_seconds))
     except KeyboardInterrupt:
         if args.jsonl:
             payload = {

@@ -14,7 +14,10 @@ import os
 
 from .entrypoint import _log
 from .config_file import server_config
+from .runtime_config import install_runtime_config
 from .observability import env_float
+
+install_runtime_config()
 
 
 class _ArgumentParser(argparse.ArgumentParser):

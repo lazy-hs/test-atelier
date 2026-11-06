@@ -15,7 +15,13 @@ os.environ.setdefault("AI_STUDIO_SESSION_SECRET", "test-only-session-secret-32-c
 
 from api.observability import (FailureWindow, JsonFormatter, SafeTextFormatter, configure_logging,
                                deployment_release, env_float, env_int, new_request_id,
-                               sanitized_subprocess_environment)
+                               redact_sensitive_text, sanitized_subprocess_environment)
+
+
+def test_file_backed_secret_paths_are_redacted_from_diagnostics():
+    message = "AI_STUDIO_SESSION_SECRET_FILE=/private/session AI_STUDIO_ADMIN_PASSWORD_FILE=/private/admin AI_STUDIO_DATABASE_PASSWORD_FILE=/private/db"
+    redacted = redact_sensitive_text(message)
+    assert all(path not in redacted for path in ("/private/session", "/private/admin", "/private/db"))
 
 
 def test_environment_numeric_helpers_use_safe_defaults(monkeypatch):
@@ -93,6 +99,17 @@ def test_json_formatter_includes_worker_error_log_interval():
     assert payload["error_log_interval_seconds"] == 30.0
 
 
+def test_json_formatter_includes_redacted_response_preview():
+    record = logging.LogRecord("api.ai_engine", logging.WARNING, __file__, 1, "provider error", (), None)
+    record.event = "model.remote.response_error"
+    record.status_code = 500
+    record.response_preview = "token=provider-secret; " + ("x" * 500)
+    payload = json.loads(JsonFormatter().format(record))
+    assert payload["status_code"] == 500
+    assert payload["response_preview"].startswith("token=[REDACTED]")
+    assert len(payload["response_preview"]) <= 256
+
+
 def test_json_formatter_keeps_database_kind_for_startup_diagnostics():
     record = logging.LogRecord("api", logging.INFO, __file__, 1, "migration checked", (), None)
     record.event = "database.migrations.checked"
@@ -156,6 +173,19 @@ def test_production_runtime_requires_http_security(monkeypatch):
 
     monkeypatch.setenv("METRICS_TOKEN", "metrics-secret-123456")
     main._validate_runtime_security()
+
+
+def test_production_runtime_accepts_file_backed_metrics_token(monkeypatch, tmp_path):
+    secret = tmp_path / "metrics-token"
+    secret.write_bytes(b"metrics-file-token-123456\r\n")
+    monkeypatch.setenv("AI_STUDIO_ENV", "production")
+    monkeypatch.setenv("COOKIE_SECURE", "1")
+    monkeypatch.delenv("METRICS_TOKEN", raising=False)
+    monkeypatch.setenv("METRICS_TOKEN_FILE", str(secret))
+    main._validate_runtime_security()
+    monkeypatch.setenv("METRICS_TOKEN", "conflicting-token-123456")
+    with pytest.raises(main.MetricsTokenRequired):
+        main._validate_runtime_security()
 
 
 def test_production_runtime_requires_structured_logs(monkeypatch):
@@ -393,6 +423,30 @@ def test_json_formatter_redacts_uppercase_environment_credentials():
     assert "AWS_SECRET_ACCESS_KEY=secret" not in payload["message"]
     assert "OPENAI_API_KEY=[REDACTED]" in payload["message"]
     assert payload["message"].count("[REDACTED]") == 2
+
+
+def test_json_formatter_redacts_harness_host_token():
+    record = logging.LogRecord(
+        "api", logging.WARNING, __file__, 1,
+        "env TEST_ATELIER_HARNESS_TOKEN=host-token-123456", (), None,
+    )
+    payload = json.loads(JsonFormatter().format(record))
+    assert "host-token-123456" not in payload["message"]
+    assert "TEST_ATELIER_HARNESS_TOKEN=[REDACTED]" in payload["message"]
+
+
+def test_json_formatter_redacts_harness_host_token_file_path():
+    record = logging.LogRecord("api", logging.WARNING, __file__, 1,
+                               "env TEST_ATELIER_HARNESS_TOKEN_FILE=/run/secrets/harness_host_api_token", (), None)
+    payload = json.loads(JsonFormatter().format(record))
+    assert "/run/secrets/harness_host_api_token" not in payload["message"]
+
+
+def test_json_formatter_redacts_metrics_file_path():
+    record = logging.LogRecord("api", logging.WARNING, __file__, 1,
+                               "env METRICS_TOKEN_FILE=/run/secrets/atelier_metrics_token", (), None)
+    payload = json.loads(JsonFormatter().format(record))
+    assert "METRICS_TOKEN_FILE=[REDACTED]" in payload["message"]
 
 
 def test_json_formatter_redacts_common_cloud_tokens_and_jwt():

@@ -1,14 +1,227 @@
 import { expect, test } from '@playwright/test'
+import path from 'node:path'
 
-test('冒烟执行模块已从工作区移除', async ({ page }) => {
+test('项目成员从冒烟集执行到冻结质量报告', async ({ page }) => {
+  test.skip(process.env.TEST_ATELIER_HARNESS_E2E !== '1', 'Requires the disposable project browser server')
   const password = process.env.AI_STUDIO_E2E_PASSWORD
-  if (!password) test.skip(true, 'Set AI_STUDIO_E2E_PASSWORD')
+  test.skip(!password, 'Set AI_STUDIO_E2E_PASSWORD')
+
+  const errors: string[] = []
+  page.on('pageerror', error => errors.push(error.message))
+  page.on('dialog', dialog => void dialog.accept())
+  await page.goto('/')
+  await page.getByLabel('账号').fill('admin')
+  await page.getByLabel('密码').fill(password!)
+  await page.getByRole('button', { name: '登录', exact: true }).click()
+  await page.getByRole('button', { name: '新建项目' }).first().click()
+  await page.getByLabel('项目名称').fill(`冒烟闭环-${Date.now()}`)
+  await page.getByRole('button', { name: '创建项目' }).click()
+  await page.getByRole('button', { name: '质量报告', exact: true }).click()
+  await expect(page.getByText('当前筛选条件下没有已完成的执行')).toBeVisible()
+  await page.getByRole('button', { name: '打开冒烟执行' }).click()
+  await expect(page.getByRole('heading', { name: '冒烟执行' })).toBeVisible()
+  await expect(page.getByText('当前项目还没有冒烟集')).toBeVisible()
+
+  await page.getByRole('button', { name: '用例库' }).first().click()
+  await page.locator('header.topbar').getByRole('button', { name: '导入用例' }).click()
+  await page.locator('input[type=file]').setInputFiles(path.resolve(process.env.AI_STUDIO_E2E_SAMPLE || 'e2e/fixtures/UGOS_PRO_sample.xlsx'))
+  await expect(page.getByText('100 条用例 · 13 个原始字段')).toBeVisible()
+  await page.getByRole('button', { name: '确认导入 100 条' }).click()
+  await page.getByText('001252040').first().click()
+  await expect(page.getByRole('heading', { name: '新客户端旧套件兼容性' })).toBeVisible()
+  await page.getByRole('combobox', { name: '最终等级' }).click()
+  await page.getByRole('option', { name: '等级 1' }).click()
+  await page.getByRole('combobox', { name: '最终冒烟' }).click()
+  await page.getByRole('option', { name: '是', exact: true }).click()
+  await page.getByPlaceholder('说明判断依据或修改原因').fill('人工确认核心链路需要冒烟覆盖')
+  await page.getByRole('button', { name: '保存审核' }).click()
+  await expect(page.getByText('审核已保存')).toBeVisible()
+
+  await page.getByRole('button', { name: '冒烟执行' }).click()
+  await page.getByRole('button', { name: '新建冒烟集' }).click()
+  const form = page.getByRole('dialog', { name: '新建冒烟集' })
+  await form.getByRole('textbox', { name: '名称' }).fill('登录核心链路')
+  await form.getByRole('textbox', { name: '目标版本' }).fill('v1.0')
+  await form.getByRole('textbox', { name: '环境' }).fill('预发布')
+  await form.getByRole('textbox', { name: '核心链路' }).fill('登录')
+  await form.getByRole('button', { name: '创建冒烟集' }).click()
+  await expect(page.getByText('冒烟集已创建')).toBeVisible()
+  await page.getByRole('combobox', { name: '选择冒烟用例' }).click()
+  await page.getByRole('option', { name: /001252040/ }).click()
+  await page.getByRole('combobox', { name: '选择核心链路' }).click()
+  await page.getByRole('option', { name: '登录', exact: true }).click()
+  await page.getByRole('button', { name: '确认加入' }).click()
+  await expect(page.getByText('用例已由人工确认并加入冒烟集')).toBeVisible()
+  await expect(page.getByText('1 / 1')).toBeVisible()
+  await page.getByRole('button', { name: '开始执行' }).click()
+  await expect(page.getByText('执行记录已创建')).toBeVisible()
+  await page.getByRole('combobox', { name: '001252040 执行结果' }).click()
+  await page.getByRole('option', { name: '通过', exact: true }).click()
+  await page.getByRole('spinbutton', { name: '001252040 实际分钟' }).fill('1')
+  await page.getByRole('button', { name: '保存 001252040 执行结果' }).click()
+  await expect(page.getByText('执行结果已保存')).toBeVisible()
+  await page.getByRole('button', { name: '结束执行' }).click()
+  await expect(page.getByText('执行已结束')).toBeVisible()
+
+  await page.reload()
+  await expect(page.getByRole('heading', { name: '冒烟执行' })).toBeVisible()
+  await page.getByRole('tab', { name: '执行记录' }).click()
+  await expect(page.locator('.smoke-run-complete')).toBeVisible()
+  await page.getByRole('button', { name: '查看质量报告' }).click()
+  await expect(page.locator('.execution-reports-metrics')).toContainText('100%')
+  const download = page.waitForEvent('download')
+  await page.getByRole('button', { name: '下载报告' }).first().click()
+  expect((await download).suggestedFilename()).toMatch(/\.json$/)
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.getByRole('button', { name: '冒烟执行' }).click()
+  await expect(page.getByRole('heading', { name: '冒烟执行' })).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(391)
+  await page.screenshot({ path: '/tmp/test-atelier-smoke-mobile.png' })
+
+  const projectId = page.url().match(/\/projects\/(\d+)/)?.[1]
+  expect(projectId).toBeTruthy()
+  const csrf = (await (await page.request.get('/api/v1/auth/csrf')).json()).token as string
+  const readerName = `smoke-reader-${Date.now()}`
+  const readerPassword = 'reader-smoke-password-123'
+  const reader = await page.request.post('/api/v1/users', {
+    data: { username: readerName, password: readerPassword, role: 'reader' },
+    headers: { 'x-csrf-token': csrf },
+  })
+  expect(reader.ok()).toBeTruthy()
+  const member = await page.request.post(`/api/v1/projects/${projectId}/members`, {
+    data: { user_id: (await reader.json()).id }, headers: { 'x-csrf-token': csrf },
+  })
+  expect(member.ok()).toBeTruthy()
+  await page.getByRole('button', { name: '退出登录' }).click()
+  await page.getByLabel('账号').fill(readerName)
+  await page.getByLabel('密码').fill(readerPassword)
+  await page.getByRole('button', { name: '登录', exact: true }).click()
+  await page.getByRole('button', { name: '冒烟执行' }).click()
+  await page.getByRole('tab', { name: '执行记录' }).click()
+  await expect(page.locator('.smoke-run-complete')).toBeVisible()
+  await expect(page.getByRole('button', { name: '新建冒烟集' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: '开始执行' })).toHaveCount(0)
+  await page.getByRole('button', { name: '质量报告', exact: true }).click()
+  await expect(page.locator('.execution-reports-metrics')).toContainText('100%')
+  expect(errors).toEqual([])
+})
+
+test('失败和阻塞需要说明，冲突不会覆盖他人结果，执行可跨刷新继续', async ({ page }) => {
+  test.skip(process.env.TEST_ATELIER_HARNESS_E2E !== '1', 'Requires the disposable project browser server')
+  const password = process.env.AI_STUDIO_E2E_PASSWORD
+  test.skip(!password, 'Set AI_STUDIO_E2E_PASSWORD')
+  page.on('dialog', dialog => void dialog.accept())
 
   await page.goto('/')
   await page.getByLabel('账号').fill('admin')
   await page.getByLabel('密码').fill(password!)
   await page.getByRole('button', { name: '登录', exact: true }).click()
-  await expect(page.getByRole('heading', { name: '工作台' })).toBeVisible()
-  await expect(page.getByRole('button', { name: '冒烟执行' })).toHaveCount(0)
-  await expect(page.getByText('冒烟集', { exact: true })).toHaveCount(0)
+  await page.getByRole('button', { name: '新建项目' }).first().click()
+  await page.getByLabel('项目名称').fill(`冒烟异常路径-${Date.now()}`)
+  await page.getByRole('button', { name: '创建项目' }).click()
+  await expect(page).toHaveURL(/\/projects\/\d+/)
+  const projectId = page.url().match(/\/projects\/(\d+)/)?.[1]
+  expect(projectId).toBeTruthy()
+  const base = `/api/v1/projects/${projectId}`
+  const csrf = (await (await page.request.get('/api/v1/auth/csrf')).json()).token as string
+
+  await page.getByRole('button', { name: '用例库' }).first().click()
+  await page.locator('header.topbar').getByRole('button', { name: '导入用例' }).click()
+  await page.locator('input[type=file]').setInputFiles(path.resolve(process.env.AI_STUDIO_E2E_SAMPLE || 'e2e/fixtures/UGOS_PRO_sample.xlsx'))
+  await expect(page.getByText('100 条用例 · 13 个原始字段')).toBeVisible()
+  await page.getByRole('button', { name: '确认导入 100 条' }).click()
+  await page.getByText('001252040').first().click()
+  await page.getByRole('combobox', { name: '最终冒烟' }).click()
+  await page.getByRole('option', { name: '是', exact: true }).click()
+  await page.getByPlaceholder('说明判断依据或修改原因').fill('确认异常路径的冒烟覆盖')
+  await page.getByRole('button', { name: '保存审核' }).click()
+  await expect(page.getByText('审核已保存')).toBeVisible()
+
+  await page.getByRole('button', { name: '冒烟执行' }).click()
+  await page.getByRole('button', { name: '新建冒烟集' }).click()
+  const form = page.getByRole('dialog', { name: '新建冒烟集' })
+  await form.getByRole('textbox', { name: '名称' }).fill('异常路径验证')
+  await form.getByRole('textbox', { name: '目标版本' }).fill('v2')
+  await form.getByRole('textbox', { name: '环境' }).fill('测试环境')
+  await form.getByRole('textbox', { name: '核心链路' }).fill('登录')
+  await form.getByRole('button', { name: '创建冒烟集' }).click()
+  await expect(form).toHaveCount(0)
+  const suite = (await (await page.request.get(`${base}/smoke-suites`)).json())[0]
+  await page.getByRole('button', { name: '编辑冒烟集' }).click()
+  const editing = page.getByRole('dialog', { name: '编辑冒烟集' })
+  await editing.getByRole('textbox', { name: '名称' }).fill('不能覆盖的新标题')
+  const competingSuite = await page.request.patch(`${base}/smoke-suites/${suite.id}`, {
+    data: { revision: suite.revision, title: '协作者更新的标题', target_version: 'v2', environment: '测试环境', required_chains: ['登录'] },
+    headers: { 'x-csrf-token': csrf },
+  })
+  expect(competingSuite.ok()).toBeTruthy()
+  await editing.getByRole('button', { name: '保存修改' }).click()
+  await expect(editing).toHaveCount(0)
+  await expect(page.getByRole('alert')).toContainText('本次修改未保存')
+  await expect(page.locator('.smoke-suite-meta strong')).toHaveText('协作者更新的标题')
+  await page.getByRole('button', { name: '编辑冒烟集' }).click()
+  await expect(page.getByRole('dialog', { name: '编辑冒烟集' }).getByRole('textbox', { name: '名称' })).toHaveValue('协作者更新的标题')
+  await page.getByRole('dialog', { name: '编辑冒烟集' }).press('Escape')
+  await page.getByRole('combobox', { name: '选择冒烟用例' }).click()
+  await page.getByRole('option', { name: /001252040/ }).click()
+  await page.getByRole('combobox', { name: '选择核心链路' }).click()
+  await page.getByRole('option', { name: '登录', exact: true }).click()
+  await page.getByRole('button', { name: '确认加入' }).click()
+  await expect(page.getByText('用例已由人工确认并加入冒烟集')).toBeVisible()
+  await page.getByRole('button', { name: '开始执行' }).click()
+  await expect(page.getByText('执行记录已创建')).toBeVisible()
+
+  const run = (await (await page.request.get(`${base}/execution-runs`)).json())[0]
+  const runPath = `${base}/execution-runs/${run.id}`
+  const item = (await (await page.request.get(runPath)).json()).items[0]
+  await page.getByRole('combobox', { name: '001252040 执行结果' }).click()
+  await page.getByRole('option', { name: '失败', exact: true }).click()
+  await expect(page.getByRole('button', { name: '保存 001252040 执行结果' })).toBeDisabled()
+  await page.getByRole('textbox', { name: '001252040 执行说明' }).fill('登录服务返回 500')
+
+  const competing = await page.request.put(`${runPath}/cases/${item.id}`, {
+    data: { version: item.version, result: 'blocked', actual_seconds: 60, note: '外部依赖不可用' },
+    headers: { 'x-csrf-token': csrf },
+  })
+  expect(competing.ok()).toBeTruthy()
+  await page.getByRole('button', { name: '保存 001252040 执行结果' }).click()
+  await expect(page.getByRole('alert')).toContainText('未保存的修改未覆盖他人结果')
+  await expect(page.getByRole('combobox', { name: '001252040 执行结果' })).toContainText('阻塞')
+  expect((await (await page.request.get(runPath)).json()).items[0].note).toBe('外部依赖不可用')
+
+  await page.reload()
+  await page.getByRole('tab', { name: '执行记录' }).click()
+  await expect(page.getByText('执行中')).toBeVisible()
+  await expect(page.getByRole('textbox', { name: '001252040 执行说明' })).toHaveValue('外部依赖不可用')
+  await page.getByRole('combobox', { name: '001252040 执行结果' }).click()
+  await page.getByRole('option', { name: '失败', exact: true }).click()
+  await page.getByRole('textbox', { name: '001252040 执行说明' }).fill('复核后确认登录接口失败')
+  await page.context().setOffline(true)
+  await page.getByRole('button', { name: '保存 001252040 执行结果' }).click()
+  await expect(page.locator('.run-case-row .error-line')).toContainText('网络暂不可用，修改仍在此页面')
+  await expect(page.getByRole('textbox', { name: '001252040 执行说明' })).toHaveValue('复核后确认登录接口失败')
+  await page.context().setOffline(false)
+  expect((await (await page.request.get(runPath)).json()).items[0].result).toBe('blocked')
+  await page.getByRole('button', { name: '保存 001252040 执行结果' }).click()
+  await expect(page.getByText('执行结果已保存')).toBeVisible()
+  await expect(page.locator('.run-case-row .error-line')).toHaveCount(0)
+  await page.getByRole('button', { name: '结束执行' }).click()
+  await expect(page.locator('.smoke-run-complete')).toBeVisible()
+  await page.getByRole('button', { name: '查看质量报告' }).click()
+  await expect(page.locator('.execution-reports-metrics')).toContainText('0%')
+  const report = await page.request.get(`${runPath}/report`)
+  expect(report.ok()).toBeTruthy()
+  const payload = await report.json()
+  expect(payload.summary.results).toMatchObject({ failed: 1, blocked: 0, passed: 0 })
+  expect(payload.cases[0]).toMatchObject({ result: 'failed', note: '复核后确认登录接口失败' })
+
+  await page.getByRole('button', { name: '冒烟执行' }).click()
+  await page.getByRole('button', { name: '开始执行' }).click()
+  await expect(page.getByText('执行记录已创建')).toBeVisible()
+  const pending = (await (await page.request.get(`${base}/execution-runs`)).json())[0]
+  expect(pending.status).toBe('active')
+  await page.reload()
+  await page.getByRole('tab', { name: '执行记录' }).click()
+  await expect(page.getByRole('button', { name: '结束执行' })).toBeDisabled()
+  expect((await (await page.request.get(`${base}/execution-runs/${pending.id}`)).json()).summary.not_run).toBe(1)
 })

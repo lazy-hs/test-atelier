@@ -35,8 +35,8 @@ _SENSITIVE_TEXT_PATTERN = re.compile(
 _SENSITIVE_ENV_PATTERN = re.compile(
     r"(?i)\b(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|AZURE_OPENAI_API_KEY|AWS_ACCESS_KEY_ID|"
     r"AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|GOOGLE_API_KEY|HF_TOKEN|GITHUB_TOKEN|"
-    r"NPM_TOKEN|DOCKER_AUTH_CONFIG|DATABASE_URL|POSTGRES_PASSWORD|METRICS_TOKEN|"
-    r"AI_STUDIO_SESSION_SECRET|AI_STUDIO_ADMIN_PASSWORD)\s*=\s*[^\r\n,;&}\s]+"
+    r"NPM_TOKEN|DOCKER_AUTH_CONFIG|DATABASE_URL|POSTGRES_PASSWORD(?:_FILE)?|AI_STUDIO_DATABASE_PASSWORD_FILE|METRICS_TOKEN(?:_FILE)?|"
+    r"AI_STUDIO_SESSION_SECRET(?:_FILE)?|TEST_ATELIER_SCOPE_SECRET(?:_FILE)?|TEST_ATELIER_HARNESS_TOKEN(?:_FILE)?|AI_STUDIO_ADMIN_PASSWORD(?:_FILE)?)\s*=\s*[^\r\n,;&}\s]+"
 )
 _SENSITIVE_COOKIE_PATTERN = re.compile(
     r"(?i)((?:set[-_ ]?cookie|cookie)\s*[:=]\s*)[^\r\n]+"
@@ -71,8 +71,9 @@ _FORBIDDEN_LOG_KEYS = {
 }
 _RELEASE_PATTERN = re.compile(r"[^A-Za-z0-9._/@:-]+")
 _SUBPROCESS_SECRET_NAMES = frozenset({
-    "AI_STUDIO_SESSION_SECRET", "AI_STUDIO_ADMIN_PASSWORD", "AI_STUDIO_REMOTE_API_KEY",
-    "DATABASE_URL", "POSTGRES_PASSWORD", "METRICS_TOKEN", "TEST_ATELIER_SKILL_ROOT",
+    "AI_STUDIO_SESSION_SECRET", "AI_STUDIO_SESSION_SECRET_FILE", "TEST_ATELIER_SCOPE_SECRET", "TEST_ATELIER_SCOPE_SECRET_FILE",
+    "TEST_ATELIER_HARNESS_TOKEN", "TEST_ATELIER_HARNESS_TOKEN_FILE", "AI_STUDIO_ADMIN_PASSWORD", "AI_STUDIO_ADMIN_PASSWORD_FILE", "AI_STUDIO_REMOTE_API_KEY",
+    "DATABASE_URL", "POSTGRES_PASSWORD", "POSTGRES_PASSWORD_FILE", "AI_STUDIO_DATABASE_PASSWORD_FILE", "METRICS_TOKEN", "METRICS_TOKEN_FILE", "TEST_ATELIER_SKILL_ROOT",
     "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AZURE_OPENAI_API_KEY",
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
     "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "HF_TOKEN",
@@ -326,12 +327,13 @@ class JsonFormatter(logging.Formatter):
     """
 
     _FIELDS = (
-        "event", "method", "path", "route", "status", "duration_ms", "error_type",
-        "job_id", "analysis_id", "project_id", "kind", "provider", "attempt", "prompt_calls",
+        "event", "method", "path", "route", "status", "duration_ms", "error_type", "error_detail",
+        "job_id", "task_id", "analysis_id", "project_id", "kind", "provider", "attempt", "prompt_calls",
         "prompt_length", "case_id", "completed", "total", "error_count", "process_pid", "queue_limit",
         "actor_id", "target_user_id", "role", "active_jobs", "released_reservations", "recovered_reservations", "shutdown_timeout", "component",
         "version", "revision", "expected_revision", "taxonomy_version_id", "suggestion_id", "case_version", "action", "count",
         "required", "source", "retry_after_seconds", "worker_id", "lease_seconds", "status_code",
+        "response_preview",
         "script", "returncode", "recovered_jobs", "reason", "file_size", "row_count", "warning_count", "failure_count", "failed_checks",
         "text_length", "conversion_mode", "output_mode", "database_kind", "session_max_age", "max_request_bytes", "request_bytes", "declared_bytes",
         "worker_age_seconds", "worker_release", "error_log_interval_seconds",

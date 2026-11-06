@@ -83,7 +83,8 @@ function RunCaseRow({ item, active, readonly, onSave }: {
   async function save() {
     setBusy(true); setError('')
     try { await onSave(result, seconds, note.trim()) }
-    catch (cause) { setError((cause as Error).message) } finally { setBusy(false) }
+    catch (cause) { setError(cause instanceof TypeError ? '网络暂不可用，修改仍在此页面；恢复连接后请重新保存' : (cause as Error).message) }
+    finally { setBusy(false) }
   }
   return <div className="run-case-row"><div className="run-case-title"><strong>{item.title}</strong><small>{item.original_id} · {item.chain_name} · 预计 {minutes(item.estimated_seconds)}</small></div>
     {active && !readonly ? <><Select value={result} onValueChange={value => setResult(value as RunResult)}><SelectTrigger aria-label={`${item.original_id} 执行结果`}><SelectValue /></SelectTrigger><SelectContent><SelectGroup>{Object.entries(resultLabels).map(([key, label]) => <SelectItem key={key} value={key}>{label}</SelectItem>)}</SelectGroup></SelectContent></Select>
@@ -94,7 +95,7 @@ function RunCaseRow({ item, active, readonly, onSave }: {
   </div>
 }
 
-export function SmokePage({ projectId, readonly, onOpenCases }: { projectId: number; readonly: boolean; onOpenCases: () => void }) {
+export function SmokePage({ projectId, readonly, onOpenCases, onOpenReports }: { projectId: number; readonly: boolean; onOpenCases: () => void; onOpenReports: () => void }) {
   const base = `/projects/${projectId}`
   const [tab, setTab] = useState('suites')
   const [suites, setSuites] = useState<SmokeSuite[]>([])
@@ -120,6 +121,11 @@ export function SmokePage({ projectId, readonly, onOpenCases }: { projectId: num
     setSuites(suiteRows); setRuns(runRows)
     setSuiteId(previous => previous && suiteRows.some(item => item.id === previous) ? previous : suiteRows[0]?.id ?? null)
     setRunId(previous => previous && runRows.some(item => item.id === previous) ? previous : runRows[0]?.id ?? null)
+  }, [base])
+  const refreshRun = useCallback(async (id: number) => {
+    const latest = await api<ExecutionRun>(`${base}/execution-runs/${id}`)
+    setRun(previous => previous?.id === id ? latest : previous)
+    setRuns(previous => previous.map(value => value.id === id ? { ...latest, items: [], events: [] } : value))
   }, [base])
   useEffect(() => { void refresh().catch(cause => setError(cause.message)) }, [refresh])
   useEffect(() => {
@@ -154,11 +160,23 @@ export function SmokePage({ projectId, readonly, onOpenCases }: { projectId: num
   useEffect(() => { if (!notice) return; const timer = window.setTimeout(() => setNotice(''), 4500); return () => window.clearTimeout(timer) }, [notice])
 
   function updateSuite(next: SmokeSuite) { setSuites(previous => previous.map(item => item.id === next.id ? next : item)) }
+  async function suiteConflict(cause: unknown) {
+    if ((cause as { status?: number }).status !== 409 || !(cause as Error).message.includes('已被其他成员修改')) return false
+    await refresh()
+    setError('冒烟集已由其他成员更新，本次修改未保存；请核对最新修订后重新编辑')
+    return true
+  }
   async function saveSuite(value: { title: string; target_version: string; environment: string; required_chains: string[] }) {
-    const next = form === 'new' ? await api<SmokeSuite>(`${base}/smoke-suites`, { method: 'POST', body: JSON.stringify(value) }) :
-      await api<SmokeSuite>(`${base}/smoke-suites/${suite!.id}`, { method: 'PATCH', body: JSON.stringify({ ...value, revision: suite!.revision }) })
-    if (form === 'new') { setSuites(previous => [next, ...previous]); setSuiteId(next.id) } else updateSuite(next)
-    setForm(null); setNotice(form === 'new' ? '冒烟集已创建' : '冒烟集已更新')
+    setError('')
+    try {
+      const next = form === 'new' ? await api<SmokeSuite>(`${base}/smoke-suites`, { method: 'POST', body: JSON.stringify(value) }) :
+        await api<SmokeSuite>(`${base}/smoke-suites/${suite!.id}`, { method: 'PATCH', body: JSON.stringify({ ...value, revision: suite!.revision }) })
+      if (form === 'new') { setSuites(previous => [next, ...previous]); setSuiteId(next.id) } else updateSuite(next)
+      setForm(null); setNotice(form === 'new' ? '冒烟集已创建' : '冒烟集已更新')
+    } catch (cause) {
+      if (await suiteConflict(cause)) { setForm(null); return }
+      throw cause
+    }
   }
   async function addItem() {
     if (!suite || !candidateId) return
@@ -172,19 +190,29 @@ export function SmokePage({ projectId, readonly, onOpenCases }: { projectId: num
       // before another candidate can be selected (otherwise the just-added
       // case can be submitted again during the refresh window).
       setCandidates([]); setCandidateId(''); setQuery(''); setNotice('用例已由人工确认并加入冒烟集')
-    } catch (cause) { setError((cause as Error).message) } finally { setBusy(false) }
+    } catch (cause) {
+      if (!await suiteConflict(cause)) setError((cause as Error).message)
+    } finally { setBusy(false) }
   }
   async function updateItem(item: SmokeItem, nextChain: string, seconds: number) {
     if (!suite) return
-    const next = await api<SmokeSuite>(`${base}/smoke-suites/${suite.id}/items/${item.id}`, { method: 'PUT', body: JSON.stringify({
-      revision: suite.revision, chain_name: nextChain, estimated_seconds: seconds,
-    }) })
-    updateSuite(next); setNotice('链路与时长已重新确认')
+    try {
+      const next = await api<SmokeSuite>(`${base}/smoke-suites/${suite.id}/items/${item.id}`, { method: 'PUT', body: JSON.stringify({
+        revision: suite.revision, chain_name: nextChain, estimated_seconds: seconds,
+      }) })
+      updateSuite(next); setError(''); setNotice('链路与时长已重新确认')
+    } catch (cause) {
+      if (!await suiteConflict(cause)) throw cause
+    }
   }
   async function removeItem(item: SmokeItem) {
     if (!suite) return
-    const next = await api<SmokeSuite>(`${base}/smoke-suites/${suite.id}/items/${item.id}?revision=${suite.revision}`, { method: 'DELETE' })
-    updateSuite(next); setNotice('用例已从冒烟集移出')
+    try {
+      const next = await api<SmokeSuite>(`${base}/smoke-suites/${suite.id}/items/${item.id}?revision=${suite.revision}`, { method: 'DELETE' })
+      updateSuite(next); setError(''); setNotice('用例已从冒烟集移出')
+    } catch (cause) {
+      if (!await suiteConflict(cause)) throw cause
+    }
   }
   async function startRun() {
     if (!suite) return
@@ -193,15 +221,27 @@ export function SmokePage({ projectId, readonly, onOpenCases }: { projectId: num
     try {
       const created = await api<ExecutionRun>(`${base}/smoke-suites/${suite.id}/runs`, { method: 'POST', body: JSON.stringify({ suite_revision: suite.revision }) })
       setRuns(previous => [{ ...created, items: [], events: [] }, ...previous]); setRunId(created.id); setRun(created); setTab('runs'); setNotice('执行记录已创建')
-    } catch (cause) { setError((cause as Error).message) } finally { setBusy(false) }
+    } catch (cause) {
+      if (!await suiteConflict(cause)) setError((cause as Error).message)
+    } finally { setBusy(false) }
   }
   async function saveResult(item: RunCase, result: RunResult, seconds: number | null, note: string) {
     if (!run) return
-    const updated = await api<ExecutionRun>(`${base}/execution-runs/${run.id}/cases/${item.id}`, { method: 'PUT', body: JSON.stringify({
-      version: item.version, result, actual_seconds: seconds, note,
-    }) })
-    setRun(updated); setRuns(previous => previous.map(value => value.id === updated.id ? { ...updated, items: [], events: [] } : value))
-    setNotice('执行结果已保存')
+    setError('')
+    try {
+      const updated = await api<ExecutionRun>(`${base}/execution-runs/${run.id}/cases/${item.id}`, { method: 'PUT', body: JSON.stringify({
+        version: item.version, result, actual_seconds: seconds, note,
+      }) })
+      setRun(updated); setRuns(previous => previous.map(value => value.id === updated.id ? { ...updated, items: [], events: [] } : value))
+      setNotice('执行结果已保存')
+    } catch (cause) {
+      if ((cause as { status?: number }).status === 409) {
+        await refreshRun(run.id)
+        setError('执行记录已更新，未保存的修改未覆盖他人结果，请核对最新结果后重新编辑')
+        return
+      }
+      throw cause
+    }
   }
   async function completeRun() {
     if (!run) return
@@ -210,7 +250,10 @@ export function SmokePage({ projectId, readonly, onOpenCases }: { projectId: num
     try {
       const completed = await api<ExecutionRun>(`${base}/execution-runs/${run.id}/complete`, { method: 'POST' })
       setRun(completed); setRuns(previous => previous.map(value => value.id === completed.id ? { ...completed, items: [], events: [] } : value)); setNotice('执行已结束')
-    } catch (cause) { setError((cause as Error).message) } finally { setBusy(false) }
+    } catch (cause) {
+      if ((cause as { status?: number }).status === 409) await refreshRun(run.id).catch(() => {})
+      setError((cause as Error).message)
+    } finally { setBusy(false) }
   }
   function chooseSuite(value: string) { setSuiteId(Number(value)); setCandidateId(''); setQuery(''); setChain('') }
   const ready = suite && suite.items.length > 0 && !suite.items.some(item => item.stale) && suite.required_chains.length > 0
@@ -246,7 +289,7 @@ export function SmokePage({ projectId, readonly, onOpenCases }: { projectId: num
         </section>}
       </>}
       </TabsContent>
-      <TabsContent value="runs"><div className="smoke-section-heading"><div><h2>执行记录</h2><p>每次执行冻结版本、环境和用例内容</p></div><Button variant="ghost" size="icon-sm" aria-label="刷新执行记录" title="刷新执行记录" onClick={() => void refresh().catch(cause => setError(cause.message))}><RefreshCw /></Button></div>
+      <TabsContent value="runs"><div className="smoke-section-heading"><div><h2>执行记录</h2><p>每次执行冻结版本、环境和用例内容</p></div><Button variant="ghost" size="icon-sm" aria-label="刷新执行记录" title="刷新执行记录" onClick={() => void Promise.all([refresh(), runId ? refreshRun(runId) : Promise.resolve()]).catch(cause => setError(cause.message))}><RefreshCw /></Button></div>
         <div className="smoke-run-list">{runs.map(value => <button key={value.id} className={runId === value.id ? 'active' : ''} onClick={() => setRunId(value.id)}><strong>{value.title}</strong><span>{value.target_version} · {value.environment}</span><small>{value.status === 'active' ? '执行中' : '已完成'} · {date(value.started_at)}</small></button>)}</div>
         {runs.length === 0 && <div className="smoke-empty">还没有执行记录</div>}
         {run && <div className="smoke-run-detail"><div className="smoke-suite-meta"><strong>{run.title}</strong><span>{run.target_version} · {run.environment} · 来源冒烟集修订 {run.suite_revision}</span></div>
@@ -258,7 +301,7 @@ export function SmokePage({ projectId, readonly, onOpenCases }: { projectId: num
           <div className="run-case-head"><span>用例</span><span>结果</span><span>实际分钟</span><span>说明</span></div>
           {run.items.map(item => <RunCaseRow key={`${item.id}-${item.version}`} item={item} active={run.status === 'active'} readonly={readonly}
             onSave={(result, seconds, note) => saveResult(item, result, seconds, note)} />)}
-          {run.status === 'completed' && <p className="smoke-run-complete">由 {run.completed_by} 于 {date(run.completed_at)} 结束</p>}
+          {run.status === 'completed' && <div className="smoke-run-complete">由 {run.completed_by} 于 {date(run.completed_at)} 结束 <Button size="sm" variant="outline" onClick={onOpenReports}>查看质量报告</Button></div>}
           <div className="smoke-section-heading smoke-event-heading"><h2>变更记录</h2><span>{run.events.length} 条</span></div>
           {run.events.map(event => <div className="smoke-event" key={event.id}><strong>{event.actor}</strong><span>{resultLabels[event.before.result]} → {resultLabels[event.after.result]} · {event.after.note || '—'}</span><time>{date(event.created_at)}</time></div>)}
         </div>}

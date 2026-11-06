@@ -29,9 +29,11 @@ from api.main import app  # noqa: E402
 def client(tmp_path, monkeypatch):
     # Keep document artifacts isolated; project deletion must remove their rows
     # even when no external object storage is configured.
-    from api import ai_routes
+    from api import ai_routes, conversion_routes
 
     monkeypatch.setattr(ai_routes, "DOCUMENT_DIR", tmp_path / "documents")
+    monkeypatch.setattr(conversion_routes, "DATA_DIR", tmp_path / "conversions")
+    monkeypatch.setenv("AI_STUDIO_DATA_DIR", str(tmp_path))
     Base.metadata.drop_all(engine)
     with TestClient(app) as test_client:
         yield test_client

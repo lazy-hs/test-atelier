@@ -1,8 +1,11 @@
 import os
+import subprocess
+from pathlib import Path
 
 import pytest
 
-from api.storage import ensure_private_directory, is_private_regular_file, open_private_regular_file, write_private_atomic
+from api.storage import (ensure_private_directory, is_private_regular_file, open_private_regular_file,
+                         remove_private_file, write_private_atomic)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not portable on Windows")
@@ -48,12 +51,61 @@ def test_private_directory_rejects_symlink_root(tmp_path):
         ensure_private_directory(linked)
 
 
+def test_private_storage_rejects_windows_junctions(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    junction = root / "junction"
+    junction.mkdir()
+    monkeypatch.setattr(Path, "is_junction", lambda self: self == junction)
+    with pytest.raises(OSError, match="junction"):
+        ensure_private_directory(junction)
+    with pytest.raises(OSError, match="junction"):
+        write_private_atomic(junction / "private.txt", b"secret", root=root)
+    assert not (junction / "private.txt").exists()
+
+
+def test_private_file_deletion_rejects_a_junction_in_its_root_or_project(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    root = data / "documents"
+    project = root / "42"
+    project.mkdir(parents=True)
+    file = project / "source.bin"
+    file.write_bytes(b"keep")
+    original = Path.is_junction
+    for redirected in (data, project):
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "is_junction", lambda self: self == redirected or original(self))
+            with pytest.raises(OSError, match="junction"):
+                remove_private_file(file, root=root)
+        assert file.read_bytes() == b"keep"
+    remove_private_file(file, root=root)
+    assert not file.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction runtime contract")
+def test_private_storage_rejects_real_windows_junction(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("private", encoding="utf-8")
+    junction = tmp_path / "workspaces"
+    result = subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert junction.is_junction()
+    with pytest.raises(OSError, match="junction"):
+        ensure_private_directory(junction)
+    assert (outside / "keep.txt").read_text(encoding="utf-8") == "private"
+
+
 def test_private_regular_file_rejects_symlink(tmp_path):
     target = tmp_path / "artifact.bin"
     target.write_bytes(b"private")
     assert is_private_regular_file(target)
     linked = tmp_path / "linked.bin"
-    linked.symlink_to(target)
+    try:
+        linked.symlink_to(target)
+    except (NotImplementedError, OSError):
+        pytest.skip("This host does not permit symlink creation")
     assert not is_private_regular_file(linked)
 
 
